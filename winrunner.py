@@ -1,4 +1,4 @@
-"""Start WinRunner with: python -m winrunner."""
+"""Start WinRunner with: python winrunner.py."""
 
 import hmac
 import json
@@ -399,9 +399,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
 def main():
     if sys.platform != "win32":
         sys.exit("WinRunner only supports Windows")
-    token = os.environ.get("RUNNER_TOKEN", "")
-    if not token or not token.isascii() or any(not 33 <= ord(c) <= 126 for c in token):
-        sys.exit("Set RUNNER_TOKEN to a nonempty ASCII token without spaces")
+    token = config.TOKEN
+    if (not isinstance(token, str) or not token or token == "123456"
+            or any(not 33 <= ord(c) <= 126 for c in token)):
+        sys.exit("Set TOKEN in config.py to a non-placeholder ASCII token without spaces")
     with HTTPServer((config.HOST, config.PORT), HTTPHandler) as server:
         server.token = token.encode("ascii")
         server.runner = Runner(config.DATA_DIR)

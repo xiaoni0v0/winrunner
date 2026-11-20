@@ -78,20 +78,26 @@ class RunnerCase(unittest.TestCase):
         self.work.mkdir()
         self.token = secrets.token_hex(24)
         self.port = free_port()
+        self.install = self.scratch / "app"
+        self.install.mkdir()
+        for name in ("config.py", "gitrepo.py", "runner.py", "winfiles.py", "winprocess.py", "winrunner.py"):
+            shutil.copyfile(ROOT / name, self.install / name)
+        self.settings = self.install / "config.py"
+        with self.settings.open("a", encoding="utf-8") as settings:
+            settings.write(f"\nTOKEN = {self.token!r}\nHOST = '127.0.0.1'\nPORT = {self.port}\n"
+                           f"DATA_DIR = Path({str(self.data)!r})\n")
         self.server = None
         self.addCleanup(self.stop_runner)
         self.start_runner()
 
     def environment(self):
-        return dict(os.environ, RUNNER_TOKEN=self.token, RUNNER_HOST="127.0.0.1",
-                    RUNNER_PORT=str(self.port), RUNNER_DATA_DIR=str(self.data),
-                    PYTHONDONTWRITEBYTECODE="1")
+        return {key: value for key, value in os.environ.items() if not key.upper().startswith("RUNNER_")}
 
     def start_runner(self):
         self.diagnostics = self.scratch / "runner.log"
         with self.diagnostics.open("ab") as out:
             self.server = subprocess.Popen(
-                [sys.executable, "-m", "winrunner"], cwd=ROOT, env=self.environment(),
+                [sys.executable, "winrunner.py"], cwd=self.install, env=self.environment(),
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
@@ -216,6 +222,19 @@ class RunnerCase(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "requires Windows shell and Job Objects")
 class CommandIntegrationTests(RunnerCase):
+    def test_placeholder_cannot_be_overridden_by_old_environment_setting(self):
+        self.stop_runner()
+        with self.settings.open("a", encoding="utf-8") as settings:
+            settings.write('\nTOKEN = "123456"\n')
+        result = subprocess.run(
+            [sys.executable, "winrunner.py"], cwd=self.install,
+            env=dict(self.environment(), RUNNER_TOKEN="legacy-setting"),
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Set TOKEN in config.py", result.stderr)
+
     def test_health_and_authentication_precede_request_processing(self):
         for method, path, payload in (("GET", "/health", None),
                                       ("GET", "/commands", None),

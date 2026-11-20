@@ -2,7 +2,7 @@
 
 ## 通用规则
 
-- 连接被接纳后，先检验 `Authorization: Bearer <token>`；缺失或错误返回 `401`。并发 HTTP 连接默认上限 64（`RUNNER_MAX_HTTP_CONNECTIONS`），满额会在鉴权前尝试返回 `503 server_busy` 和 `Retry-After: 1`。这不是后台任务并发上限。
+- 连接被接纳后，先检验 `Authorization: Bearer <token>`；缺失或错误返回 `401`。并发 HTTP 连接默认上限 64（[config.py](<config.py>) 中的 `MAX_HTTP_CONNECTIONS`），满额会在鉴权前尝试返回 `503 server_busy` 和 `Retry-After: 1`。这不是后台任务并发上限。
 - POST 用 `Content-Length` 发送 UTF-8 JSON 对象，请求体默认上限 1 MiB；表格未标为可选的字段必填。除文件下载、`204` 和无报文体的 `HEAD` 外，响应为 JSON。
 - HTTP 错误体为 `{"error":{"code":"…","message":"…"}}`。`400` 参数或请求体不合法，`404` 路由或资源不存在，已知路由不支持的方法返回 `405` 和 `Allow`，`409` 与当前状态冲突，`413` 请求体过大，`500` 服务端错误。各接口另有专用状态码时单独列出。
 - `timeout` 是可选的非负有限秒数，支持小数，默认 `10`。仅用于 Action、命令 POST；从接受请求开始计时，包含准备和执行。`0` 不等待，`60` 最多等待 60 秒。提前结束立即返回 `200` 与终态，未结束返回 `202` 与当前状态，任务继续。任务执行失败也用终态表达，不用 HTTP 错误状态；请求体不合法等 HTTP 错误除外。
