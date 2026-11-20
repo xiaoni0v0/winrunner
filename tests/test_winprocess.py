@@ -30,13 +30,15 @@ class WinProcessTests(unittest.TestCase):
         return job
 
     def run_python(self, source, *arguments, **kwargs):
-        options = dict(cwd=self.cwd, env=self.env, stdout=self.out.extend, stderr=self.err.extend)
+        options = dict(
+            cwd=self.cwd, env=self.env, stdout=self.out.extend, stderr=self.err.extend
+        )
         options.update(kwargs)
         return self.job.run([sys.executable, "-c", source, *arguments], **options)
 
     def start_worker(self, function, job=None):
         job = self.job if job is None else job
-        result = queue.Queue()
+        result: queue.Queue[int | BaseException] = queue.Queue()
 
         def work():
             try:
@@ -70,21 +72,42 @@ class WinProcessTests(unittest.TestCase):
             "sys.stderr.buffer.write(sys.stdin.buffer.read() or b'EOF'); sys.exit(23)"
         )
         started = []
-        self.assertEqual(self.run_python(source, arg, on_started=lambda: started.append(True)), 23)
+        self.assertEqual(
+            self.run_python(source, arg, on_started=lambda: started.append(True)), 23
+        )
         self.assertEqual(started, [True])
-        self.assertEqual(self.out.decode(), f"{self.cwd}|{self.env['WINPROCESS_TEST']}|{arg}")
+        self.assertEqual(
+            self.out.decode(), f"{self.cwd}|{self.env['WINPROCESS_TEST']}|{arg}"
+        )
         self.assertEqual(self.err, b"EOF")
         self.out.clear()
         raw = subprocess.list2cmdline([sys.executable, "-c", "print('raw', end='')"])
-        self.assertEqual(self.job.run(raw, cwd=str(self.cwd), env=self.env, stdout=self.out.extend,
-                                      stderr=self.err.extend, executable=sys.executable), 0)
+        self.assertEqual(
+            self.job.run(
+                raw,
+                cwd=str(self.cwd),
+                env=self.env,
+                stdout=self.out.extend,
+                stderr=self.err.extend,
+                executable=sys.executable,
+            ),
+            0,
+        )
         self.assertEqual(self.out, b"raw")
         self.out.clear()
         cmd = self.env["COMSPEC"]
         shell_command = f'"{cmd}" /d /s /c "echo first^&second"'
-        self.assertEqual(self.job.run(shell_command, cwd=self.cwd, env=self.env,
-                                      stdout=self.out.extend, stderr=self.err.extend,
-                                      executable=cmd), 0)
+        self.assertEqual(
+            self.job.run(
+                shell_command,
+                cwd=self.cwd,
+                env=self.env,
+                stdout=self.out.extend,
+                stderr=self.err.extend,
+                executable=cmd,
+            ),
+            0,
+        )
         self.assertEqual(self.out, b"first&second\r\n")
 
     def test_both_pipes_deliver_bytes_before_process_exits(self):
@@ -102,9 +125,14 @@ class WinProcessTests(unittest.TestCase):
             f"os.write(1, b'x'*{count}); os.write(2, b'y'*{count})\n"
             "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\n"
         )
-        worker = self.start_worker(lambda: self.run_python(
-            source, str(gate), stdout=lambda data: collect(data, self.out, streamed[0]),
-            stderr=lambda data: collect(data, self.err, streamed[1])))
+        worker = self.start_worker(
+            lambda: self.run_python(
+                source,
+                str(gate),
+                stdout=lambda data: collect(data, self.out, streamed[0]),
+                stderr=lambda data: collect(data, self.err, streamed[1]),
+            )
+        )
         for event in streamed:
             self.assertTrue(event.wait(8), "pipe did not stream until exit")
         self.assertTrue(worker[0].is_alive())
@@ -128,11 +156,16 @@ class WinProcessTests(unittest.TestCase):
             "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print('child', flush=True); "
             "sys.exit(17)"
         )
-        worker = self.start_worker(lambda: self.run_python(
-            parent, child, str(gate), str(done), stdout=lambda _: started.set()))
+        worker = self.start_worker(
+            lambda: self.run_python(
+                parent, child, str(gate), str(done), stdout=lambda _: started.set()
+            )
+        )
         self.assertTrue(started.wait(8), self.err)
-        worker[0].join(.25)
-        self.assertTrue(worker[0].is_alive(), "run returned while descendant was still alive")
+        worker[0].join(0.25)
+        self.assertTrue(
+            worker[0].is_alive(), "run returned while descendant was still alive"
+        )
         gate.touch()
         self.assertEqual(self.finish(worker), 17)
         self.assertTrue(done.is_file())
@@ -155,7 +188,9 @@ class WinProcessTests(unittest.TestCase):
             if b"\n" in self.out:
                 started.set()
 
-        worker = self.start_worker(lambda: self.run_python(parent, child, stdout=collect))
+        worker = self.start_worker(
+            lambda: self.run_python(parent, child, stdout=collect)
+        )
         self.assertTrue(started.wait(8), self.err)
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
@@ -192,9 +227,15 @@ class WinProcessTests(unittest.TestCase):
     def test_failed_launch_does_not_start_or_poison_job(self):
         started = []
         with self.assertRaises(OSError):
-            self.job.run(["not-real"], cwd=self.cwd, env=self.env, stdout=self.out.extend,
-                         stderr=self.err.extend, executable=str(self.cwd / "no.exe"),
-                         on_started=lambda: started.append(True))
+            self.job.run(
+                ["not-real"],
+                cwd=self.cwd,
+                env=self.env,
+                stdout=self.out.extend,
+                stderr=self.err.extend,
+                executable=str(self.cwd / "no.exe"),
+                on_started=lambda: started.append(True),
+            )
         self.assertEqual(started, [])
         self.assertEqual(self.run_python("pass"), 0)
 
@@ -217,8 +258,13 @@ class WinProcessTests(unittest.TestCase):
 
         def second():
             barrier.wait(8)
-            return other.run([sys.executable, "-c", source, "fast"], cwd=self.cwd, env=self.env,
-                             stdout=out.extend, stderr=err.extend)
+            return other.run(
+                [sys.executable, "-c", source, "fast"],
+                cwd=self.cwd,
+                env=self.env,
+                stdout=out.extend,
+                stderr=err.extend,
+            )
 
         slow = self.start_worker(first)
         fast = self.start_worker(second, other)
@@ -230,16 +276,20 @@ class WinProcessTests(unittest.TestCase):
         self.assertEqual((self.out, self.err), (b"slow", b"slow"))
 
     def test_health_native_metrics(self):
-        with patch("winprocess._previous_cpu_times", None), patch(
-                "winprocess._GetActiveProcessorGroupCount", return_value=1):
+        with (
+            patch("winprocess._previous_cpu_times", None),
+            patch("winprocess._GetActiveProcessorGroupCount", return_value=1),
+        ):
             first = health(self.cwd, 3.5)
             self.assertEqual(first["uptime_seconds"], 3.5)
             self.assertGreater(first["cpu"]["logical_cores"], 0)
             self.assertIsNone(first["cpu"]["usage_percent"])
             for key in ("disk", "memory"):
                 self.assertGreater(first[key]["total_bytes"], 0)
-                self.assertGreaterEqual(first[key]["total_bytes"], first[key]["available_bytes"])
-            time.sleep(.08)
+                self.assertGreaterEqual(
+                    first[key]["total_bytes"], first[key]["available_bytes"]
+                )
+            time.sleep(0.08)
             usage = health(self.cwd, 4)["cpu"]["usage_percent"]
             self.assertIsNotNone(usage)
             self.assertTrue(0 <= usage <= 100)
@@ -250,8 +300,10 @@ class WinProcessTests(unittest.TestCase):
         except (OSError, AttributeError) as error:
             self.skipTest(f"host performance counters unavailable: {error}")
         self.addCleanup(sampler.close)
-        with patch("winprocess._pdh_cpu", sampler), patch(
-                "winprocess._GetActiveProcessorGroupCount", return_value=2):
+        with (
+            patch("winprocess._pdh_cpu", sampler),
+            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
+        ):
             self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
             self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
             time.sleep(1.05)
@@ -261,9 +313,12 @@ class WinProcessTests(unittest.TestCase):
             self.assertEqual(health(self.cwd, 1)["cpu"]["usage_percent"], usage)
 
     def test_health_unavailable_pdh_does_not_report_partial_usage(self):
-        with patch("winprocess._pdh_cpu", None), patch("winprocess._pdh_retry_after", 0), patch(
-                "winprocess._GetActiveProcessorGroupCount", return_value=2), patch(
-                "winprocess._PdhCpu", side_effect=OSError("unavailable")) as build:
+        with (
+            patch("winprocess._pdh_cpu", None),
+            patch("winprocess._pdh_retry_after", 0),
+            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
+            patch("winprocess._PdhCpu", side_effect=OSError("unavailable")) as build,
+        ):
             self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
             self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
             build.assert_called_once()

@@ -15,52 +15,77 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Callable
+from typing import Callable, cast
 
 
 class JobCancelled(Exception):
     """The job was cancelled; ``exit_code`` is set if a process was reaped."""
 
-    def __init__(self, message: str = "Job was cancelled", *, exit_code: int | None = None):
+    def __init__(
+        self, message: str = "Job was cancelled", *, exit_code: int | None = None
+    ):
         super().__init__(message)
         self.exit_code = exit_code
 
 
 class _BasicLimits(C.Structure):
     _fields_ = [
-        ("PerProcessUserTimeLimit", C.c_int64), ("PerJobUserTimeLimit", C.c_int64),
-        ("LimitFlags", W.DWORD), ("MinimumWorkingSetSize", C.c_size_t),
-        ("MaximumWorkingSetSize", C.c_size_t), ("ActiveProcessLimit", W.DWORD),
-        ("Affinity", C.c_size_t), ("PriorityClass", W.DWORD),
+        ("PerProcessUserTimeLimit", C.c_int64),
+        ("PerJobUserTimeLimit", C.c_int64),
+        ("LimitFlags", W.DWORD),
+        ("MinimumWorkingSetSize", C.c_size_t),
+        ("MaximumWorkingSetSize", C.c_size_t),
+        ("ActiveProcessLimit", W.DWORD),
+        ("Affinity", C.c_size_t),
+        ("PriorityClass", W.DWORD),
         ("SchedulingClass", W.DWORD),
     ]
 
 
 class _ExtendedLimits(C.Structure):
     _fields_ = [
-        ("BasicLimitInformation", _BasicLimits), ("IoInfo", C.c_uint64 * 6),
-        ("ProcessMemoryLimit", C.c_size_t), ("JobMemoryLimit", C.c_size_t),
-        ("PeakProcessMemoryUsed", C.c_size_t), ("PeakJobMemoryUsed", C.c_size_t),
+        ("BasicLimitInformation", _BasicLimits),
+        ("IoInfo", C.c_uint64 * 6),
+        ("ProcessMemoryLimit", C.c_size_t),
+        ("JobMemoryLimit", C.c_size_t),
+        ("PeakProcessMemoryUsed", C.c_size_t),
+        ("PeakJobMemoryUsed", C.c_size_t),
     ]
 
 
 class _Accounting(C.Structure):
     _fields_ = [
-        ("TotalUserTime", C.c_int64), ("TotalKernelTime", C.c_int64),
-        ("ThisPeriodTotalUserTime", C.c_int64), ("ThisPeriodTotalKernelTime", C.c_int64),
-        ("TotalPageFaultCount", W.DWORD), ("TotalProcesses", W.DWORD),
-        ("ActiveProcesses", W.DWORD), ("TotalTerminatedProcesses", W.DWORD),
+        ("TotalUserTime", C.c_int64),
+        ("TotalKernelTime", C.c_int64),
+        ("ThisPeriodTotalUserTime", C.c_int64),
+        ("ThisPeriodTotalKernelTime", C.c_int64),
+        ("TotalPageFaultCount", W.DWORD),
+        ("TotalProcesses", W.DWORD),
+        ("ActiveProcesses", W.DWORD),
+        ("TotalTerminatedProcesses", W.DWORD),
     ]
 
 
 class _StartupInfo(C.Structure):
     _fields_ = [
-        ("cb", W.DWORD), ("lpReserved", W.LPWSTR), ("lpDesktop", W.LPWSTR),
-        ("lpTitle", W.LPWSTR), ("dwX", W.DWORD), ("dwY", W.DWORD),
-        ("dwXSize", W.DWORD), ("dwYSize", W.DWORD), ("dwXCountChars", W.DWORD),
-        ("dwYCountChars", W.DWORD), ("dwFillAttribute", W.DWORD), ("dwFlags", W.DWORD),
-        ("wShowWindow", W.WORD), ("cbReserved2", W.WORD), ("lpReserved2", C.c_void_p),
-        ("hStdInput", W.HANDLE), ("hStdOutput", W.HANDLE), ("hStdError", W.HANDLE),
+        ("cb", W.DWORD),
+        ("lpReserved", W.LPWSTR),
+        ("lpDesktop", W.LPWSTR),
+        ("lpTitle", W.LPWSTR),
+        ("dwX", W.DWORD),
+        ("dwY", W.DWORD),
+        ("dwXSize", W.DWORD),
+        ("dwYSize", W.DWORD),
+        ("dwXCountChars", W.DWORD),
+        ("dwYCountChars", W.DWORD),
+        ("dwFillAttribute", W.DWORD),
+        ("dwFlags", W.DWORD),
+        ("wShowWindow", W.WORD),
+        ("cbReserved2", W.WORD),
+        ("lpReserved2", C.c_void_p),
+        ("hStdInput", W.HANDLE),
+        ("hStdOutput", W.HANDLE),
+        ("hStdError", W.HANDLE),
     ]
 
 
@@ -70,17 +95,23 @@ class _StartupInfoEx(C.Structure):
 
 class _ProcessInformation(C.Structure):
     _fields_ = [
-        ("hProcess", W.HANDLE), ("hThread", W.HANDLE), ("dwProcessId", W.DWORD),
+        ("hProcess", W.HANDLE),
+        ("hThread", W.HANDLE),
+        ("dwProcessId", W.DWORD),
         ("dwThreadId", W.DWORD),
     ]
 
 
 class _MemoryStatus(C.Structure):
     _fields_ = [
-        ("dwLength", W.DWORD), ("dwMemoryLoad", W.DWORD),
-        ("ullTotalPhys", C.c_uint64), ("ullAvailPhys", C.c_uint64),
-        ("ullTotalPageFile", C.c_uint64), ("ullAvailPageFile", C.c_uint64),
-        ("ullTotalVirtual", C.c_uint64), ("ullAvailVirtual", C.c_uint64),
+        ("dwLength", W.DWORD),
+        ("dwMemoryLoad", W.DWORD),
+        ("ullTotalPhys", C.c_uint64),
+        ("ullAvailPhys", C.c_uint64),
+        ("ullTotalPageFile", C.c_uint64),
+        ("ullAvailPageFile", C.c_uint64),
+        ("ullTotalVirtual", C.c_uint64),
+        ("ullAvailVirtual", C.c_uint64),
         ("ullAvailExtendedVirtual", C.c_uint64),
     ]
 
@@ -103,19 +134,35 @@ _B = W.BOOL
 _SZ = C.c_size_t
 _CreateJobObject = _native("CreateJobObjectW", _H, _PTR, W.LPCWSTR)
 _SetInformationJobObject = _native("SetInformationJobObject", _B, _H, C.c_int, _PTR, _D)
-_QueryInformationJobObject = _native("QueryInformationJobObject", _B, _H, C.c_int, _PTR, _D, _P(_D))
+_QueryInformationJobObject = _native(
+    "QueryInformationJobObject", _B, _H, C.c_int, _PTR, _D, _P(_D)
+)
 _TerminateJobObject = _native("TerminateJobObject", _B, _H, W.UINT)
 _CreatePipe = _native("CreatePipe", _B, _P(_H), _P(_H), _PTR, _D)
 _CreateFile = _native("CreateFileW", _H, W.LPCWSTR, _D, _D, _PTR, _D, _D, _H)
 _CloseHandle = _native("CloseHandle", _B, _H)
 _GetCurrentProcess = _native("GetCurrentProcess", _H)
 _DuplicateHandle = _native("DuplicateHandle", _B, _H, _H, _H, _P(_H), _D, _B, _D)
-_InitializeAttributes = _native("InitializeProcThreadAttributeList", _B, _PTR, _D, _D, _P(_SZ))
-_UpdateAttribute = _native("UpdateProcThreadAttribute", _B, _PTR, _D, _SZ, _PTR, _SZ, _PTR, _P(_SZ))
+_InitializeAttributes = _native(
+    "InitializeProcThreadAttributeList", _B, _PTR, _D, _D, _P(_SZ)
+)
+_UpdateAttribute = _native(
+    "UpdateProcThreadAttribute", _B, _PTR, _D, _SZ, _PTR, _SZ, _PTR, _P(_SZ)
+)
 _DeleteAttributes = _native("DeleteProcThreadAttributeList", None, _PTR)
 _CreateProcess = _native(
-    "CreateProcessW", _B, W.LPCWSTR, W.LPWSTR, _PTR, _PTR, _B, _D,
-    _PTR, W.LPCWSTR, _P(_StartupInfoEx), _P(_ProcessInformation),
+    "CreateProcessW",
+    _B,
+    W.LPCWSTR,
+    W.LPWSTR,
+    _PTR,
+    _PTR,
+    _B,
+    _D,
+    _PTR,
+    W.LPCWSTR,
+    _P(_StartupInfoEx),
+    _P(_ProcessInformation),
 )
 _ReadFile = _native("ReadFile", _B, _H, _PTR, _D, _P(_D), _PTR)
 _WaitForSingleObject = _native("WaitForSingleObject", _D, _H, _D)
@@ -153,26 +200,41 @@ def _check(result):
 def _inheritable(handle: int, temporary: ExitStack) -> int:
     duplicate = _H()
     current = _GetCurrentProcess()
-    _check(_DuplicateHandle(current, handle, current, C.byref(duplicate), 0, True,
-                            _DUPLICATE_SAME_ACCESS))
-    temporary.callback(_CloseHandle, duplicate.value)
-    return duplicate.value
+    _check(
+        _DuplicateHandle(
+            current,
+            handle,
+            current,
+            C.byref(duplicate),
+            0,
+            True,
+            _DUPLICATE_SAME_ACCESS,
+        )
+    )
+    # The successful call fills the output handle.
+    duplicate_handle = cast(int, duplicate.value)
+    temporary.callback(_CloseHandle, duplicate_handle)
+    return duplicate_handle
 
 
 def _output_pipe(resources: ExitStack, temporary: ExitStack) -> tuple[int, int]:
     reader, writer = _H(), _H()
     _check(_CreatePipe(C.byref(reader), C.byref(writer), None, 0))
-    resources.callback(_CloseHandle, reader.value)
+    # The successful call fills both output handles.
+    read_handle, write_handle = cast(int, reader.value), cast(int, writer.value)
+    resources.callback(_CloseHandle, read_handle)
     try:
-        return reader.value, _inheritable(writer.value, temporary)
+        return read_handle, _inheritable(write_handle, temporary)
     finally:
-        _CloseHandle(writer.value)
+        _CloseHandle(write_handle)
 
 
 def _prepare(argv, env, cwd, executable):
     command = argv if isinstance(argv, str) else subprocess.list2cmdline(argv)
     directory = os.fspath(cwd)
-    if not command or any("\0" in text for text in (command, directory, executable or "")):
+    if not command or any(
+        "\0" in text for text in (command, directory, executable or "")
+    ):
         raise OSError(errno.EINVAL, "Empty command or NUL in process arguments")
     entries = []
     for key, value in sorted(env.items(), key=lambda pair: pair[0].upper()):
@@ -189,7 +251,10 @@ def _launch(job, resources, command, environment, directory, executable):
     with ExitStack() as temporary:
         size = _SZ()
         # The API sizes the list by failing with ERROR_INSUFFICIENT_BUFFER.
-        if _InitializeAttributes(None, 2, 0, C.byref(size)) or C.get_last_error() != _ERROR_INSUFFICIENT_BUFFER:
+        if (
+            _InitializeAttributes(None, 2, 0, C.byref(size))
+            or C.get_last_error() != _ERROR_INSUFFICIENT_BUFFER
+        ):
             raise C.WinError(C.get_last_error())
         attributes = C.create_string_buffer(size.value)
         _check(_InitializeAttributes(attributes, 2, 0, C.byref(size)))
@@ -210,8 +275,14 @@ def _launch(job, resources, command, environment, directory, executable):
             _CloseHandle(nul)
         handles = (_H * 3)(child_stdin, out_write, err_write)
         jobs = (_H * 1)(job)
-        _check(_UpdateAttribute(attributes, 0, _HANDLE_LIST, handles, C.sizeof(handles), None, None))
-        _check(_UpdateAttribute(attributes, 0, _JOB_LIST, jobs, C.sizeof(jobs), None, None))
+        _check(
+            _UpdateAttribute(
+                attributes, 0, _HANDLE_LIST, handles, C.sizeof(handles), None, None
+            )
+        )
+        _check(
+            _UpdateAttribute(attributes, 0, _JOB_LIST, jobs, C.sizeof(jobs), None, None)
+        )
 
         startup = _StartupInfoEx()
         startup.StartupInfo.cb = C.sizeof(startup)
@@ -222,9 +293,22 @@ def _launch(job, resources, command, environment, directory, executable):
         startup.lpAttributeList = C.addressof(attributes)
         process = _ProcessInformation()
         # The kernel attaches the job during creation, before user code executes.
-        _check(_CreateProcess(executable, command, None, None, True,
-                              _EXTENDED_STARTUPINFO_PRESENT | _CREATE_UNICODE_ENVIRONMENT | _CREATE_NO_WINDOW,
-                              environment, directory, C.byref(startup), C.byref(process)))
+        _check(
+            _CreateProcess(
+                executable,
+                command,
+                None,
+                None,
+                True,
+                _EXTENDED_STARTUPINFO_PRESENT
+                | _CREATE_UNICODE_ENVIRONMENT
+                | _CREATE_NO_WINDOW,
+                environment,
+                directory,
+                C.byref(startup),
+                C.byref(process),
+            )
+        )
         resources.callback(_CloseHandle, process.hProcess)
         _CloseHandle(process.hThread)
         return process.hProcess, out_read, err_read
@@ -241,7 +325,7 @@ def _drain(handle, callback, failures):
                     return
                 raise C.WinError(error)
             if count.value:
-                callback(buffer[:count.value])
+                callback(buffer[: count.value])
     except BaseException as error:
         failures.put(error)
 
@@ -261,20 +345,28 @@ def _wait_empty(job, failures=None):
     while True:
         if failures is not None:
             _raise_reader_failure(failures)
-        _check(_QueryInformationJobObject(job, _JOB_BASIC_ACCOUNTING, C.byref(accounting),
-                                         C.sizeof(accounting), None))
+        _check(
+            _QueryInformationJobObject(
+                job,
+                _JOB_BASIC_ACCOUNTING,
+                C.byref(accounting),
+                C.sizeof(accounting),
+                None,
+            )
+        )
         if not accounting.ActiveProcesses:
             return
         time.sleep(0.015)
 
 
 def _monitor(job, process, out_read, err_read, stdout, stderr, on_started):
-    failures = queue.SimpleQueue()
+    failures: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
     readers = []
     try:
         for handle, callback in ((out_read, stdout), (err_read, stderr)):
-            reader = threading.Thread(target=_drain, args=(handle, callback, failures),
-                                      name="winprocess-pipe")
+            reader = threading.Thread(
+                target=_drain, args=(handle, callback, failures), name="winprocess-pipe"
+            )
             reader.start()
             readers.append(reader)
         if on_started is not None:
@@ -315,8 +407,11 @@ class Job:
         try:
             limit = _ExtendedLimits()
             limit.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
-            _check(_SetInformationJobObject(handle, _JOB_EXTENDED_LIMIT, C.byref(limit),
-                                            C.sizeof(limit)))
+            _check(
+                _SetInformationJobObject(
+                    handle, _JOB_EXTENDED_LIMIT, C.byref(limit), C.sizeof(limit)
+                )
+            )
         except BaseException:
             _CloseHandle(handle)
             raise
@@ -351,9 +446,15 @@ class Job:
                 self._close_handle()
 
     def run(
-        self, argv: list[str] | str, *, cwd: Path | str, env: dict[str, str],
-        stdout: Callable[[bytes], None], stderr: Callable[[bytes], None],
-        executable: str | None = None, on_started: Callable[[], None] | None = None,
+        self,
+        argv: list[str] | str,
+        *,
+        cwd: Path | str,
+        env: dict[str, str],
+        stdout: Callable[[bytes], None],
+        stderr: Callable[[bytes], None],
+        executable: str | None = None,
+        on_started: Callable[[], None] | None = None,
     ) -> int:
         with self._lock:
             self._check_available()
@@ -362,11 +463,14 @@ class Job:
             with self._lock:
                 self._check_available()
                 job = self._handle
-                process, out_read, err_read = _launch(job, resources, command, environment,
-                                                     directory, executable)
+                process, out_read, err_read = _launch(
+                    job, resources, command, environment, directory, executable
+                )
                 self._active = True
             try:
-                code = _monitor(job, process, out_read, err_read, stdout, stderr, on_started)
+                code = _monitor(
+                    job, process, out_read, err_read, stdout, stderr, on_started
+                )
             finally:
                 with self._lock:
                     self._active = False
@@ -389,18 +493,31 @@ class _PdhCpu:
     def __init__(self):
         pdh = C.WinDLL("pdh.dll")
         op = _native("PdhOpenQueryW", W.LONG, W.LPCWSTR, _SZ, _P(_H), library=pdh)
-        add = _native("PdhAddEnglishCounterW", W.LONG, _H, W.LPCWSTR, _SZ, _P(_H), library=pdh)
+        add = _native(
+            "PdhAddEnglishCounterW", W.LONG, _H, W.LPCWSTR, _SZ, _P(_H), library=pdh
+        )
         self._close = _native("PdhCloseQuery", W.LONG, _H, library=pdh)
         self._collect = _native("PdhCollectQueryData", W.LONG, _H, library=pdh)
-        self._format = _native("PdhGetFormattedCounterValue", W.LONG, _H, _D,
-                               _P(_D), _P(_PdhValue), library=pdh)
+        self._format = _native(
+            "PdhGetFormattedCounterValue",
+            W.LONG,
+            _H,
+            _D,
+            _P(_D),
+            _P(_PdhValue),
+            library=pdh,
+        )
         self.query, self.counter = _H(), _H()
         self.last_collection = None
         self.last_usage = None
         if op(None, 0, C.byref(self.query)):
             raise OSError("Could not open Windows performance query")
-        if add(self.query, r"\Processor Information(_Total)\% Processor Time", 0,
-               C.byref(self.counter)):
+        if add(
+            self.query,
+            r"\Processor Information(_Total)\% Processor Time",
+            0,
+            C.byref(self.counter),
+        ):
             self.close()
             raise OSError("System-wide Windows processor counter unavailable")
 
@@ -418,8 +535,13 @@ class _PdhCpu:
         if self._collect(self.query) or previous is None:
             return None
         value = _PdhValue()
-        if (not self._format(self.counter, 0x200, None, C.byref(value))  # PDH_FMT_DOUBLE
-                and value.status in (0, 1) and math.isfinite(value.value)):
+        if (
+            not self._format(
+                self.counter, 0x200, None, C.byref(value)
+            )  # PDH_FMT_DOUBLE
+            and value.status in (0, 1)
+            and math.isfinite(value.value)
+        ):
             self.last_usage = min(100.0, max(0.0, value.value))
         return self.last_usage
 
@@ -476,9 +598,14 @@ def health(workspace: Path, uptime_seconds: float) -> dict:
     _check(_GlobalMemoryStatusEx(C.byref(memory)))
     disk = shutil.disk_usage(workspace)
     return {
-        "cpu": {"logical_cores": _GetActiveProcessorCount(0xFFFF) or os.cpu_count() or 1,
-                "usage_percent": _cpu_percent()},
-        "memory": {"total_bytes": memory.ullTotalPhys, "available_bytes": memory.ullAvailPhys},
+        "cpu": {
+            "logical_cores": _GetActiveProcessorCount(0xFFFF) or os.cpu_count() or 1,
+            "usage_percent": _cpu_percent(),
+        },
+        "memory": {
+            "total_bytes": memory.ullTotalPhys,
+            "available_bytes": memory.ullAvailPhys,
+        },
         "disk": {"total_bytes": disk.total, "available_bytes": disk.free},
         "uptime_seconds": uptime_seconds,
     }

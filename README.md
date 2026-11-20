@@ -15,13 +15,35 @@
 python winrunner.py
 ```
 
-按 **Ctrl+C** 停止。Windows 上可用 `python -m unittest discover -s tests -v` 运行集成测试。
+按 **Ctrl+C** 停止。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
+
+## 本机监控窗口
+
+服务启动后，在同一台机器的另一个终端运行：
+
+```powershell
+python winrunner_gui.py
+```
+
+窗口用同一份配置里的令牌和端口访问 `127.0.0.1`，只读显示 CPU、内存、磁盘、运行指纹，以及项目和临时命令状态。窗口不负责启停服务，关闭它不影响任务。需要带 Tcl/Tk 的 Python 和交互桌面；无桌面环境仍可单独运行服务。若服务改成绑定单个非回环 IP，监控窗口无法连接。
 
 ## 任务和结果
 
 - **Project**：同步克隆公开 HTTPS 仓库。创建后即可浏览和下载当前检出目录的内容，包括 `.git`。不自动拉取子模块或 Git LFS 文件。项目列表和详情直接显示 Action 状态；`GET /projects/{name}/actions` 可查详情和日志。
 - **Action**：每个 Project 只有一个槽位。请求一旦占槽就清除上一轮文件和输出，即使这次失败。每次刷新远端分支和标签，按目标提交干净检出，不 merge；强推或删引用后，仅残留在本地缓存里的提交不能执行。停止 Action 会保留当时的文件和输出。
-- **命令**：`/commands` 支持 `cmd` 和多行 PowerShell，允许并行，按 ID 查询和删除。删除会终止任务并丢弃记录和输出。
+- **命令**：`/commands` 支持 `cmd` 和多行 PowerShell，允许并行。短 ID 仅在本轮服务内唯一；重启可通过 `/health` 的 `run_id` 识别。删除会终止任务并丢弃记录和输出。
 - **等待与终止**：`timeout` 只限制 POST 等响应的时间，默认 10 秒；设为 `0` 即不等，不限制任务运行时长。每项任务用独立 Windows Job Object 管理自身的进程树；不影响其他任务。
 
 脚本和命令写入 stdout/stderr 管道的数据可立即轮询，不等换行或退出。日志在内存中按原始字节保存，不限量、不自动淘汰。实例回收或 Runner 退出后不会恢复；调用方负责控制输出量、定期取走结果和检查点，并让脚本能从外部检查点继续运行。
+
+## 开发检查
+
+若本机未安装 Black 或 mypy，可将它们装进项目的 `.venv`；运行服务和 GUI 不依赖这两个工具。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install black==26.3.1 mypy==1.19.1
+$sources = @(git ls-files '*.py')
+.\.venv\Scripts\python.exe -m black --check @sources
+.\.venv\Scripts\python.exe -m mypy
+```

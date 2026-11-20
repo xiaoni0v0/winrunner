@@ -11,12 +11,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socket import SHUT_RDWR
 from threading import BoundedSemaphore
+from typing import cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import config
 from runner import APIError, Runner, invalid, not_found
 from winprocess import health
-
 
 DECIMAL = re.compile(r"[0-9]+\Z")
 BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
@@ -65,6 +65,9 @@ def range_bounds(header, size):
 
 
 class HTTPServer(ThreadingHTTPServer):
+    token: bytes
+    runner: Runner
+
     def __init__(self, *args, **kwargs):
         limit = getattr(config, "MAX_HTTP_CONNECTIONS", 64)
         if type(limit) is not int or limit < 1:
@@ -75,14 +78,16 @@ class HTTPServer(ThreadingHTTPServer):
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
             body = b'{"error":{"code":"server_busy","message":"Too many HTTP connections"}}'
-            response = (b"HTTP/1.0 503 Service Unavailable\r\n"
-                        b"Content-Type: application/json; charset=utf-8\r\n"
-                        b"Retry-After: 1\r\nCache-Control: no-store\r\nConnection: close\r\n"
-                        b"Content-Length: %d\r\n\r\n" % len(body)) + body
+            response = (
+                b"HTTP/1.0 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Retry-After: 1\r\nCache-Control: no-store\r\nConnection: close\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+            ) + body
             try:
                 # Closing with unread bytes can reset the connection on Windows.
                 # Discard one chunk, without waiting for a complete HTTP request.
-                request.settimeout(.01)
+                request.settimeout(0.01)
                 try:
                     request.recv(65536)
                 except TimeoutError:
@@ -108,6 +113,7 @@ class HTTPServer(ThreadingHTTPServer):
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
+    server: HTTPServer
     server_version = "WinRunner/1.0"
     sys_version = ""
 
@@ -144,12 +150,22 @@ class HTTPHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Authorization", [])
         try:
             scheme, token = values[0].split(" ", 1) if len(values) == 1 else ("", "")
-            valid = scheme.lower() == "bearer" and hmac.compare_digest(token.encode("ascii"), self.server.token)
+            valid = scheme.lower() == "bearer" and hmac.compare_digest(
+                token.encode("ascii"), self.server.token
+            )
         except (ValueError, UnicodeError):
             valid = False
         if not valid:
-            self.reply(401, {"error": {"code": "unauthorized", "message": "Valid Bearer token required"}},
-                       {"WWW-Authenticate": "Bearer"})
+            self.reply(
+                401,
+                {
+                    "error": {
+                        "code": "unauthorized",
+                        "message": "Valid Bearer token required",
+                    }
+                },
+                {"WWW-Authenticate": "Bearer"},
+            )
             return False
         return True
 
@@ -162,7 +178,11 @@ class HTTPHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def reply(self, status, value=None, headers=None):
-        data = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("ascii") if value is not None else b""
+        data = (
+            json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+            if value is not None
+            else b""
+        )
         self.send_response(status)
         if value is not None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -185,11 +205,15 @@ class HTTPHandler(BaseHTTPRequestHandler):
             raise invalid("Multiple Content-Length headers")
         length = uint(lengths[0].strip(), "Content-Length") if lengths else 0
         if length > config.MAX_REQUEST_BYTES:
-            raise APIError(413, "request_too_large", "Request body exceeds the configured limit")
+            raise APIError(
+                413, "request_too_large", "Request body exceeds the configured limit"
+            )
         try:
             raw = self.rfile.read(length)
         except TimeoutError as exc:
-            raise APIError(408, "request_timeout", "Timed out while receiving the request body") from exc
+            raise APIError(
+                408, "request_timeout", "Timed out while receiving the request body"
+            ) from exc
         if len(raw) != length:
             raise invalid("Request body ended before Content-Length")
         return raw
@@ -199,7 +223,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             if not url.path.startswith("/") or url.scheme or url.netloc or url.fragment:
                 raise ValueError
-            parts = [unquote(part, encoding="utf-8", errors="strict") for part in url.path[1:].split("/")]
+            parts = [
+                unquote(part, encoding="utf-8", errors="strict")
+                for part in url.path[1:].split("/")
+            ]
             if any(not part or any(c in part for c in "/\\\0") for part in parts):
                 raise not_found("Route not found")
         except (UnicodeError, ValueError) as exc:
@@ -209,7 +236,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
     @staticmethod
     def parse_query(raw):
         try:
-            items = parse_qsl(raw, keep_blank_values=True, errors="strict", max_num_fields=16)
+            items = parse_qsl(
+                raw, keep_blank_values=True, errors="strict", max_num_fields=16
+            )
             query = dict(items)
             if len(items) != len(query):
                 raise ValueError
@@ -232,12 +261,30 @@ class HTTPHandler(BaseHTTPRequestHandler):
             elif isinstance(exc, APIError):
                 self.reply(exc.status, exc.response_payload())
             elif isinstance(exc, ValueError):  # Includes BadPath.
-                self.reply(400, {"error": {"code": "invalid_request", "message": str(exc)}})
+                self.reply(
+                    400, {"error": {"code": "invalid_request", "message": str(exc)}}
+                )
             elif isinstance(exc, (FileNotFoundError, NotADirectoryError)):
-                self.reply(404, {"error": {"code": "not_found", "message": "File or directory not found"}})
+                self.reply(
+                    404,
+                    {
+                        "error": {
+                            "code": "not_found",
+                            "message": "File or directory not found",
+                        }
+                    },
+                )
             else:
                 traceback.print_exc()
-                self.reply(500, {"error": {"code": "internal_error", "message": "Internal runner error"}})
+                self.reply(
+                    500,
+                    {
+                        "error": {
+                            "code": "internal_error",
+                            "message": "Internal runner error",
+                        }
+                    },
+                )
 
     def route(self, method, parts, raw_query):
         key = (parts[0], None, *parts[2:]) if len(parts) > 1 else tuple(parts)
@@ -254,7 +301,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
     def get_health(self, _method, _name, query):
         self.no_query(query)
         runner = self.server.runner
-        self.reply(200, health(runner.base, time.monotonic() - runner.started_at))
+        self.reply(
+            200,
+            {
+                **health(runner.base, time.monotonic() - runner.started_at),
+                "run_id": runner.run_id,
+            },
+        )
 
     def projects(self, method, _name, query):
         self.no_query(query)
@@ -291,7 +344,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
             raise invalid("Unexpected query parameter")
         relative = query.get("path", "")
         try:
-            with self.server.runner.file_entry(name, relative, cancel_read=self.abort_file_response) as entry:
+            with self.server.runner.file_entry(
+                name, relative, cancel_read=self.abort_file_response
+            ) as entry:
                 self.files(entry, relative)
         except OSError as exc:
             if not self.response_started and getattr(exc, "winerror", None) in (32, 33):
@@ -339,14 +394,26 @@ class HTTPHandler(BaseHTTPRequestHandler):
             raise invalid("Unexpected query parameters")
 
     def method_error(self, allow):
-        self.reply(405, {"error": {"code": "method_not_allowed", "message": "Method not allowed"}},
-                   {"Allow": allow})
+        self.reply(
+            405,
+            {"error": {"code": "method_not_allowed", "message": "Method not allowed"}},
+            {"Allow": allow},
+        )
 
     def files(self, entry, relative):
         if entry.is_dir:
-            items = sorted(entry.list_entries(), key=lambda item: item["name"].casefold())
-            self.reply(200, {"path": "" if relative in ("", ".") else relative.replace("\\", "/"),
-                             "entries": items})
+            items = sorted(
+                entry.list_entries(), key=lambda item: item["name"].casefold()
+            )
+            self.reply(
+                200,
+                {
+                    "path": (
+                        "" if relative in ("", ".") else relative.replace("\\", "/")
+                    ),
+                    "entries": items,
+                },
+            )
         else:
             self.download(entry)
 
@@ -358,7 +425,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
             try:
                 start, stop = range_bounds(header, size)
             except APIError as exc:
-                self.reply(416, {"error": exc.payload()}, {"Content-Range": f"bytes */{size}"})
+                self.reply(
+                    416, {"error": exc.payload()}, {"Content-Range": f"bytes */{size}"}
+                )
                 return
             file.seek(start)
             self.send_response(206 if header is not None else 200)
@@ -400,13 +469,19 @@ def main():
     if sys.platform != "win32":
         sys.exit("WinRunner only supports Windows")
     token = config.TOKEN
-    if (not isinstance(token, str) or not token or token == "123456"
-            or any(not 33 <= ord(c) <= 126 for c in token)):
-        sys.exit("Set TOKEN in config.py to a non-placeholder ASCII token without spaces")
+    if (
+        not isinstance(token, str)
+        or not token
+        or token == "123456"
+        or any(not 33 <= ord(c) <= 126 for c in token)
+    ):
+        sys.exit(
+            "Set TOKEN in config.py to a non-placeholder ASCII token without spaces"
+        )
     with HTTPServer((config.HOST, config.PORT), HTTPHandler) as server:
         server.token = token.encode("ascii")
         server.runner = Runner(config.DATA_DIR)
-        host, port = server.server_address
+        host, port = cast(tuple[str, int], server.server_address)  # IPv4 listener
         print(f"WinRunner listening on http://{host}:{port}", flush=True)
         try:
             server.serve_forever()

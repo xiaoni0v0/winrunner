@@ -26,10 +26,26 @@ class WinFilesTests(unittest.TestCase):
 
     def test_invalid_names(self):
         for name in (
-            "/escape", "\\escape", "C:drive-relative", "C:/drive-absolute", "\\\\server\\share",
-            "\\\\?\\C:\\foo", "../escape", "dir\\..\\escape", "./../escape",
-            "dir/con.txt", "NUL .txt", "dir/Com².log", "LPT9", "CONIN$", "aux",
-            "dir/stream:ads", "dir/trailing.", "trailing /child", "file\0name", "f*",
+            "/escape",
+            "\\escape",
+            "C:drive-relative",
+            "C:/drive-absolute",
+            "\\\\server\\share",
+            "\\\\?\\C:\\foo",
+            "../escape",
+            "dir\\..\\escape",
+            "./../escape",
+            "dir/con.txt",
+            "NUL .txt",
+            "dir/Com².log",
+            "LPT9",
+            "CONIN$",
+            "aux",
+            "dir/stream:ads",
+            "dir/trailing.",
+            "trailing /child",
+            "file\0name",
+            "f*",
         ):
             with self.subTest(name=name), self.assertRaises(BadPath):
                 with pinned_entry(self.root, name):
@@ -43,6 +59,7 @@ class WinFilesTests(unittest.TestCase):
         for pin in (pinned_path, pinned_entry):
             with self.subTest(pin=pin), pin(self.root, f".git\\{target.name}") as value:
                 if pin is pinned_entry:
+                    assert isinstance(value, winfiles._PinnedEntry)
                     self.assertEqual(value.path, target)
                     self.assertFalse(value.is_dir)
                     with value.open_file() as file:
@@ -52,9 +69,10 @@ class WinFilesTests(unittest.TestCase):
                     with value.open_file() as file:
                         self.assertEqual(file.read(1), b"0")
                 else:
+                    assert isinstance(value, Path)
                     self.assertEqual(value, target)
                     self.assertEqual(value.read_bytes(), b"0123456789")
-                pinned_names = (self.parent, self.root, git_dir)
+                pinned_names: tuple[Path, ...] = (self.parent, self.root, git_dir)
                 if pin is pinned_path:
                     pinned_names += (target,)
                 for path in pinned_names:
@@ -78,7 +96,12 @@ class WinFilesTests(unittest.TestCase):
 
     def set_file_info(self, handle, info_class, info):
         setter = winfiles._kernel32.SetFileInformationByHandle
-        setter.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        setter.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
         setter.restype = wintypes.BOOL
         if not setter(handle, info_class, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -90,7 +113,10 @@ class WinFilesTests(unittest.TestCase):
         # Rotate with a writer that permits deletion (Python's builtin open
         # does not share delete on Windows; the reader cannot change that).
         with self.native_handle(target, 0x40000000, 7):  # GENERIC_WRITE, share all
-            with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+            with (
+                pinned_entry(self.root, target.name) as entry,
+                entry.open_file() as file,
+            ):
                 self.assertEqual(file.read(8), old[:8])
                 target.rename(rotated)
                 target.write_bytes(b"new file at the original name")
@@ -112,8 +138,10 @@ class WinFilesTests(unittest.TestCase):
 
         class FileRenameInfo(ctypes.Structure):
             _fields_ = [
-                ("flags", wintypes.DWORD), ("root_directory", wintypes.HANDLE),
-                ("name_bytes", wintypes.DWORD), ("name", wintypes.WCHAR * (target_name_bytes // 2 + 1)),
+                ("flags", wintypes.DWORD),
+                ("root_directory", wintypes.HANDLE),
+                ("name_bytes", wintypes.DWORD),
+                ("name", wintypes.WCHAR * (target_name_bytes // 2 + 1)),
             ]
 
         # FileRenameInfoEx with REPLACE_IF_EXISTS | POSIX_SEMANTICS. This is
@@ -125,7 +153,10 @@ class WinFilesTests(unittest.TestCase):
             with self.native_handle(replacement, 0x10000, 7) as handle:  # DELETE access
                 self.set_file_info(handle, 22, rename_info)
             self.assertFalse(replacement.exists())
-            with pinned_entry(self.root, target.name) as current, current.open_file() as current_file:
+            with (
+                pinned_entry(self.root, target.name) as current,
+                current.open_file() as current_file,
+            ):
                 self.assertEqual(current_file.read(), new)
             self.assertEqual(os.fstat(file.fileno()).st_size, len(old))
             self.assertEqual(file.read(), old[8:])
@@ -135,10 +166,14 @@ class WinFilesTests(unittest.TestCase):
         target.write_bytes(b"old payload")
         with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
             with self.native_handle(target, 0x10000, 7) as handle:  # DELETE access
-                self.set_file_info(handle, 4, wintypes.BOOL(True))  # legacy FileDispositionInfo
+                self.set_file_info(
+                    handle, 4, wintypes.BOOL(True)
+                )  # legacy FileDispositionInfo
             with self.assertRaises(FileNotFoundError):
                 with pinned_entry(self.root, target.name):
-                    self.fail("unexpectedly opened a new handle to a delete-pending file")
+                    self.fail(
+                        "unexpectedly opened a new handle to a delete-pending file"
+                    )
             self.assertEqual(file.read(), b"old payload")
         self.assertFalse(target.exists())
 
@@ -147,7 +182,10 @@ class WinFilesTests(unittest.TestCase):
         with target.open("wb") as writer:
             writer.write(b"payload")
             writer.flush()
-            with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+            with (
+                pinned_entry(self.root, target.name) as entry,
+                entry.open_file() as file,
+            ):
                 self.assertEqual(file.read(), b"payload")
         with self.native_handle(target, 0x40000000, 0):  # GENERIC_WRITE, exclusive
             with self.assertRaises(OSError) as error:
@@ -171,7 +209,9 @@ class WinFilesTests(unittest.TestCase):
                 self.assertIsNone(by_name[".git"]["size_bytes"])
                 for i in range(650):
                     name = f"file {i:04d}"
-                    self.assertEqual(by_name[name], {"name": name, "type": "file", "size_bytes": 3})
+                    self.assertEqual(
+                        by_name[name], {"name": name, "type": "file", "size_bytes": 3}
+                    )
                 self.assertEqual(entry.list_entries(), entries)
         with self.assertRaises(FileNotFoundError):
             with pinned_entry(self.root, "missing/path"):
@@ -188,18 +228,35 @@ class WinFilesTests(unittest.TestCase):
         # privilege. Use a temporary, ordinary local volume; skip if unavailable.
         io_control = winfiles._kernel32.DeviceIoControl
         io_control.argtypes = (
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
-            wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
         )
         io_control.restype = wintypes.BOOL
-        flags = winfiles._FILE_FLAG_BACKUP_SEMANTICS | winfiles._FILE_FLAG_OPEN_REPARSE_POINT
+        flags = (
+            winfiles._FILE_FLAG_BACKUP_SEMANTICS
+            | winfiles._FILE_FLAG_OPEN_REPARSE_POINT
+        )
         handle = winfiles._create_file(str(leaf), 0x100, 7, None, 3, flags, None)
         if handle == winfiles._INVALID_HANDLE_VALUE:
-            self.skipTest(f"Cannot open temporary junction candidate: WinError {ctypes.get_last_error()}")
+            self.skipTest(
+                f"Cannot open temporary junction candidate: WinError {ctypes.get_last_error()}"
+            )
         self.addCleanup(winfiles._close_handle, handle)
         sub = ("\\??\\" + str(outside)).encode("utf-16-le")
         visible = str(outside).encode("utf-16-le")
-        names = struct.pack("<HHHH", 0, len(sub), len(sub) + 2, len(visible)) + sub + b"\0\0" + visible + b"\0\0"
+        names = (
+            struct.pack("<HHHH", 0, len(sub), len(sub) + 2, len(visible))
+            + sub
+            + b"\0\0"
+            + visible
+            + b"\0\0"
+        )
         mount_point = struct.pack("<IHH", 0xA0000003, len(names), 0) + names
 
         junction_present = False
@@ -207,19 +264,36 @@ class WinFilesTests(unittest.TestCase):
         def make_junction():
             nonlocal junction_present
             if not io_control(
-                handle, 0x900A4, mount_point, len(mount_point), None, 0,
-                ctypes.byref(wintypes.DWORD()), None,
+                handle,
+                0x900A4,
+                mount_point,
+                len(mount_point),
+                None,
+                0,
+                ctypes.byref(wintypes.DWORD()),
+                None,
             ):
-                self.skipTest(f"Cannot install junction: WinError {ctypes.get_last_error()}")
+                self.skipTest(
+                    f"Cannot install junction: WinError {ctypes.get_last_error()}"
+                )
             junction_present = True
 
         def clear_junction():
             nonlocal junction_present
             if junction_present:
                 data = struct.pack("<IHH", 0xA0000003, 0, 0)
-                self.assertTrue(io_control(
-                    handle, 0x900AC, data, len(data), None, 0, ctypes.byref(wintypes.DWORD()), None,
-                ))
+                self.assertTrue(
+                    io_control(
+                        handle,
+                        0x900AC,
+                        data,
+                        len(data),
+                        None,
+                        0,
+                        ctypes.byref(wintypes.DWORD()),
+                        None,
+                    )
+                )
                 junction_present = False
 
         self.addCleanup(clear_junction)
@@ -229,10 +303,21 @@ class WinFilesTests(unittest.TestCase):
             self.assertEqual(list(leaf.iterdir()), [leaf / "secret.txt"])
             self.assertEqual(entry.list_entries(), [])
         with pinned_entry(self.root, "") as entry:
-            self.assertEqual(entry.list_entries(), [{"name": "leaf", "type": "other", "size_bytes": None}])
+            self.assertEqual(
+                entry.list_entries(),
+                [{"name": "leaf", "type": "other", "size_bytes": None}],
+            )
         for pin in (pinned_path, pinned_entry):
-            for root, name in ((self.root, "leaf"), (self.root, "leaf/secret.txt"), (leaf, ""), (leaf / "project", "")):
-                with self.subTest(root=root, name=name, pin=pin), self.assertRaises(BadPath):
+            for root, name in (
+                (self.root, "leaf"),
+                (self.root, "leaf/secret.txt"),
+                (leaf, ""),
+                (leaf / "project", ""),
+            ):
+                with (
+                    self.subTest(root=root, name=name, pin=pin),
+                    self.assertRaises(BadPath),
+                ):
                     with pin(root, name):
                         self.fail("unexpectedly followed the junction")
 
@@ -247,7 +332,9 @@ class WinFilesTests(unittest.TestCase):
         with patch.object(winfiles, "_pin_child", replace_parent_before_open):
             with self.assertRaises((BadPath, FileNotFoundError)):
                 with pinned_entry(self.root, "leaf/secret.txt"):
-                    self.fail("unexpectedly followed a junction created after checking its parent")
+                    self.fail(
+                        "unexpectedly followed a junction created after checking its parent"
+                    )
 
 
 if __name__ == "__main__":

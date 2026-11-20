@@ -18,7 +18,7 @@ import string
 from contextlib import ExitStack, contextmanager
 from ctypes import wintypes
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, cast
 
 if os.name == "nt":
     import msvcrt
@@ -35,9 +35,8 @@ _DEVICES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}) | {
 
 
 def _validate_component(component: str) -> None:
-    if (
-        component.endswith((".", " "))
-        or any(c in _INVALID_CHARS or ord(c) < 32 for c in component)
+    if component.endswith((".", " ")) or any(
+        c in _INVALID_CHARS or ord(c) < 32 for c in component
     ):
         raise BadPath(f"Invalid path component: {component!r}")
     # Win32 also recognizes device names with an extension or spaces before it.
@@ -98,33 +97,47 @@ class _FileAttributeTagInfo(ctypes.Structure):
 
 class _UnicodeString(ctypes.Structure):
     _fields_ = [
-        ("length", wintypes.USHORT), ("maximum_length", wintypes.USHORT),
+        ("length", wintypes.USHORT),
+        ("maximum_length", wintypes.USHORT),
         ("buffer", wintypes.LPVOID),
     ]
 
 
 class _ObjectAttributes(ctypes.Structure):
     _fields_ = [
-        ("length", wintypes.ULONG), ("root_directory", wintypes.HANDLE),
-        ("object_name", ctypes.POINTER(_UnicodeString)), ("attributes", wintypes.ULONG),
-        ("security_descriptor", wintypes.LPVOID), ("security_qos", wintypes.LPVOID),
+        ("length", wintypes.ULONG),
+        ("root_directory", wintypes.HANDLE),
+        ("object_name", ctypes.POINTER(_UnicodeString)),
+        ("attributes", wintypes.ULONG),
+        ("security_descriptor", wintypes.LPVOID),
+        ("security_qos", wintypes.LPVOID),
     ]
 
 
 class _IoStatusBlock(ctypes.Structure):
     # The first field is a union of an NTSTATUS and a pointer.
-    _fields_ = [("status_or_pointer", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+    _fields_ = [
+        ("status_or_pointer", ctypes.c_void_p),
+        ("information", ctypes.c_size_t),
+    ]
 
 
 class _DirectoryInfo(ctypes.Structure):
     _fields_ = [
-        ("next_entry_offset", wintypes.DWORD), ("file_index", wintypes.DWORD),
-        ("creation_time", ctypes.c_int64), ("last_access_time", ctypes.c_int64),
-        ("last_write_time", ctypes.c_int64), ("change_time", ctypes.c_int64),
-        ("file_size", ctypes.c_int64), ("allocation_size", ctypes.c_int64),
-        ("attributes", wintypes.DWORD), ("name_bytes", wintypes.DWORD),
-        ("ea_size", wintypes.DWORD), ("short_name_length", ctypes.c_char),
-        ("short_name", wintypes.WCHAR * 12), ("file_id", ctypes.c_int64),
+        ("next_entry_offset", wintypes.DWORD),
+        ("file_index", wintypes.DWORD),
+        ("creation_time", ctypes.c_int64),
+        ("last_access_time", ctypes.c_int64),
+        ("last_write_time", ctypes.c_int64),
+        ("change_time", ctypes.c_int64),
+        ("file_size", ctypes.c_int64),
+        ("allocation_size", ctypes.c_int64),
+        ("attributes", wintypes.DWORD),
+        ("name_bytes", wintypes.DWORD),
+        ("ea_size", wintypes.DWORD),
+        ("short_name_length", ctypes.c_char),
+        ("short_name", wintypes.WCHAR * 12),
+        ("file_id", ctypes.c_int64),
         ("name", wintypes.WCHAR),  # beginning of a variable-length name
     ]
 
@@ -134,14 +147,22 @@ if os.name == "nt":
 
     _create_file = _kernel32.CreateFileW
     _create_file.argtypes = (
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
     )
     _create_file.restype = wintypes.HANDLE
 
     _get_file_info = _kernel32.GetFileInformationByHandleEx
     _get_file_info.argtypes = (
-        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
     )
     _get_file_info.restype = wintypes.BOOL
 
@@ -155,17 +176,30 @@ if os.name == "nt":
 
     _duplicate_handle = _kernel32.DuplicateHandle
     _duplicate_handle.argtypes = (
-        wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
-        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
     )
     _duplicate_handle.restype = wintypes.BOOL
 
     _ntdll = ctypes.WinDLL("ntdll")
     _nt_create_file = _ntdll.NtCreateFile
     _nt_create_file.argtypes = (
-        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, ctypes.POINTER(_ObjectAttributes),
-        ctypes.POINTER(_IoStatusBlock), wintypes.LPVOID, wintypes.ULONG, wintypes.ULONG,
-        wintypes.ULONG, wintypes.ULONG, wintypes.LPVOID, wintypes.ULONG,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
     )
     _nt_create_file.restype = wintypes.LONG
 
@@ -184,9 +218,13 @@ def _pin(path: Path) -> int:
     # A metadata-only handle may not participate in Windows share checks.
     # Ask for READ_DATA so omitting FILE_SHARE_DELETE actually protects the name.
     handle = _create_file(
-        str(path), _FILE_READ_DATA | _FILE_READ_ATTRIBUTES,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING,
-        _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS, None,
+        str(path),
+        _FILE_READ_DATA | _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS,
+        None,
     )
     if handle == _INVALID_HANDLE_VALUE:
         raise _winerror(path)
@@ -202,12 +240,17 @@ def _pin_child(parent: int, path: Path, name: str, *, file_leaf: bool = False) -
     buffer = ctypes.create_string_buffer(encoded + b"\0\0")
     nt_name = _UnicodeString(len(encoded), len(encoded) + 2, ctypes.addressof(buffer))
     obj = _ObjectAttributes(
-        ctypes.sizeof(_ObjectAttributes), parent, ctypes.pointer(nt_name),
-        _OBJ_CASE_INSENSITIVE | _OBJ_DONT_REPARSE, None, None,
+        ctypes.sizeof(_ObjectAttributes),
+        parent,
+        ctypes.pointer(nt_name),
+        _OBJ_CASE_INSENSITIVE | _OBJ_DONT_REPARSE,
+        None,
+        None,
     )
     handle = wintypes.HANDLE()
     options = (
-        _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_FOR_BACKUP_INTENT
+        _FILE_SYNCHRONOUS_IO_NONALERT
+        | _FILE_OPEN_FOR_BACKUP_INTENT
         | _FILE_FLAG_OPEN_REPARSE_POINT
     )
     # Let the kernel distinguish files from directories in the open itself.
@@ -219,12 +262,21 @@ def _pin_child(parent: int, path: Path, name: str, *, file_leaf: bool = False) -
             share |= _FILE_SHARE_DELETE
             create_options |= _FILE_NON_DIRECTORY_FILE
         status = _nt_create_file(
-            ctypes.byref(handle), _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
-            ctypes.byref(obj), ctypes.byref(_IoStatusBlock()), None, 0,
-            share, _FILE_OPEN, create_options, None, 0,
+            ctypes.byref(handle),
+            _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            ctypes.byref(obj),
+            ctypes.byref(_IoStatusBlock()),
+            None,
+            0,
+            share,
+            _FILE_OPEN,
+            create_options,
+            None,
+            0,
         )
         if status >= 0:
-            return handle.value
+            # A successful NtCreateFile fills the output handle.
+            return cast(int, handle.value)
         if not share_delete or (status & 0xFFFFFFFF) != _STATUS_FILE_IS_A_DIRECTORY:
             break
         # Retry without delete sharing to pin a directory leaf (or a new file
@@ -234,9 +286,14 @@ def _pin_child(parent: int, path: Path, name: str, *, file_leaf: bool = False) -
     if ntstatus == _STATUS_DELETE_PENDING:
         # Legacy deletion leaves the name visible until the last handle is
         # closed, but another reader cannot open it. Preserve real ACL errors.
-        raise FileNotFoundError(errno.ENOENT, "File or directory is pending deletion", str(path))
+        raise FileNotFoundError(
+            errno.ENOENT, "File or directory is pending deletion", str(path)
+        )
     code = _ntstatus_to_error(status)
-    if ntstatus == _STATUS_REPARSE_POINT_ENCOUNTERED or code == _ERROR_CANT_RESOLVE_FILENAME:
+    if (
+        ntstatus == _STATUS_REPARSE_POINT_ENCOUNTERED
+        or code == _ERROR_CANT_RESOLVE_FILENAME
+    ):
         raise BadPath(f"Reparse point not permitted: {name!r}")
     raise _winerror(path, code)
 
@@ -256,7 +313,9 @@ def _check_handle(stack: ExitStack, handle: int, path: Path, *, directory: bool)
 
 
 @contextmanager
-def _walk(root: Path, relative: str, *, relative_handles: bool) -> Iterator[tuple[Path, int, int]]:
+def _walk(
+    root: Path, relative: str, *, relative_handles: bool
+) -> Iterator[tuple[Path, int, int]]:
     relative_parts = _relative_parts(relative)
     if os.name != "nt":
         raise OSError(errno.ENOTSUP, "Project path pinning requires Windows")
@@ -307,8 +366,10 @@ class _PinnedEntry:
     def __init__(self, path: Path, handle: int, attributes: int):
         self.path = path
         self.is_dir = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
-        self._regular = not attributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE)
-        self._handle = handle
+        self._regular = not attributes & (
+            _FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE
+        )
+        self._handle: int | None = handle
 
     def _require_handle(self) -> int:
         if self._handle is None:
@@ -326,13 +387,23 @@ class _PinnedEntry:
         duplicate = wintypes.HANDLE()
         proc = _get_process()
         if not _duplicate_handle(
-            proc, handle, proc, ctypes.byref(duplicate), 0, False, _DUPLICATE_SAME_ACCESS
+            proc,
+            handle,
+            proc,
+            ctypes.byref(duplicate),
+            0,
+            False,
+            _DUPLICATE_SAME_ACCESS,
         ):
             raise _winerror(self.path)
+        # A successful DuplicateHandle fills the output handle.
+        duplicate_handle = cast(int, duplicate.value)
         try:
-            fd = msvcrt.open_osfhandle(duplicate.value, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+            fd = msvcrt.open_osfhandle(
+                duplicate_handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT
+            )
         except BaseException:
-            _close_handle(duplicate.value)
+            _close_handle(duplicate_handle)
             raise
         try:
             os.lseek(fd, 0, os.SEEK_SET)
@@ -354,11 +425,13 @@ class _PinnedEntry:
             while True:
                 record = _DirectoryInfo.from_buffer(buffer, offset)
                 start = offset + _DirectoryInfo.name.offset
-                name = bytes(buffer[start:start + record.name_bytes]).decode(
-                    "utf-16-le", errors="surrogatepass",
-                )
+                # ctypes c_char arrays return bytes when sliced.
+                raw_name = cast(bytes, buffer[start : start + record.name_bytes])
+                name = raw_name.decode("utf-16-le", errors="surrogatepass")
                 if name not in (".", ".."):
-                    if record.attributes & (_FILE_ATTRIBUTE_REPARSE_POINT | _FILE_ATTRIBUTE_DEVICE):
+                    if record.attributes & (
+                        _FILE_ATTRIBUTE_REPARSE_POINT | _FILE_ATTRIBUTE_DEVICE
+                    ):
                         kind, size = "other", None
                     elif record.attributes & _FILE_ATTRIBUTE_DIRECTORY:
                         kind, size = "directory", None

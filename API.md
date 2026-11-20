@@ -90,6 +90,8 @@
 
 非交互运行，不加载 PowerShell 用户配置。`ps` 默认关闭 PowerShell 进度提示，命令可自行设置 `$ProgressPreference = 'Continue'` 恢复；错误和程序写入 stderr 的内容不做过滤。若机器的 PowerShell 执行策略禁止加载本地脚本模块，可在 [config.py](<config.py>) 将 `PS_SUPPRESS_PROGRESS` 设为 `False`，无需放宽系统策略。工作目录为 Runner 账号的用户目录，命令可自行 `cd`。可并发。`200` / `202`：`Command`，即 `Task` 加字段 `id`（服务端分配的 string）、`mode`（`cmd` / `ps`）。
 
+`id` 是从 `0` 开始的 36 进制小写字符串（`0`–`z`，随后是 `10` 等），在本次服务运行中不复用。服务重启后从头编号；跨轮保存或操作任务时，应同时核对 `/health` 的 `run_id`。
+
 ### `GET /commands`
 
 `200`：`{"commands":[Command, …]}`，不附日志内容。
@@ -136,3 +138,4 @@
 | `memory` | `{"total_bytes":…,"available_bytes":…}`；物理内存。 |
 | `disk` | `{"total_bytes":…,"available_bytes":…}`；项目数据目录所在卷。 |
 | `uptime_seconds` | number；Runner 进程运行秒数。 |
+| `run_id` | string；启动时生成的 32 位小写十六进制随机指纹。本轮运行内不变，每次重启重新生成；不是机器标识，也不是令牌。 |

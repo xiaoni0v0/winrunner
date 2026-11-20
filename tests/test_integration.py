@@ -25,8 +25,8 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import ClassVar
 from urllib.parse import urlencode
-
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -80,26 +80,43 @@ class RunnerCase(unittest.TestCase):
         self.port = free_port()
         self.install = self.scratch / "app"
         self.install.mkdir()
-        for name in ("config.py", "gitrepo.py", "runner.py", "winfiles.py", "winprocess.py", "winrunner.py",
-                     "winrunner-progress.psm1"):
+        for name in (
+            "config.py",
+            "gitrepo.py",
+            "runner.py",
+            "winfiles.py",
+            "winprocess.py",
+            "winrunner.py",
+            "winrunner-progress.psm1",
+        ):
             shutil.copyfile(ROOT / name, self.install / name)
         self.settings = self.install / "config.py"
         with self.settings.open("a", encoding="utf-8") as settings:
-            settings.write(f"\nTOKEN = {self.token!r}\nHOST = '127.0.0.1'\nPORT = {self.port}\n"
-                           f"DATA_DIR = Path({str(self.data)!r})\n")
+            settings.write(
+                f"\nTOKEN = {self.token!r}\nHOST = '127.0.0.1'\nPORT = {self.port}\n"
+                f"DATA_DIR = Path({str(self.data)!r})\n"
+            )
         self.server = None
         self.addCleanup(self.stop_runner)
         self.start_runner()
 
     def environment(self):
-        return {key: value for key, value in os.environ.items() if not key.upper().startswith("RUNNER_")}
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("RUNNER_")
+        }
 
     def start_runner(self):
         self.diagnostics = self.scratch / "runner.log"
         with self.diagnostics.open("ab") as out:
             self.server = subprocess.Popen(
-                [sys.executable, "winrunner.py"], cwd=self.install, env=self.environment(),
-                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                [sys.executable, "winrunner.py"],
+                cwd=self.install,
+                env=self.environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         deadline = time.monotonic() + 17
@@ -109,8 +126,10 @@ class RunnerCase(unittest.TestCase):
                     return
             except (OSError, http.client.HTTPException):
                 pass
-            time.sleep(.05)
-        self.fail("runner did not start:\n" + self.diagnostics.read_text(errors="replace"))
+            time.sleep(0.05)
+        self.fail(
+            "runner did not start:\n" + self.diagnostics.read_text(errors="replace")
+        )
 
     def stop_runner(self):
         if self.server is not None:
@@ -119,7 +138,9 @@ class RunnerCase(unittest.TestCase):
             self.server.wait(timeout=10)
             self.server = None
 
-    def request(self, method, path, payload=None, *, auth=True, headers=None, timeout=35):
+    def request(
+        self, method, path, payload=None, *, auth=True, headers=None, timeout=35
+    ):
         headers = dict(headers or {})
         if auth is True:
             headers["Authorization"] = "Bearer " + self.token
@@ -158,35 +179,50 @@ class RunnerCase(unittest.TestCase):
                 return snapshot
             if time.monotonic() >= deadline:
                 self.fail(f"condition not met for {endpoint}: {snapshot!r}")
-            time.sleep(.05)
+            time.sleep(0.05)
 
     def finished(self, endpoint, *, expected="succeeded"):
-        task = self.poll(endpoint, lambda item: item["status"] in TERMINAL,
-                         query="?stdout_offset=0&stderr_offset=0")
+        task = self.poll(
+            endpoint,
+            lambda item: item["status"] in TERMINAL,
+            query="?stdout_offset=0&stderr_offset=0",
+        )
         self.assertEqual(task["status"], expected, task)
         return task
 
     def gated_ps(self, gate, stdout=b"out|", stderr=b"err!"):
         def write(stream, data):
             numbers = ",".join(str(n) for n in data)
-            return (f"$stream = [Console]::OpenStandard{stream}()\n"
-                    f"$buf = [byte[]]@({numbers})\n"
-                    "$stream.Write($buf, 0, $buf.Length)\n$stream.Flush()\n")
-        return (write("Output", stdout) + write("Error", stderr) +
-                "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n"
-                f"while (-not [IO.File]::Exists({ps_quote(gate)})) {{\n"
-                "    if ([DateTime]::UtcNow -gt $deadline) { exit 97 }\n"
-                "    [Threading.Thread]::Sleep(50)\n"
-                "}\n" + write("Output", b"done"))
+            return (
+                f"$stream = [Console]::OpenStandard{stream}()\n"
+                f"$buf = [byte[]]@({numbers})\n"
+                "$stream.Write($buf, 0, $buf.Length)\n$stream.Flush()\n"
+            )
+
+        return (
+            write("Output", stdout)
+            + write("Error", stderr)
+            + "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n"
+            f"while (-not [IO.File]::Exists({ps_quote(gate)})) {{\n"
+            "    if ([DateTime]::UtcNow -gt $deadline) { exit 97 }\n"
+            "    [Threading.Thread]::Sleep(50)\n"
+            "}\n" + write("Output", b"done")
+        )
 
     @contextlib.contextmanager
     def live_tree(self, endpoint):
         query = "?stdout_offset=0"
         pattern = re.compile(rb"TREE (\d+) (\d+)\r?\n")
-        task = self.poll(endpoint, lambda item: pattern.search(log_bytes(item, "stdout")),
-                         query=query)
+        task = self.poll(
+            endpoint,
+            lambda item: pattern.search(log_bytes(item, "stdout")),
+            query=query,
+        )
         self.assertEqual(task["status"], "running", task)
-        pids = [int(pid) for pid in pattern.search(log_bytes(task, "stdout")).groups()]
+        match = pattern.search(log_bytes(task, "stdout"))
+        if match is None:
+            self.fail("runner did not report the process tree PIDs")
+        pids = [int(pid) for pid in match.groups()]
         from ctypes import wintypes
 
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -202,22 +238,31 @@ class RunnerCase(unittest.TestCase):
                 if not handle:
                     raise ctypes.WinError(ctypes.get_last_error())
                 handles.append(handle)
-                self.assertEqual(kernel.WaitForSingleObject(handle, 0), 258,
-                                 f"PID {pid} already exited")
+                self.assertEqual(
+                    kernel.WaitForSingleObject(handle, 0),
+                    258,
+                    f"PID {pid} already exited",
+                )
 
             def assert_stopped():
                 for pid, handle in zip(pids, handles):
-                    self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0,
-                                     f"PID {pid} did not exit")
+                    self.assertEqual(
+                        kernel.WaitForSingleObject(handle, 5000),
+                        0,
+                        f"PID {pid} did not exit",
+                    )
 
             yield assert_stopped
         finally:
             for pid, handle in reversed(list(zip(pids, handles))):
                 if kernel.WaitForSingleObject(handle, 0) == 258:
                     # Prevent bugs in the runner from leaving fixtures running.
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                   capture_output=True, timeout=10,
-                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
                 kernel.CloseHandle(handle)
 
 
@@ -228,20 +273,25 @@ class CommandIntegrationTests(RunnerCase):
         with self.settings.open("a", encoding="utf-8") as settings:
             settings.write('\nTOKEN = "123456"\n')
         result = subprocess.run(
-            [sys.executable, "winrunner.py"], cwd=self.install,
+            [sys.executable, "winrunner.py"],
+            cwd=self.install,
             env=dict(self.environment(), RUNNER_TOKEN="legacy-setting"),
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=8,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=8,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"Set TOKEN in config.py", result.stderr)
 
     def test_health_and_authentication_precede_request_processing(self):
-        for method, path, payload in (("GET", "/health", None),
-                                      ("GET", "/commands", None),
-                                      ("POST", "/commands", b"{"),
-                                      ("DELETE", "/commands/nonexistent", None),
-                                      ("POST", "/projects", b"{")):
+        for method, path, payload in (
+            ("GET", "/health", None),
+            ("GET", "/commands", None),
+            ("POST", "/commands", b"{"),
+            ("DELETE", "/commands/nonexistent", None),
+            ("POST", "/projects", b"{"),
+        ):
             for auth in (False, "Bearer incorrect", f"Basic {self.token}"):
                 with self.subTest(method=method, path=path, auth=auth):
                     self.call(401, method, path, payload, auth=auth)
@@ -254,20 +304,30 @@ class CommandIntegrationTests(RunnerCase):
         for sensor in ("memory", "disk"):
             self.assertGreater(health[sensor]["total_bytes"], 0)
             self.assertLessEqual(0, health[sensor]["available_bytes"])
-            self.assertLessEqual(health[sensor]["available_bytes"], health[sensor]["total_bytes"])
+            self.assertLessEqual(
+                health[sensor]["available_bytes"], health[sensor]["total_bytes"]
+            )
         self.assertGreaterEqual(health["uptime_seconds"], 0)
         self.assertEqual(self.call(200, "GET", "/commands"), {"commands": []})
 
     def test_cmd_and_request_validation(self):
         valid = {"mode": "cmd", "command": "echo runner-cmd-marker"}
-        for bad in ({"mode": "bad"}, {"command": ["echo nope"]}, {"timeout": True},
-                    {"timeout": -1}, {"timeout": "1"}, {"timeout": None},
-                    {"timeout": float("inf")}, {"timeout": float("nan")}):
+        for bad in (
+            {"mode": "bad"},
+            {"command": ["echo nope"]},
+            {"timeout": True},
+            {"timeout": -1},
+            {"timeout": "1"},
+            {"timeout": None},
+            {"timeout": float("inf")},
+            {"timeout": float("nan")},
+        ):
             with self.subTest(bad=bad):
                 self.call(400, "POST", "/commands", dict(valid, **bad))
         self.call(400, "POST", "/commands", b"{")
         self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
         task = self.call(200, "POST", "/commands", dict(valid, timeout=8))
+        self.assertEqual(task["id"], "0")
         self.assertEqual(task["mode"], "cmd")
         endpoint = "/commands/" + task["id"]
         snapshot = self.call(200, "GET", endpoint)
@@ -279,35 +339,51 @@ class CommandIntegrationTests(RunnerCase):
         self.assertEqual(task["exit_code"], 0)
         self.assertIsNone(task["error"])
         self.assertEqual(log_bytes(task, "stdout").strip(), b"runner-cmd-marker")
-        failed = self.call(200, "POST", "/commands",
-                           {"mode": "cmd", "command": "exit /b 7", "timeout": 8})
+        self.call(204, "DELETE", endpoint)
+        failed = self.call(
+            200,
+            "POST",
+            "/commands",
+            {"mode": "cmd", "command": "exit /b 7", "timeout": 8},
+        )
+        self.assertEqual(failed["id"], "1")
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["exit_code"], 7)
+        self.call(404, "GET", endpoint)
 
     def test_powershell_suppresses_progress_without_losing_real_errors(self):
         def run(command, status="succeeded"):
-            task = self.call(200, "POST", "/commands", {"mode": "ps", "command": command})
+            task = self.call(
+                200, "POST", "/commands", {"mode": "ps", "command": command}
+            )
             return self.finished("/commands/" + task["id"], expected=status)
 
-        task = run('using namespace System.Text\n'
-                   'param([string]$Message = "runner-ok")\n'
-                   'Get-Item Env:SystemRoot | Out-Null\n'
-                   'Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
-                   '[StringBuilder]::new($Message).ToString()')
+        task = run(
+            "using namespace System.Text\n"
+            'param([string]$Message = "runner-ok")\n'
+            "Get-Item Env:SystemRoot | Out-Null\n"
+            'Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
+            "[StringBuilder]::new($Message).ToString()"
+        )
         self.assertEqual(log_bytes(task, "stdout").strip(), b"runner-ok")
         self.assertEqual(log_bytes(task, "stderr"), b"")
 
-        task = run('Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
-                   'Write-Error "runner-real-error"\nexit 7', "failed")
+        task = run(
+            'Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
+            'Write-Error "runner-real-error"\nexit 7',
+            "failed",
+        )
         self.assertEqual(task["exit_code"], 7)
         errors = log_bytes(task, "stderr")
         self.assertIn(b"runner-real-error", errors)
         # PowerShell embeds the original command text in its error records.
         self.assertNotIn(b's="progress"', errors.lower())
-        self.assertEqual(run('cmd.exe /d /c exit 7', "failed")["exit_code"], 1)
+        self.assertEqual(run("cmd.exe /d /c exit 7", "failed")["exit_code"], 1)
 
-        task = run('$ProgressPreference = "Continue"\n'
-                   'Write-Progress -Activity "runner-opt-in" -PercentComplete 50')
+        task = run(
+            '$ProgressPreference = "Continue"\n'
+            'Write-Progress -Activity "runner-opt-in" -PercentComplete 50'
+        )
         self.assertIn(b"runner-opt-in", log_bytes(task, "stderr"))
 
     def test_zero_timeout_multiline_powershell_and_concurrent_incremental_logs(self):
@@ -315,9 +391,16 @@ class CommandIntegrationTests(RunnerCase):
             gate = self.work / (label + " release")
             out = (label + "-stdout").encode("ascii")
             err = (label + "-stderr").encode("ascii")
-            task = self.call(202, "POST", "/commands", {
-                "mode": "ps", "command": self.gated_ps(gate, out, err), "timeout": 0,
-            })
+            task = self.call(
+                202,
+                "POST",
+                "/commands",
+                {
+                    "mode": "ps",
+                    "command": self.gated_ps(gate, out, err),
+                    "timeout": 0,
+                },
+            )
             self.assertIn(task["status"], ACTIVE)
             self.assertEqual(task["mode"], "ps")
             return "/commands/" + task["id"], task["id"], gate, out, err
@@ -328,9 +411,15 @@ class CommandIntegrationTests(RunnerCase):
         self.assertNotEqual(tasks[0][1], tasks[1][1])
         for endpoint, _, _, out, err in tasks:
             # Both pipes must be visible before the process exits, without newlines.
-            self.poll(endpoint, lambda item: item["status"] == "running" and
-                      item["stdout_bytes"] == len(out) and item["stderr_bytes"] == len(err))
-            task = self.call(200, "GET", endpoint + "?stdout_offset=0&stderr_offset=0&limit=2")
+            self.poll(
+                endpoint,
+                lambda item: item["status"] == "running"
+                and item["stdout_bytes"] == len(out)
+                and item["stderr_bytes"] == len(err),
+            )
+            task = self.call(
+                200, "GET", endpoint + "?stdout_offset=0&stderr_offset=0&limit=2"
+            )
             for stream, expected in (("stdout", out), ("stderr", err)):
                 self.assertEqual(log_bytes(task, stream), expected[:2])
                 self.assertEqual(task[stream]["next_offset"], 2)
@@ -341,8 +430,12 @@ class CommandIntegrationTests(RunnerCase):
             end = self.call(200, "GET", endpoint + f"?stdout_offset={len(out)}")
             self.assertEqual(log_bytes(end, "stdout"), b"")
             self.assertEqual(end["stdout"]["next_offset"], len(out))
-            for query in (f"stdout_offset={len(out)+1}", "stderr_offset=-1", "limit=0",
-                          "stdout_offset=0&limit=1048577"):
+            for query in (
+                f"stdout_offset={len(out)+1}",
+                "stderr_offset=-1",
+                "limit=0",
+                "stdout_offset=0&limit=1048577",
+            ):
                 self.call(400, "GET", f"{endpoint}?{query}")
 
         listed = self.call(200, "GET", "/commands")["commands"]
@@ -353,19 +446,29 @@ class CommandIntegrationTests(RunnerCase):
             self.assertNotIn("stderr", item)
         first, second = tasks
         first[2].touch()
-        self.assertEqual(log_bytes(self.finished(first[0]), "stdout"), first[3] + b"done")
+        self.assertEqual(
+            log_bytes(self.finished(first[0]), "stdout"), first[3] + b"done"
+        )
         self.assertEqual(self.call(200, "GET", second[0])["status"], "running")
         second[2].touch()
-        self.assertEqual(log_bytes(self.finished(second[0]), "stdout"), second[3] + b"done")
+        self.assertEqual(
+            log_bytes(self.finished(second[0]), "stdout"), second[3] + b"done"
+        )
 
     def test_explicit_and_default_timeout_wait_without_stopping_tasks(self):
-        for label, extra, lower, upper in (("explicit", {"timeout": 1}, .85, 8),
-                                            ("default", {}, 9, 25)):
+        for label, extra, lower, upper in (
+            ("explicit", {"timeout": 1}, 0.85, 8),
+            ("default", {}, 9, 25),
+        ):
             with self.subTest(timeout=label):
                 gate = self.work / label
                 started = time.monotonic()
-                task = self.call(202, "POST", "/commands", dict(
-                    {"mode": "ps", "command": self.gated_ps(gate)}, **extra))
+                task = self.call(
+                    202,
+                    "POST",
+                    "/commands",
+                    dict({"mode": "ps", "command": self.gated_ps(gate)}, **extra),
+                )
                 elapsed = time.monotonic() - started
                 self.assertGreaterEqual(elapsed, lower, f"{label}: {elapsed:.2f}s")
                 self.assertLess(elapsed, upper, f"{label}: {elapsed:.2f}s")
@@ -379,17 +482,31 @@ class CommandIntegrationTests(RunnerCase):
         script = self.work / "tree fixture.py"
         script.write_text(TREE_SCRIPT, encoding="utf-8")
         command = f"& {ps_quote(sys.executable)} -u {ps_quote(script)}"
-        task = self.call(202, "POST", "/commands", {
-            "mode": "ps", "command": command, "timeout": 0,
-        })
+        task = self.call(
+            202,
+            "POST",
+            "/commands",
+            {
+                "mode": "ps",
+                "command": command,
+                "timeout": 0,
+            },
+        )
         return "/commands/" + task["id"]
 
     def test_delete_terminates_the_process_tree_and_removes_the_record(self):
         endpoint = self.launch_tree_command()
         gate = self.work / "independent command release"
-        other = self.call(202, "POST", "/commands", {
-            "mode": "ps", "command": self.gated_ps(gate), "timeout": 0,
-        })
+        other = self.call(
+            202,
+            "POST",
+            "/commands",
+            {
+                "mode": "ps",
+                "command": self.gated_ps(gate),
+                "timeout": 0,
+            },
+        )
         other_endpoint = "/commands/" + other["id"]
         with self.live_tree(endpoint) as assert_stopped:
             self.call(204, "DELETE", endpoint)
@@ -403,14 +520,19 @@ class CommandIntegrationTests(RunnerCase):
         self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
 
     def test_restart_terminates_live_processes_and_does_not_restore_commands(self):
+        run_id = self.call(200, "GET", "/health")["run_id"]
+        self.assertRegex(run_id, r"\A[0-9a-f]{32}\Z")
         endpoint = self.launch_tree_command()
         with self.live_tree(endpoint) as assert_stopped:
+            self.assertEqual(self.call(200, "GET", "/health")["run_id"], run_id)
             self.stop_runner()
             assert_stopped()
         self.start_runner()
         self.call(404, "GET", endpoint)
         self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
-        self.call(200, "GET", "/health")
+        restarted_run_id = self.call(200, "GET", "/health")["run_id"]
+        self.assertRegex(restarted_run_id, r"\A[0-9a-f]{32}\Z")
+        self.assertNotEqual(restarted_run_id, run_id)
 
 
 class GitHTTPHandler(http.server.SimpleHTTPRequestHandler):
@@ -420,60 +542,110 @@ class GitHTTPHandler(http.server.SimpleHTTPRequestHandler):
 
 @unittest.skipUnless(os.name == "nt", "requires Windows shell and Job Objects")
 class ProjectIntegrationTests(RunnerCase):
+    git_env: ClassVar[dict[str, str]]
+    commit: ClassVar[str]
+    repo_url: ClassVar[str]
+
     @classmethod
     def setUpClass(cls):
-        cls.git = shutil.which("git")
-        if not cls.git:
+        git = shutil.which("git")
+        if not git:
             raise unittest.SkipTest("Git for Windows is not installed")
         openssl = shutil.which("openssl")
         if not openssl:
-            openssl = Path(cls.git).parent.parent / "usr" / "bin" / "openssl.exe"
-            if not openssl.is_file():
-                raise unittest.SkipTest("OpenSSL is needed for the local HTTPS Git fixture")
+            bundled_openssl = Path(git).parent.parent / "usr" / "bin" / "openssl.exe"
+            if not bundled_openssl.is_file():
+                raise unittest.SkipTest(
+                    "OpenSSL is needed for the local HTTPS Git fixture"
+                )
+            openssl = str(bundled_openssl)
         temp = tempfile.TemporaryDirectory(prefix="winrunner-https-git-")
         cls.addClassCleanup(temp.cleanup)
         fixture = Path(temp.name)
         global_config = fixture / "empty.gitconfig"
         global_config.touch()
-        cls.cert = fixture / "cert.pem"
+        cert = fixture / "cert.pem"
         key = fixture / "key.pem"
-        cls.git_env = {key: value for key, value in os.environ.items()
-                       if not key.upper().startswith("GIT_")}
-        cls.git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(global_config),
-                           GIT_SSL_CAINFO=str(cls.cert), GIT_CONFIG_COUNT="2",
-                           GIT_CONFIG_KEY_0="http.sslBackend", GIT_CONFIG_VALUE_0="openssl",
-                           GIT_CONFIG_KEY_1="http.proxy", GIT_CONFIG_VALUE_1="")
+        cls.git_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        cls.git_env.update(
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_CONFIG_GLOBAL=str(global_config),
+            GIT_SSL_CAINFO=str(cert),
+            GIT_CONFIG_COUNT="2",
+            GIT_CONFIG_KEY_0="http.sslBackend",
+            GIT_CONFIG_VALUE_0="openssl",
+            GIT_CONFIG_KEY_1="http.proxy",
+            GIT_CONFIG_VALUE_1="",
+        )
 
-        def checked(args):
-            proc = subprocess.run(args, env=cls.git_env, capture_output=True, timeout=20)
+        def checked(args: list[str]) -> str:
+            proc = subprocess.run(
+                args, env=cls.git_env, capture_output=True, timeout=20
+            )
             if proc.returncode != 0:
                 raise RuntimeError(f"fixture command failed: {args!r}\n{proc.stderr!r}")
             return proc.stdout.strip().decode("ascii", errors="replace")
 
-        checked([os.fspath(openssl), "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                 "-days", "1", "-subj", "/CN=localhost", "-addext",
-                 "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cls.cert)])
+        checked(
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+            ]
+        )
         src = fixture / "source"
         public = fixture / "public"
         public.mkdir()
-        cls.remote = public / "fixture.git"
-        checked([cls.git, "init", "--initial-branch=fixture-main", str(src)])
-        checked([cls.git, "init", "--bare", "--initial-branch=fixture-main", str(cls.remote)])
+        remote = public / "fixture.git"
+        checked([git, "init", "--initial-branch=fixture-main", str(src)])
+        checked([git, "init", "--bare", "--initial-branch=fixture-main", str(remote)])
         (src / "script with spaces.py").write_text(ACTION_SCRIPT, encoding="utf-8")
         (src / "-c").write_text("print('option-like filename ran')\n", encoding="utf-8")
         (src / "tree.py").write_text(TREE_SCRIPT, encoding="utf-8")
         (src / "read me.txt").write_bytes(b"0123456789")
-        checked([cls.git, "-C", str(src), "add", "."])
-        checked([cls.git, "-C", str(src), "-c", "user.name=Integration Test",
-                 "-c", "user.email=integration@example.invalid", "commit", "-m", "fixture"])
-        cls.commit = checked([cls.git, "-C", str(src), "rev-parse", "HEAD"])
-        checked([cls.git, "-C", str(src), "push", str(cls.remote), "HEAD:refs/heads/fixture-main"])
-        checked([cls.git, "-C", str(cls.remote), "update-server-info"])
+        checked([git, "-C", str(src), "add", "."])
+        checked(
+            [
+                git,
+                "-C",
+                str(src),
+                "-c",
+                "user.name=Integration Test",
+                "-c",
+                "user.email=integration@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ]
+        )
+        cls.commit = checked([git, "-C", str(src), "rev-parse", "HEAD"])
+        checked(
+            [git, "-C", str(src), "push", str(remote), "HEAD:refs/heads/fixture-main"]
+        )
+        checked([git, "-C", str(remote), "update-server-info"])
         server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), partial(GitHTTPHandler, directory=str(public)))
+            ("127.0.0.1", 0), partial(GitHTTPHandler, directory=str(public))
+        )
         cls.addClassCleanup(server.server_close)
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls.load_cert_chain(cls.cert, key)
+        tls.load_cert_chain(cert, key)
         server.socket = tls.wrap_socket(server.socket, server_side=True)
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
@@ -486,7 +658,9 @@ class ProjectIntegrationTests(RunnerCase):
         for key in list(env):
             if key.upper().startswith("GIT_"):
                 del env[key]
-        env.update({key: val for key, val in self.git_env.items() if key.startswith("GIT_")})
+        env.update(
+            {key: val for key, val in self.git_env.items() if key.startswith("GIT_")}
+        )
         return env
 
     def register(self, name="Fixture"):
@@ -494,37 +668,58 @@ class ProjectIntegrationTests(RunnerCase):
         return "/projects/" + name
 
     def action(self, project, **kwargs):
-        fields = {"commit": self.commit[:12], "interpreter": "python",
-                  "script": "script with spaces.py", "timeout": 0}
+        fields = {
+            "commit": self.commit[:12],
+            "interpreter": "python",
+            "script": "script with spaces.py",
+            "timeout": 0,
+        }
         return self.call(202, "POST", project + "/actions", dict(fields, **kwargs))
 
     def test_project_clone_files_validation_delete_and_restart(self):
-        for name, url in (("NUL", self.repo_url), ("bad name", self.repo_url),
-                          ("Sample", self.repo_url.replace("https:", "http:")),
-                          ("Sample", self.repo_url.replace("https://", "https://user:secret@"))):
+        for name, url in (
+            ("NUL", self.repo_url),
+            ("bad name", self.repo_url),
+            ("Sample", self.repo_url.replace("https:", "http:")),
+            ("Sample", self.repo_url.replace("https://", "https://user:secret@")),
+        ):
             self.call(400, "POST", "/projects", {"name": name, "repo_url": url})
-        self.call(502, "POST", "/projects", {"name": "Fixture", "repo_url": self.repo_url + "-missing"})
+        self.call(
+            502,
+            "POST",
+            "/projects",
+            {"name": "Fixture", "repo_url": self.repo_url + "-missing"},
+        )
         self.call(404, "GET", "/projects/Fixture")
         project = self.register()
         expected = {"name": "Fixture", "repo_url": self.repo_url, "status": "idle"}
         self.assertEqual(self.call(200, "GET", project.lower()), expected)
         self.assertEqual(self.call(200, "GET", "/projects")["projects"], [expected])
-        self.call(409, "POST", "/projects", {"name": "FIXTURE", "repo_url": self.repo_url})
+        self.call(
+            409, "POST", "/projects", {"name": "FIXTURE", "repo_url": self.repo_url}
+        )
         self.call(404, "GET", project + "/actions")
         self.call(404, "DELETE", project + "/actions")
         listing = self.call(200, "GET", project + "/files")
         self.assertEqual(listing["path"], "")
         entries = {entry["name"]: entry for entry in listing["entries"]}
-        self.assertEqual(entries["read me.txt"], {
-            "name": "read me.txt", "type": "file", "size_bytes": 10,
-        })
+        self.assertEqual(
+            entries["read me.txt"],
+            {
+                "name": "read me.txt",
+                "type": "file",
+                "size_bytes": 10,
+            },
+        )
         self.assertEqual(entries[".git"]["type"], "directory")
         self.assertIsNone(entries[".git"]["size_bytes"])
         files = project + "/files?"
         head = self.call(200, "GET", files + urlencode({"path": ".git/HEAD"}))
         self.assertEqual(head.strip(), b"ref: refs/heads/fixture-main")
         file_url = files + urlencode({"path": "read me.txt"})
-        status, data, headers = self.request("GET", file_url, headers={"Range": "bytes=2-5"})
+        status, data, headers = self.request(
+            "GET", file_url, headers={"Range": "bytes=2-5"}
+        )
         self.assertEqual((status, data), (206, b"2345"))
         self.assertEqual(headers["Content-Range"], "bytes 2-5/10")
         self.assertEqual(headers.get_content_type(), "application/octet-stream")
@@ -543,22 +738,29 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertFalse(list(self.data.rglob("read me.txt")))
         self.register()
 
-    def test_action_conflict_cancel_preserves_logs_and_invalid_request_replaces_round(self):
+    def test_action_conflict_cancel_preserves_logs_and_invalid_request_replaces_round(
+        self,
+    ):
         project = self.register()
         endpoint = project + "/actions"
         args = ["with spaces", "a&b", '"quoted"']
         self.action(project, args=args)
         expected_stdout = json.dumps(args).encode("ascii")
-        running = self.poll(endpoint, lambda item: item["stdout_bytes"] == len(expected_stdout) and
-                            item["stderr_bytes"] == len(b"action-stderr"),
-                            query="?stdout_offset=0&stderr_offset=0")
+        running = self.poll(
+            endpoint,
+            lambda item: item["stdout_bytes"] == len(expected_stdout)
+            and item["stderr_bytes"] == len(b"action-stderr"),
+            query="?stdout_offset=0&stderr_offset=0",
+        )
         self.assertEqual(running["status"], "running")
         self.assertEqual(running["commit"], self.commit)
         self.assertEqual(running["output_source"], "process")
         self.assertEqual(json.loads(log_bytes(running, "stdout")), args)
         self.assertEqual(log_bytes(running, "stderr"), b"action-stderr")
         self.assertEqual(self.call(200, "GET", project)["status"], "running")
-        self.assertEqual(self.call(200, "GET", "/projects")["projects"][0]["status"], "running")
+        self.assertEqual(
+            self.call(200, "GET", "/projects")["projects"][0]["status"], "running"
+        )
         self.call(401, "POST", endpoint, b"{", auth=False)
         self.call(409, "POST", endpoint, b"{")
         self.call(204, "DELETE", endpoint)
@@ -583,10 +785,17 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertIsNone(unresolved["commit"])
         gate = self.work / "already released"
         gate.touch()
-        succeeded = self.call(200, "POST", endpoint, {
-            "commit": self.commit, "interpreter": "python", "script": "script with spaces.py",
-            "args": ["--gate", str(gate)],
-        })
+        succeeded = self.call(
+            200,
+            "POST",
+            endpoint,
+            {
+                "commit": self.commit,
+                "interpreter": "python",
+                "script": "script with spaces.py",
+                "args": ["--gate", str(gate)],
+            },
+        )
         self.assertEqual(succeeded["status"], "succeeded")
         self.assertEqual(succeeded["exit_code"], 0)
         self.assertEqual(self.call(200, "GET", project)["status"], "succeeded")
@@ -601,12 +810,16 @@ class ProjectIntegrationTests(RunnerCase):
             response = self.call(400, "POST", endpoint, b"{")
             self.assertEqual(response["error"]["code"], "invalid_request")
             snapshot = response["action"]
-            self.assertEqual((snapshot["status"], snapshot["phase"]), ("failed", "reset"))
+            self.assertEqual(
+                (snapshot["status"], snapshot["phase"]), ("failed", "reset")
+            )
             self.assertEqual(snapshot["output_source"], "runner")
             self.assertEqual(snapshot["error"]["code"], "reset_blocked")
             self.assertEqual(snapshot, self.call(200, "GET", endpoint))
             self.assertTrue(old_file.is_file())
-            self.call(404, "GET", project + "/files?" + urlencode({"path": old_file.name}))
+            self.call(
+                404, "GET", project + "/files?" + urlencode({"path": old_file.name})
+            )
 
         response = self.call(400, "POST", endpoint, b"{")
         self.assertEqual(response["error"]["code"], "invalid_request")
@@ -624,8 +837,12 @@ class ProjectIntegrationTests(RunnerCase):
             slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             slow.settimeout(6)
             slow.connect(("127.0.0.1", self.port))
-            slow.sendall((f"GET {project}/files?path=pending.bin HTTP/1.0\r\n"
-                          f"Authorization: Bearer {self.token}\r\n\r\n").encode("ascii"))
+            slow.sendall(
+                (
+                    f"GET {project}/files?path=pending.bin HTTP/1.0\r\n"
+                    f"Authorization: Bearer {self.token}\r\n\r\n"
+                ).encode("ascii")
+            )
             with slow.makefile("rb") as response:
                 self.assertIn(b" 200 ", response.readline())
                 while True:
@@ -635,7 +852,9 @@ class ProjectIntegrationTests(RunnerCase):
                 # Do not drain the connection. The new Action must free the old tree anyway.
                 self.call(400, "POST", project + "/actions", b"{")
                 result = self.call(200, "GET", project + "/actions")
-                self.assertEqual((result["status"], result["phase"]), ("failed", "validate"), result)
+                self.assertEqual(
+                    (result["status"], result["phase"]), ("failed", "validate"), result
+                )
                 self.assertFalse((worktree / "pending.bin").exists())
                 try:
                     self.assertLess(len(response.read()), size)
@@ -647,7 +866,9 @@ class ProjectIntegrationTests(RunnerCase):
 
         def submit(name):
             ready.wait(timeout=5)
-            return self.request("POST", "/projects", {"name": name, "repo_url": self.repo_url})[0]
+            return self.request(
+                "POST", "/projects", {"name": name, "repo_url": self.repo_url}
+            )[0]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             statuses = list(pool.map(submit, ["Same", "sAME"]))
@@ -662,7 +883,9 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(result["status"], "succeeded")
         logs = self.call(200, "GET", endpoint + "?stdout_offset=0")
         self.assertEqual(log_bytes(logs, "stdout").strip(), b"option-like filename ran")
-        result = self.call(200, "POST", endpoint, dict(fields, script="..\\..\\outside.py"))
+        result = self.call(
+            200, "POST", endpoint, dict(fields, script="..\\..\\outside.py")
+        )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["error"]["code"], "invalid_script")
         self.assertEqual(result["output_source"], "runner")

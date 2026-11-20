@@ -13,7 +13,9 @@ DATA_DIR = Path(__file__).resolve().parent / ".winrunner-data"
 DEFAULT_TIMEOUT = 10.0
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_HTTP_CONNECTIONS = 64
-PROJECT_DRAIN_TIMEOUT = 5.0  # Seconds to release HTTP readers / stop work before project deletion.
+PROJECT_DRAIN_TIMEOUT = (
+    5.0  # Seconds to release HTTP readers / stop work before project deletion.
+)
 
 # Aliases map to (absolute executable path, fixed argument tuple). An absent
 # optional executable is reported as a launch error, not an unknown alias.

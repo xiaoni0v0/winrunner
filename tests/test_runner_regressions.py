@@ -9,10 +9,11 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
+from typing import TypeVar
 from unittest.mock import patch
 
 import runner
-
 
 REPO_URL = "https://example.invalid/repo.git"
 COMMIT = "a" * 40
@@ -20,6 +21,23 @@ ACTION = b'{"commit":"aaaa","interpreter":"python","script":"script.py","timeout
 COMMAND = b'{"mode":"cmd","command":"exit 0","timeout":30}'
 OFFSETS = {"stdout": 0, "stderr": 0}
 WAIT = 5
+T = TypeVar("T")
+
+
+class CommandIDTests(unittest.TestCase):
+    def test_short_command_id_uses_lowercase_base36(self):
+        for number, expected in (
+            (0, "0"),
+            (1, "1"),
+            (9, "9"),
+            (10, "a"),
+            (35, "z"),
+            (36, "10"),
+            (1295, "zz"),
+            (1296, "100"),
+        ):
+            with self.subTest(number=number):
+                self.assertEqual(runner.short_command_id(number), expected)
 
 
 class LocalRepository:
@@ -76,11 +94,13 @@ class RunnerRegressions(unittest.TestCase):
     def assert_api_error(self, status, code, operation, *args, **kwargs):
         with self.assertRaises(runner.APIError) as caught:
             operation(*args, **kwargs)
-        self.assertEqual((caught.exception.status, caught.exception.code), (status, code))
+        self.assertEqual(
+            (caught.exception.status, caught.exception.code), (status, code)
+        )
         return caught.exception
 
-    def background(self, operation, *args):
-        outcome = Future()
+    def background(self, operation: Callable[..., T], *args: object) -> Future[T]:
+        outcome: Future[T] = Future()
 
         def run():
             try:
@@ -112,14 +132,19 @@ class RunnerRegressions(unittest.TestCase):
                 raise PermissionError("worktree stat failed")
             return is_dir(path)
 
-        with patch.object(path_type, "is_dir", broken_is_dir), self.assertLogs("runner", "ERROR"):
+        with (
+            patch.object(path_type, "is_dir", broken_is_dir),
+            self.assertLogs("runner", "ERROR"),
+        ):
             task = self.start_action(project)
             result = self.wait_action(project, task)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["error"]["code"], "worktree_status_failed")
         self.assertIn("worktree stat failed", result["error"]["message"])
         self.assertEqual(result["output_source"], "process")
-        self.assertEqual(base64.b64decode(result["stderr"]["data_base64"]), b"process stderr")
+        self.assertEqual(
+            base64.b64decode(result["stderr"]["data_base64"]), b"process stderr"
+        )
         self.assert_api_error(404, "not_found", self.open_script, project)
 
         replacement = self.start_action(project)
@@ -150,10 +175,14 @@ class RunnerRegressions(unittest.TestCase):
             cancellation = self.background(self.model.cancel_action, project.name)
             cancellation.result(timeout=WAIT)
             result = self.wait_action(project, task)
-            self.assertEqual((result["status"], result["phase"]), ("cancelled", "reset"))
+            self.assertEqual(
+                (result["status"], result["phase"]), ("cancelled", "reset")
+            )
             self.assertTrue((project.worktree / "script.py").exists())
         self.job.run.assert_not_called()
-        self.assertEqual(self.wait_action(project, self.start_action(project))["status"], "succeeded")
+        self.assertEqual(
+            self.wait_action(project, self.start_action(project))["status"], "succeeded"
+        )
 
     def test_delete_times_out_with_live_reader_and_can_be_retried(self):
         # #02: a reader without a callback cannot be interrupted by DELETE.
@@ -163,9 +192,13 @@ class RunnerRegressions(unittest.TestCase):
             self.model.file_entry(project.name, "script.py"),
         ):
             deletion = self.background(self.model.delete_project, project.name)
-            error = self.assert_api_error(409, "project_busy", deletion.result, timeout=WAIT)
+            error = self.assert_api_error(
+                409, "project_busy", deletion.result, timeout=WAIT
+            )
             self.assertIn("retry", str(error))
-            self.assertEqual(self.model.get_project(project.name)["status"], "delete_failed")
+            self.assertEqual(
+                self.model.get_project(project.name)["status"], "delete_failed"
+            )
             self.assertTrue(project.worktree.exists())
         self.model.delete_project(project.name)
         self.assert_api_error(404, "not_found", self.model.get_project, project.name)
@@ -177,7 +210,9 @@ class RunnerRegressions(unittest.TestCase):
         opened, release = threading.Event(), threading.Event()
 
         def read():
-            with self.model.file_entry(project.name, "script.py", cancel_read=release.set):
+            with self.model.file_entry(
+                project.name, "script.py", cancel_read=release.set
+            ):
                 opened.set()
                 self.assertTrue(release.wait(2 * WAIT), "reader was not interrupted")
 
@@ -202,7 +237,9 @@ class RunnerRegressions(unittest.TestCase):
             repo.cache.mkdir()
             repo.worktree.mkdir()
             (repo.worktree / "partial").touch()
-            raise runner.GitFailure("clone exited 128", stderr=b"simulated Git transport error\n")
+            raise runner.GitFailure(
+                "clone exited 128", stderr=b"simulated Git transport error\n"
+            )
 
         def block_rollback(path):
             if path == worktree and (path / "partial").exists():
@@ -214,7 +251,9 @@ class RunnerRegressions(unittest.TestCase):
             patch.object(runner, "_remove_tree", side_effect=block_rollback),
             self.assertLogs("runner", "WARNING") as logs,
         ):
-            error = self.assert_api_error(502, "git_clone_failed", self.model.create, raw)
+            error = self.assert_api_error(
+                502, "git_clone_failed", self.model.create, raw
+            )
             self.assertEqual(str(error), "simulated Git transport error")
 
         self.assertIn("worktree handle is held", "\n".join(logs.output))
@@ -230,7 +269,9 @@ class RunnerRegressions(unittest.TestCase):
             patch.object(LocalRepository, "create", autospec=True) as clone,
             self.assertLogs("runner", "WARNING"),
         ):
-            self.assert_api_error(409, "project_cleanup_blocked", self.model.create, retry)
+            self.assert_api_error(
+                409, "project_cleanup_blocked", self.model.create, retry
+            )
             clone.assert_not_called()
         self.assert_api_error(404, "not_found", self.model.get_project, "sample")
 
@@ -251,9 +292,13 @@ class RunnerRegressions(unittest.TestCase):
             remove_tree(path)
 
         with patch.object(runner, "_remove_tree", side_effect=block_worktree):
-            error = self.assert_api_error(409, "project_cleanup_blocked", self.model.delete_project, project.name)
+            error = self.assert_api_error(
+                409, "project_cleanup_blocked", self.model.delete_project, project.name
+            )
         self.assertIn("retry", str(error))
-        self.assertEqual(self.model.get_project(project.name)["status"], "delete_failed")
+        self.assertEqual(
+            self.model.get_project(project.name)["status"], "delete_failed"
+        )
         self.assert_api_error(404, "not_found", self.open_script, project)
         self.model.delete_project(project.name)
         self.assert_api_error(404, "not_found", self.model.get_project, project.name)
@@ -266,7 +311,9 @@ class RunnerRegressions(unittest.TestCase):
         def interrupted_process(*args, on_started, **kwargs):
             on_started()
             running.set()
-            self.assertTrue(release.wait(2 * WAIT), "command cancellation did not reach the job")
+            self.assertTrue(
+                release.wait(2 * WAIT), "command cancellation did not reach the job"
+            )
             raise runner.JobCancelled(exit_code=23)
 
         self.job.run.side_effect = interrupted_process
@@ -279,7 +326,9 @@ class RunnerRegressions(unittest.TestCase):
             deletion = self.background(self.model.delete_command, command["id"])
             status, result = response.result(timeout=WAIT)
             deletion.result(timeout=WAIT)
-            self.assertEqual((status, result["status"], result["exit_code"]), (200, "cancelled", 23))
+            self.assertEqual(
+                (status, result["status"], result["exit_code"]), (200, "cancelled", 23)
+            )
         finally:
             release.set()
 
@@ -288,12 +337,22 @@ class RunnerRegressions(unittest.TestCase):
         project = self.create()
         old = project.worktree / "old.txt"
         old.write_text("previous round", encoding="utf-8")
-        with patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start test thread")):
+        with patch.object(
+            threading.Thread,
+            "start",
+            side_effect=RuntimeError("cannot start test thread"),
+        ):
             self.assert_api_error(500, "worker_unavailable", self.start_action, project)
         self.assertFalse(project.worktree.exists())
         result = self.wait_action(project, project.task)
-        self.assertEqual((result["status"], result["phase"], result["output_source"]), ("failed", "reset", "runner"))
-        self.assertIn(b"cannot start test thread", base64.b64decode(result["stderr"]["data_base64"]))
+        self.assertEqual(
+            (result["status"], result["phase"], result["output_source"]),
+            ("failed", "reset", "runner"),
+        )
+        self.assertIn(
+            b"cannot start test thread",
+            base64.b64decode(result["stderr"]["data_base64"]),
+        )
         self.job.run.assert_not_called()
 
     def test_worker_start_failure_logs_incomplete_reset_and_hides_old_files(self):
@@ -302,10 +361,20 @@ class RunnerRegressions(unittest.TestCase):
         prior = self.wait_action(project, self.start_action(project))
         self.assertGreater(prior["stdout_bytes"], 0)
         with (
-            patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start test thread")),
-            patch.object(runner, "_remove_tree", side_effect=PermissionError("old worktree is in use")) as remove,
+            patch.object(
+                threading.Thread,
+                "start",
+                side_effect=RuntimeError("cannot start test thread"),
+            ),
+            patch.object(
+                runner,
+                "_remove_tree",
+                side_effect=PermissionError("old worktree is in use"),
+            ) as remove,
         ):
-            error = self.assert_api_error(500, "worker_unavailable_reset_incomplete", self.start_action, project)
+            error = self.assert_api_error(
+                500, "worker_unavailable_reset_incomplete", self.start_action, project
+            )
         remove.assert_called_once_with(project.worktree)
         self.assertIn("old worktree is in use", str(error))
         self.assertTrue((project.worktree / "script.py").exists())
@@ -346,7 +415,11 @@ class RunnerRegressions(unittest.TestCase):
     def test_blocked_job_termination_does_not_block_other_project_snapshot(self):
         # #16: the command must remain registered while termination is underway.
         other = self.create("other")
-        running, terminating, release = threading.Event(), threading.Event(), threading.Event()
+        running, terminating, release = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
 
         def active_process(*args, on_started, **kwargs):
             on_started()
@@ -369,7 +442,9 @@ class RunnerRegressions(unittest.TestCase):
             self.assertTrue(terminating.wait(WAIT), "job termination never started")
             snapshot = self.background(self.model.get_project, other.name)
             self.assertEqual(snapshot.result(timeout=WAIT)["status"], "idle")
-            self.assert_api_error(409, "conflict", self.model.delete_command, command_id)
+            self.assert_api_error(
+                409, "conflict", self.model.delete_command, command_id
+            )
         finally:
             release.set()
             if deletion is not None:

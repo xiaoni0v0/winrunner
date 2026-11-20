@@ -6,12 +6,12 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import threading
 import time
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -21,13 +21,24 @@ from gitrepo import CommitError, GitFailure, Repository
 from winfiles import BadPath, pinned_entry, pinned_path
 from winprocess import Job, JobCancelled
 
-
 PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)
 COMMIT = re.compile(r"[0-9a-fA-F]{1,64}\Z")
 LOG = logging.getLogger(__name__)
 PS_PROGRESS_MODULE = Path(__file__).resolve().with_name("winrunner-progress.psm1")
-PS_SINGLE_QUOTES = str.maketrans({quote: quote * 2 for quote in "'\u2018\u2019\u201a\u201b"})
+PS_SINGLE_QUOTES = str.maketrans(
+    {quote: quote * 2 for quote in "'\u2018\u2019\u201a\u201b"}
+)
+BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def short_command_id(number: int) -> str:
+    digits = []
+    while number >= len(BASE36):
+        number, digit = divmod(number, len(BASE36))
+        digits.append(BASE36[digit])
+    digits.append(BASE36[number])
+    return "".join(reversed(digits))
 
 
 def encode_ps_command(command):
@@ -79,8 +90,11 @@ def object_body(raw):
 
 
 def clean_string(value):
-    return isinstance(value, str) and "\0" not in value and all(
-        not 0xD800 <= ord(c) <= 0xDFFF for c in value)
+    return (
+        isinstance(value, str)
+        and "\0" not in value
+        and all(not 0xD800 <= ord(c) <= 0xDFFF for c in value)
+    )
 
 
 def timeout_value(body):
@@ -96,25 +110,44 @@ def timeout_value(body):
 def project_body(raw):
     body = object_body(raw)
     name, url = body.get("name"), body.get("repo_url")
-    if not isinstance(name, str) or not PROJECT_NAME.fullmatch(name) or DEVICE_NAME.fullmatch(name):
+    if (
+        not isinstance(name, str)
+        or not PROJECT_NAME.fullmatch(name)
+        or DEVICE_NAME.fullmatch(name)
+    ):
         raise invalid("Invalid Windows project name")
-    if not clean_string(url) or not url or any(ord(c) <= 32 or c in "\\\x7f" for c in url):
+    if (
+        not clean_string(url)
+        or not url
+        or any(ord(c) <= 32 or c in "\\\x7f" for c in url)
+    ):
         raise invalid("repo_url must be a public HTTPS Git URL without credentials")
     try:
         parts = urlsplit(url)
         port = parts.port
-        if (parts.scheme != "https" or not parts.hostname or not parts.path
-                or parts.username is not None or parts.password is not None
-                or parts.query or parts.fragment or port == 0):
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or not parts.path
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or port == 0
+        ):
             raise ValueError
     except ValueError as exc:
-        raise invalid("repo_url must be a public HTTPS Git URL without credentials") from exc
+        raise invalid(
+            "repo_url must be a public HTTPS Git URL without credentials"
+        ) from exc
     return name, url
 
 
 def action_body(raw):
     body = object_body(raw)
-    commit, interpreter, script = (body.get(key) for key in ("commit", "interpreter", "script"))
+    commit, interpreter, script = (
+        body.get(key) for key in ("commit", "interpreter", "script")
+    )
     args = body.get("args", [])
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
         raise invalid("commit must be a hexadecimal hash or prefix")
@@ -148,6 +181,7 @@ def _remove_tree(path):
         else:
             path.unlink()
     elif stat.S_ISDIR(info.st_mode):
+
         def retry(operation, entry, error):
             if not isinstance(error[1], PermissionError):
                 raise error[1]
@@ -156,6 +190,7 @@ def _remove_tree(path):
                 raise error[1]
             os.chmod(entry, stat.S_IREAD | stat.S_IWRITE)
             operation(entry)
+
         shutil.rmtree(path, onerror=retry)
     else:
         path.unlink()
@@ -172,11 +207,15 @@ def _clean_paths(paths):
 
 
 def _cleanup_error(code, message, exc):
-    return APIError(409, code, f"{message}; release any file or directory handles and retry. {exc}")
+    return APIError(
+        409, code, f"{message}; release any file or directory handles and retry. {exc}"
+    )
 
 
 def child_env():
-    return {key: value for key, value in os.environ.items() if key.upper() != "RUNNER_TOKEN"}
+    return {
+        key: value for key, value in os.environ.items() if key.upper() != "RUNNER_TOKEN"
+    }
 
 
 class DeferredJob:
@@ -244,10 +283,15 @@ class Task:
 
     def run(self, argv, *, executable, cwd):
         self.stage("launch")
-        return self.job.run(argv, executable=executable, cwd=cwd, env=child_env(),
-                            stdout=lambda data: self.append("stdout", data),
-                            stderr=lambda data: self.append("stderr", data),
-                            on_started=self.started)
+        return self.job.run(
+            argv,
+            executable=executable,
+            cwd=cwd,
+            env=child_env(),
+            stdout=lambda data: self.append("stdout", data),
+            stderr=lambda data: self.append("stderr", data),
+            on_started=self.started,
+        )
 
     def cancel(self, wake=None):
         with self.lock:
@@ -259,7 +303,9 @@ class Task:
             wake()
         self.job.cancel()
 
-    def finish(self, *, exit_code=None, error=None, source=None, stdout=b"", stderr=b""):
+    def finish(
+        self, *, exit_code=None, error=None, source=None, stdout=b"", stderr=b""
+    ):
         try:
             self.job.close()
         except Exception as exc:
@@ -272,7 +318,11 @@ class Task:
                 self.status = "cancelled"
             elif error is not None or exit_code not in (None, 0):
                 if error is None:
-                    error = APIError(200, "process_exit_nonzero", f"Process exited with code {exit_code}")
+                    error = APIError(
+                        200,
+                        "process_exit_nonzero",
+                        f"Process exited with code {exit_code}",
+                    )
                 self.status = "failed"
             else:
                 self.status = "succeeded"
@@ -287,9 +337,15 @@ class Task:
     def snapshot(self, offsets=None, limit=65536):
         offsets = offsets or {}
         with self.lock:
-            result = {"status": self.status, "phase": self.phase, "output_source": self.source,
-                      "exit_code": self.exit_code, "error": self.error,
-                      "stdout_bytes": len(self.output["stdout"]), "stderr_bytes": len(self.output["stderr"])}
+            result = {
+                "status": self.status,
+                "phase": self.phase,
+                "output_source": self.source,
+                "exit_code": self.exit_code,
+                "error": self.error,
+                "stdout_bytes": len(self.output["stdout"]),
+                "stderr_bytes": len(self.output["stderr"]),
+            }
             if self.command_id is None:
                 result["commit"] = self.commit
             else:
@@ -297,10 +353,16 @@ class Task:
             for stream, offset in offsets.items():
                 output = self.output[stream]
                 if offset > len(output):
-                    raise APIError(400, "invalid_offset", f"{stream}_offset exceeds the stored length")
-                chunk = output[offset:offset + limit]
-                result[stream] = {"data_base64": base64.b64encode(chunk).decode("ascii"),
-                                  "next_offset": offset + len(chunk)}
+                    raise APIError(
+                        400,
+                        "invalid_offset",
+                        f"{stream}_offset exceeds the stored length",
+                    )
+                chunk = output[offset : offset + limit]
+                result[stream] = {
+                    "data_base64": base64.b64encode(chunk).decode("ascii"),
+                    "next_offset": offset + len(chunk),
+                }
             return result
 
     def response(self, seconds, accepted_at):
@@ -312,7 +374,9 @@ class Task:
                     break
                 self.done.wait(min(remaining, threading.TIMEOUT_MAX))
         result = self.snapshot()
-        status = 200 if result["status"] in ("succeeded", "failed", "cancelled") else 202
+        status = (
+            200 if result["status"] in ("succeeded", "failed", "cancelled") else 202
+        )
         return status, result
 
 
@@ -320,7 +384,7 @@ class Project:
     def __init__(self, name, url, job, projects_dir, caches_dir):
         self.name, self.url, self.clone_job = name, url, job
         self.worktree, self.cache = projects_dir / name, caches_dir / name
-        self.lifecycle = "cloning"
+        self.lifecycle: str | None = "cloning"
         self.cloned = threading.Event()
         self.create_failed = False
         self.task = None
@@ -346,9 +410,12 @@ class Runner:
         self.lock = threading.RLock()
         self.reader_changed = threading.Condition(self.lock)
         self.closing = False
-        self.projects, self.commands = {}, {}
-        self.pending_cleanup = {}
+        self.projects: dict[str, Project] = {}
+        self.commands: dict[str, Task] = {}
+        self.pending_cleanup: dict[str, tuple[Path, ...]] = {}
+        self.next_command_number = 0
         self.started_at = time.monotonic()
+        self.run_id = secrets.token_hex(16)
         self.base = Path(data_dir).resolve()
         self.base.mkdir(parents=True, exist_ok=True)
         self.lockfile_path = self.base / ".lock"
@@ -358,7 +425,9 @@ class Runner:
             msvcrt.locking(self.lease.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             self.lease.close()
-            raise RuntimeError(f"The runner data directory is already in use: {self.base}") from exc
+            raise RuntimeError(
+                f"The runner data directory is already in use: {self.base}"
+            ) from exc
         self.projects_dir, self.caches_dir = self.base / "projects", self.base / "cache"
         try:
             for path in (self.projects_dir, self.caches_dir):
@@ -392,7 +461,11 @@ class Runner:
 
     def list_projects(self):
         with self.lock:
-            return [project.snapshot() for project in self.projects.values() if not project.create_failed]
+            return [
+                project.snapshot()
+                for project in self.projects.values()
+                if not project.create_failed
+            ]
 
     def get_project(self, name):
         with self.lock:
@@ -405,7 +478,9 @@ class Runner:
             self._available()
             if key in self.projects:
                 raise conflict("Project name is already registered")
-            project = Project(name, url, DeferredJob(), self.projects_dir, self.caches_dir)
+            project = Project(
+                name, url, DeferredJob(), self.projects_dir, self.caches_dir
+            )
             stale_paths = self.pending_cleanup.get(key, ())
             self.projects[key] = project
         paths = tuple(dict.fromkeys((*stale_paths, project.worktree, project.cache)))
@@ -415,7 +490,11 @@ class Runner:
             failed_paths = _clean_paths(paths)
             if failed_paths:
                 exc = next(iter(failed_paths.values()))
-                raise _cleanup_error("project_cleanup_blocked", "Could not clear stale project directories", exc)
+                raise _cleanup_error(
+                    "project_cleanup_blocked",
+                    "Could not clear stale project directories",
+                    exc,
+                )
             self._repo(project, project.clone_job).create()
             with self.lock:
                 if project.lifecycle != "cloning" or self.closing:
@@ -440,8 +519,8 @@ class Runner:
             try:
                 if not success and not failed_paths:
                     failed_paths = _clean_paths(paths)
-                for path, exc in failed_paths.items():
-                    LOG.warning("Project rollback left %s: %s", path, exc)
+                for path, cleanup_failure in failed_paths.items():
+                    LOG.warning("Project rollback left %s: %s", path, cleanup_failure)
             finally:
                 with self.lock:
                     if failed_paths:
@@ -472,19 +551,29 @@ class Runner:
             if task is not None:
                 self._cancel_task(task)
             for event in (project.cloned, task.done if task is not None else None):
-                if event is not None and not event.wait(max(0, deadline - time.monotonic())):
-                    raise APIError(409, "project_busy", "Project is still stopping; retry DELETE")
+                if event is not None and not event.wait(
+                    max(0, deadline - time.monotonic())
+                ):
+                    raise APIError(
+                        409, "project_busy", "Project is still stopping; retry DELETE"
+                    )
             self._wait_readers(project, deadline)
             with self.lock:
                 stale_paths = self.pending_cleanup.get(key, ())
-            paths = tuple(dict.fromkeys((*stale_paths, project.worktree, project.cache)))
+            paths = tuple(
+                dict.fromkeys((*stale_paths, project.worktree, project.cache))
+            )
             failures = _clean_paths(paths)
             if failures:
                 if project.create_failed:
                     with self.lock:
                         self.pending_cleanup[key] = tuple(failures)
                 exc = next(iter(failures.values()))
-                raise _cleanup_error("project_cleanup_blocked", "Could not delete project directories", exc)
+                raise _cleanup_error(
+                    "project_cleanup_blocked",
+                    "Could not delete project directories",
+                    exc,
+                )
             success = True
         finally:
             with self.lock:
@@ -521,7 +610,9 @@ class Runner:
                 try:
                     cancel()
                 except Exception:
-                    LOG.exception("Could not interrupt a file response for %s", project.name)
+                    LOG.exception(
+                        "Could not interrupt a file response for %s", project.name
+                    )
 
     def _notify_readers(self):
         with self.reader_changed:
@@ -533,14 +624,23 @@ class Runner:
     def _wait_readers(self, project, deadline, cancelled=None):
         with self.reader_changed:
             self.reader_changed.wait_for(
-                lambda: not project.readers or (cancelled is not None and cancelled.is_set()),
+                lambda: not project.readers
+                or (cancelled is not None and cancelled.is_set()),
                 timeout=max(0, deadline - time.monotonic()),
             )
             if not project.readers:
                 return
             if cancelled is not None and cancelled.is_set():
-                raise APIError(409, "reset_cancelled", "Cancelled before existing downloads released the old worktree")
-            raise APIError(409, "project_busy", "Project downloads have not released their files; retry the operation")
+                raise APIError(
+                    409,
+                    "reset_cancelled",
+                    "Cancelled before existing downloads released the old worktree",
+                )
+            raise APIError(
+                409,
+                "project_busy",
+                "Project downloads have not released their files; retry the operation",
+            )
 
     def _reset_action(self, project, task):
         deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
@@ -549,13 +649,17 @@ class Runner:
         try:
             _remove_tree(project.worktree)
         except OSError as exc:
-            raise _cleanup_error("reset_blocked", "Could not clear the previous worktree", exc) from exc
+            raise _cleanup_error(
+                "reset_blocked", "Could not clear the previous worktree", exc
+            ) from exc
 
     def start_action(self, name, raw, accepted_at):
         with self.lock:
             self._available()
             project = self._project(name)
-            if project.lifecycle is not None or (project.task and not project.task.done.is_set()):
+            if project.lifecycle is not None or (
+                project.task and not project.task.done.is_set()
+            ):
                 raise conflict("Project or action slot is busy")
             task = Task("reset")
             project.task, project.visible = task, False
@@ -566,23 +670,34 @@ class Runner:
         try:
             self._start_thread(self._run_action, task, project, values, error)
         except Exception as exc:
-            worker_error = APIError(500, "worker_unavailable", "Could not start worker thread")
+            worker_error = APIError(
+                500, "worker_unavailable", "Could not start worker thread"
+            )
             diagnostic = str(exc)
             try:
                 self._reset_action(project, task)
             except Exception as reset_exc:
-                worker_error = APIError(500, "worker_unavailable_reset_incomplete",
-                                        f"Could not start worker thread; worktree reset incomplete: {reset_exc}")
+                worker_error = APIError(
+                    500,
+                    "worker_unavailable_reset_incomplete",
+                    f"Could not start worker thread; worktree reset incomplete: {reset_exc}",
+                )
                 diagnostic = f"{diagnostic}\n{worker_error}"
             finally:
-                task.finish(error=worker_error, source="runner", stderr=diagnostic.encode("utf-8", "replace"))
+                task.finish(
+                    error=worker_error,
+                    source="runner",
+                    stderr=diagnostic.encode("utf-8", "replace"),
+                )
             raise worker_error from exc
         if error is not None:
             task.done.wait()
             action = task.snapshot()
             if action["phase"] == "reset" and action["error"] is not None:
                 # Report both failures without making the client race the next Action via GET.
-                raise APIError(error.status, error.code, str(error), action=action) from error
+                raise APIError(
+                    error.status, error.code, str(error), action=action
+                ) from error
             raise error
         return task.response(values[-1], accepted_at)
 
@@ -619,26 +734,41 @@ class Runner:
                         raise BadPath("script is not a regular file")
                     script_path = str(path)
             except (ValueError, OSError) as exc:
-                raise APIError(400, "invalid_script", f"Cannot use script path: {exc}") from exc
+                raise APIError(
+                    400, "invalid_script", f"Cannot use script path: {exc}"
+                ) from exc
             exe, options = config.INTERPRETERS[interpreter]
             task.stage("launch")
             if not exe:
-                raise FileNotFoundError(f"Configured interpreter {interpreter!r} is not installed")
-            result["exit_code"] = task.run([exe, *options, script_path, *args], executable=exe,
-                                          cwd=project.worktree)
+                raise FileNotFoundError(
+                    f"Configured interpreter {interpreter!r} is not installed"
+                )
+            result["exit_code"] = task.run(
+                [exe, *options, script_path, *args],
+                executable=exe,
+                cwd=project.worktree,
+            )
         except JobCancelled as exc:
             if task.phase == "run":
                 result["exit_code"] = exc.exit_code
         except GitFailure as exc:
-            result.update(error=APIError(200, "git_failed", str(exc)), source="git",
-                          stdout=exc.stdout, stderr=exc.stderr)
+            result.update(
+                error=APIError(200, "git_failed", str(exc)),
+                source="git",
+                stdout=exc.stdout,
+                stderr=exc.stderr,
+            )
         except CommitError as exc:
             result.update(_failure(APIError(200, exc.code, str(exc)), "runner"))
         except APIError as exc:
             result.update(_failure(exc, "runner"))
         except Exception as exc:
             source = {"launch": "launch", "run": "process"}.get(task.phase, "runner")
-            code = {"launch": "launch_failed", "process": "process_error", "runner": "runner_error"}[source]
+            code = {
+                "launch": "launch_failed",
+                "process": "process_error",
+                "runner": "runner_error",
+            }[source]
             result.update(_failure(APIError(200, code, str(exc)), source))
         finally:
             try:
@@ -649,9 +779,15 @@ class Runner:
                 with self.lock:
                     project.visible = False
                 if "error" not in result:
-                    error = APIError(200, "worktree_status_failed", f"Could not inspect current worktree: {exc}")
+                    error = APIError(
+                        200,
+                        "worktree_status_failed",
+                        f"Could not inspect current worktree: {exc}",
+                    )
                     if task.phase == "run":
-                        result["error"] = error  # Do not mix Runner diagnostics into process logs.
+                        result["error"] = (
+                            error  # Do not mix Runner diagnostics into process logs.
+                        )
                     else:
                         result.update(_failure(error, "runner"))
             finally:
@@ -688,16 +824,17 @@ class Runner:
         mode, command, timeout = command_body(raw)
         with self.lock:
             self._available()
-            command_id = uuid.uuid4().hex
-            while command_id in self.commands:
-                command_id = uuid.uuid4().hex
+            command_id = short_command_id(self.next_command_number)
+            self.next_command_number += 1
             task = Task("launch", command_id=command_id, mode=mode)
             self.commands[command_id] = task
         try:
             self._start_thread(self._run_command, task, command)
         except Exception as exc:
             error = APIError(500, "worker_unavailable", "Could not start worker thread")
-            task.finish(error=error, source="runner", stderr=str(exc).encode("utf-8", "replace"))
+            task.finish(
+                error=error, source="runner", stderr=str(exc).encode("utf-8", "replace")
+            )
             raise error from exc
         return task.response(timeout, accepted_at)
 
@@ -708,17 +845,35 @@ class Runner:
             if task.mode == "ps":
                 executable = str(config.POWERSHELL)
                 encoded = encode_ps_command(command)
-                argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
+                argv = [
+                    executable,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    encoded,
+                ]
             else:
                 executable = str(config.CMD)
-                argv = subprocess.list2cmdline([executable]) + ' /d /s /c "' + command + '"'
+                argv = (
+                    subprocess.list2cmdline([executable])
+                    + ' /d /s /c "'
+                    + command
+                    + '"'
+                )
             result["exit_code"] = task.run(argv, executable=executable, cwd=Path.home())
         except JobCancelled as exc:
             result["exit_code"] = exc.exit_code
         except Exception as exc:
             source = "process" if task.phase == "run" else "launch"
-            result = _failure(APIError(200, "process_error" if source == "process" else "launch_failed",
-                                       str(exc)), source)
+            result = _failure(
+                APIError(
+                    200,
+                    "process_error" if source == "process" else "launch_failed",
+                    str(exc),
+                ),
+                source,
+            )
         finally:
             task.finish(**result)
 
@@ -751,7 +906,9 @@ class Runner:
         with self.lock:
             self.closing = True
             projects = list(self.projects.values())
-            tasks = list(self.commands.values()) + [p.task for p in projects if p.task is not None]
+            tasks = list(self.commands.values()) + [
+                p.task for p in projects if p.task is not None
+            ]
         try:
             for project in projects:
                 if not project.cloned.is_set():
@@ -769,4 +926,8 @@ class Runner:
 
 
 def _failure(error, source):
-    return {"error": error, "source": source, "stderr": str(error).encode("utf-8", "replace")}
+    return {
+        "error": error,
+        "source": source,
+        "stderr": str(error).encode("utf-8", "replace"),
+    }

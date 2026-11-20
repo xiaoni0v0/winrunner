@@ -12,7 +12,6 @@ from unittest.mock import Mock, patch
 import config
 from winrunner import HTTPHandler, HTTPServer, ThreadingHTTPServer
 
-
 TOKEN = "test-bearer-token"
 
 
@@ -45,7 +44,11 @@ class HTTPRegressionTests(unittest.TestCase):
         self.server.runner = self.runner = Mock()
         self.runner.list_projects.return_value = []
         self.port = self.server.server_address[1]
-        thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+        thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
         self.addCleanup(self.server.server_close)
         thread.start()
         self.addCleanup(thread.join, 5)
@@ -75,12 +78,16 @@ class HTTPRegressionTests(unittest.TestCase):
             self.assertEqual(headers["Retry-After"], "1")
             self.assertEqual(headers["Connection"], "close")
             self.assertEqual(headers.get_content_type(), "application/json")
-            with socket.create_connection(("127.0.0.1", self.port), timeout=3) as waiting:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=3
+            ) as waiting:
                 # A saturated server must reply even before it gets a request line.
                 with http.client.HTTPResponse(waiting) as response:
                     response.begin()
                     self.assertEqual(response.status, 503)
-                    self.assertEqual(json.loads(response.read())["error"]["code"], "server_busy")
+                    self.assertEqual(
+                        json.loads(response.read())["error"]["code"], "server_busy"
+                    )
             self.assertEqual(self.server.worker_count, 1)
             self.assertEqual(self.runner.mock_calls, [])
         self.assertTrue(self.server.worker_done.wait(3))
@@ -93,8 +100,14 @@ class HTTPRegressionTests(unittest.TestCase):
         self.start_server(limit=1)
         failed = threading.Event()
         with (
-            patch.object(ThreadingHTTPServer, "process_request", side_effect=RuntimeError("start failed")),
-            patch.object(self.server, "handle_error", side_effect=lambda *_: failed.set()),
+            patch.object(
+                ThreadingHTTPServer,
+                "process_request",
+                side_effect=RuntimeError("start failed"),
+            ),
+            patch.object(
+                self.server, "handle_error", side_effect=lambda *_: failed.set()
+            ),
             socket.create_connection(("127.0.0.1", self.port), timeout=3) as conn,
         ):
             self.assertTrue(failed.wait(3))
@@ -120,7 +133,9 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.assertEqual(status, 405)
                 self.assertEqual(body["error"]["code"], "method_not_allowed")
                 self.assertEqual(headers["Allow"], allow)
-        status, body, headers = self.request("EXTENSION", "/projects/missing/actions", auth=False)
+        status, body, headers = self.request(
+            "EXTENSION", "/projects/missing/actions", auth=False
+        )
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
         self.assertIsNone(headers["Allow"])
@@ -135,7 +150,9 @@ class HTTPRegressionTests(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 # Read the raw response so http.client cannot mask an erroneous HEAD body.
-                with socket.create_connection(("127.0.0.1", self.port), timeout=3) as conn:
+                with socket.create_connection(
+                    ("127.0.0.1", self.port), timeout=3
+                ) as conn:
                     request = f"HEAD {path} HTTP/1.1\r\nHost: localhost\r\n"
                     if auth:
                         request += f"Authorization: Bearer {TOKEN}\r\n"
@@ -144,13 +161,21 @@ class HTTPRegressionTests(unittest.TestCase):
                         headers, sep, body = wire.read().partition(b"\r\n\r\n")
                 self.assertTrue(sep)
                 self.assertEqual(int(headers.split(b" ", 2)[1]), expected)
-                allow_line = [line for line in headers.split(b"\r\n") if line.startswith(b"Allow:")]
-                self.assertEqual(allow_line, [f"Allow: {allow}".encode("ascii")] if allow else [])
+                allow_line = [
+                    line
+                    for line in headers.split(b"\r\n")
+                    if line.startswith(b"Allow:")
+                ]
+                self.assertEqual(
+                    allow_line, [f"Allow: {allow}".encode("ascii")] if allow else []
+                )
                 self.assertEqual(body, b"")
 
         for method in ("GET", "DELETE", "EXTENSION"):
             with self.subTest(method=method):
-                status, body, headers = self.request(method, "/projects/demo/unknown?x=1&x=2")
+                status, body, headers = self.request(
+                    method, "/projects/demo/unknown?x=1&x=2"
+                )
                 self.assertEqual(status, 404)
                 self.assertEqual(body["error"]["code"], "not_found")
                 self.assertIsNone(headers["Allow"])
@@ -211,8 +236,11 @@ class HTTPRegressionTests(unittest.TestCase):
             self.runner.file_entry.return_value = nullcontext(entry)
             conn = self.connect()
             try:
-                conn.request("GET", "/projects/demo/files?path=artifact.txt",
-                             headers={"Authorization": "Bearer " + TOKEN})
+                conn.request(
+                    "GET",
+                    "/projects/demo/files?path=artifact.txt",
+                    headers={"Authorization": "Bearer " + TOKEN},
+                )
                 response = conn.getresponse()
                 self.assertEqual(response.status, 200)
                 self.assertTrue(reading.wait(3))
@@ -228,7 +256,10 @@ class HTTPRegressionTests(unittest.TestCase):
 
     def test_file_read_error_after_headers_is_logged_and_truncates_response(self):
         self.start_server()
-        with tempfile.TemporaryFile() as file, patch("winrunner.traceback.print_exc") as log:
+        with (
+            tempfile.TemporaryFile() as file,
+            patch("winrunner.traceback.print_exc") as log,
+        ):
             file.write(b"test data")
             file.flush()
             reader = Mock(wraps=file)
@@ -238,8 +269,11 @@ class HTTPRegressionTests(unittest.TestCase):
             self.runner.file_entry.return_value = nullcontext(entry)
             conn = self.connect()
             try:
-                conn.request("GET", "/projects/demo/files?path=artifact.txt",
-                             headers={"Authorization": "Bearer " + TOKEN})
+                conn.request(
+                    "GET",
+                    "/projects/demo/files?path=artifact.txt",
+                    headers={"Authorization": "Bearer " + TOKEN},
+                )
                 response = conn.getresponse()
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Content-Length"], "9")
