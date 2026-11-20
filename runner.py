@@ -26,6 +26,17 @@ PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)
 COMMIT = re.compile(r"[0-9a-fA-F]{1,64}\Z")
 LOG = logging.getLogger(__name__)
+PS_PROGRESS_MODULE = Path(__file__).resolve().with_name("winrunner-progress.psm1")
+PS_SINGLE_QUOTES = str.maketrans({quote: quote * 2 for quote in "'\u2018\u2019\u201a\u201b"})
+
+
+def encode_ps_command(command):
+    # Import defaults before execution without wrapping the command in another
+    # script block or inserting a statement before its `using` / `param` block.
+    if getattr(config, "PS_SUPPRESS_PROGRESS", True):
+        module_path = str(PS_PROGRESS_MODULE).translate(PS_SINGLE_QUOTES)
+        command = f"using module '{module_path}'\n{command}"
+    return base64.b64encode(command.encode("utf-16-le")).decode("ascii")
 
 
 class APIError(Exception):
@@ -696,7 +707,7 @@ class Runner:
         try:
             if task.mode == "ps":
                 executable = str(config.POWERSHELL)
-                encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+                encoded = encode_ps_command(command)
                 argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
             else:
                 executable = str(config.CMD)

@@ -80,7 +80,8 @@ class RunnerCase(unittest.TestCase):
         self.port = free_port()
         self.install = self.scratch / "app"
         self.install.mkdir()
-        for name in ("config.py", "gitrepo.py", "runner.py", "winfiles.py", "winprocess.py", "winrunner.py"):
+        for name in ("config.py", "gitrepo.py", "runner.py", "winfiles.py", "winprocess.py", "winrunner.py",
+                     "winrunner-progress.psm1"):
             shutil.copyfile(ROOT / name, self.install / name)
         self.settings = self.install / "config.py"
         with self.settings.open("a", encoding="utf-8") as settings:
@@ -282,6 +283,32 @@ class CommandIntegrationTests(RunnerCase):
                            {"mode": "cmd", "command": "exit /b 7", "timeout": 8})
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["exit_code"], 7)
+
+    def test_powershell_suppresses_progress_without_losing_real_errors(self):
+        def run(command, status="succeeded"):
+            task = self.call(200, "POST", "/commands", {"mode": "ps", "command": command})
+            return self.finished("/commands/" + task["id"], expected=status)
+
+        task = run('using namespace System.Text\n'
+                   'param([string]$Message = "runner-ok")\n'
+                   'Get-Item Env:SystemRoot | Out-Null\n'
+                   'Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
+                   '[StringBuilder]::new($Message).ToString()')
+        self.assertEqual(log_bytes(task, "stdout").strip(), b"runner-ok")
+        self.assertEqual(log_bytes(task, "stderr"), b"")
+
+        task = run('Write-Progress -Activity "runner-progress" -PercentComplete 50\n'
+                   'Write-Error "runner-real-error"\nexit 7', "failed")
+        self.assertEqual(task["exit_code"], 7)
+        errors = log_bytes(task, "stderr")
+        self.assertIn(b"runner-real-error", errors)
+        # PowerShell embeds the original command text in its error records.
+        self.assertNotIn(b's="progress"', errors.lower())
+        self.assertEqual(run('cmd.exe /d /c exit 7', "failed")["exit_code"], 1)
+
+        task = run('$ProgressPreference = "Continue"\n'
+                   'Write-Progress -Activity "runner-opt-in" -PercentComplete 50')
+        self.assertIn(b"runner-opt-in", log_bytes(task, "stderr"))
 
     def test_zero_timeout_multiline_powershell_and_concurrent_incremental_logs(self):
         def launch(label):
