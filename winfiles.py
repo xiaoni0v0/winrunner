@@ -65,6 +65,7 @@ _FILE_READ_DATA = 0x0001  # FILE_LIST_DIRECTORY for directories
 _FILE_READ_ATTRIBUTES = 0x0080
 _FILE_SHARE_READ = 0x0001
 _FILE_SHARE_WRITE = 0x0002
+_FILE_SHARE_DELETE = 0x0004
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -81,9 +82,12 @@ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _SYNCHRONIZE = 0x00100000
 _FILE_OPEN = 1
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+_FILE_NON_DIRECTORY_FILE = 0x40
 _FILE_OPEN_FOR_BACKUP_INTENT = 0x4000
 _OBJ_CASE_INSENSITIVE = 0x40
 _OBJ_DONT_REPARSE = 0x1000
+_STATUS_DELETE_PENDING = 0xC0000056
+_STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA
 _STATUS_REPARSE_POINT_ENCOUNTERED = 0xC000050B
 _DUPLICATE_SAME_ACCESS = 2
 
@@ -189,7 +193,7 @@ def _pin(path: Path) -> int:
     return handle
 
 
-def _pin_child(parent: int, path: Path, name: str) -> int:
+def _pin_child(parent: int, path: Path, name: str, *, file_leaf: bool = False) -> int:
     # Open the single name relative to the *directory object*, rather than
     # resolving a new absolute path through possibly mutated ancestors.
     encoded = name.encode("utf-16-le", errors="surrogatepass")
@@ -206,20 +210,35 @@ def _pin_child(parent: int, path: Path, name: str) -> int:
         _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_FOR_BACKUP_INTENT
         | _FILE_FLAG_OPEN_REPARSE_POINT
     )
-    status = _nt_create_file(
-        ctypes.byref(handle), _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
-        ctypes.byref(obj), ctypes.byref(_IoStatusBlock()), None, 0,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE, _FILE_OPEN, options, None, 0,
-    )
-    if status < 0:
-        code = _ntstatus_to_error(status)
-        if (
-            (status & 0xFFFFFFFF) == _STATUS_REPARSE_POINT_ENCOUNTERED
-            or code == _ERROR_CANT_RESOLVE_FILENAME
-        ):
-            raise BadPath(f"Reparse point not permitted: {name!r}")
-        raise _winerror(path, code)
-    return handle.value
+    # Let the kernel distinguish files from directories in the open itself.
+    # A directory is never opened with delete sharing, even temporarily.
+    for share_delete in (True, False) if file_leaf else (False,):
+        share = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        create_options = options
+        if share_delete:
+            share |= _FILE_SHARE_DELETE
+            create_options |= _FILE_NON_DIRECTORY_FILE
+        status = _nt_create_file(
+            ctypes.byref(handle), _FILE_READ_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+            ctypes.byref(obj), ctypes.byref(_IoStatusBlock()), None, 0,
+            share, _FILE_OPEN, create_options, None, 0,
+        )
+        if status >= 0:
+            return handle.value
+        if not share_delete or (status & 0xFFFFFFFF) != _STATUS_FILE_IS_A_DIRECTORY:
+            break
+        # Retry without delete sharing to pin a directory leaf (or a new file
+        # if the name changed after the first open).
+
+    ntstatus = status & 0xFFFFFFFF
+    if ntstatus == _STATUS_DELETE_PENDING:
+        # Legacy deletion leaves the name visible until the last handle is
+        # closed, but another reader cannot open it. Preserve real ACL errors.
+        raise FileNotFoundError(errno.ENOENT, "File or directory is pending deletion", str(path))
+    code = _ntstatus_to_error(status)
+    if ntstatus == _STATUS_REPARSE_POINT_ENCOUNTERED or code == _ERROR_CANT_RESOLVE_FILENAME:
+        raise BadPath(f"Reparse point not permitted: {name!r}")
+    raise _winerror(path, code)
 
 
 def _check_handle(stack: ExitStack, handle: int, path: Path, *, directory: bool) -> int:
@@ -261,11 +280,12 @@ def _walk(root: Path, relative: str, *, relative_handles: bool) -> Iterator[tupl
         attributes = _check_handle(stack, handle, path, directory=True)
         for index, component in enumerate(parts):
             path /= component
-            handle = _pin_child(handle, path, component) if relative_handles else _pin(path)
-            attributes = _check_handle(
-                stack, handle, path,
-                directory=index < len(root_parts) or index + 1 < len(parts),
-            )
+            directory = index < len(root_parts) or index + 1 < len(parts)
+            if relative_handles:
+                handle = _pin_child(handle, path, component, file_leaf=not directory)
+            else:
+                handle = _pin(path)
+            attributes = _check_handle(stack, handle, path, directory=directory)
         yield path, handle, attributes
 
 
@@ -357,7 +377,14 @@ class _PinnedEntry:
 
 @contextmanager
 def pinned_entry(root: Path, relative: str) -> Iterator[_PinnedEntry]:
-    """Yield checked file/dir access that never reopens the entry by path."""
+    """Yield checked file/dir access that never reopens the entry by path.
+
+    The opened regular file stays readable after rename, deletion, or an
+    atomic replacement using Windows POSIX rename semantics. Legacy Windows
+    replacement (including os.replace) can still reject an open target.
+    This pins the file object, not its contents against in-place writes.
+    Directory handles continue to deny delete sharing.
+    """
     with _walk(root, relative, relative_handles=True) as (path, handle, attributes):
         entry = _PinnedEntry(path, handle, attributes)
         try:

@@ -546,6 +546,34 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(self.call(200, "GET", project)["status"], "succeeded")
         self.assertEqual(self.call(200, "GET", file_url), b"new data")
 
+    def test_new_action_interrupts_an_existing_slow_download(self):
+        project = self.register()
+        worktree = next(self.data.rglob("read me.txt")).parent
+        size = 64 * 1024 * 1024
+        with (worktree / "pending.bin").open("wb") as file:
+            file.truncate(size)
+        with socket.socket() as slow:
+            slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            slow.settimeout(6)
+            slow.connect(("127.0.0.1", self.port))
+            slow.sendall((f"GET {project}/files?path=pending.bin HTTP/1.0\r\n"
+                          f"Authorization: Bearer {self.token}\r\n\r\n").encode("ascii"))
+            with slow.makefile("rb") as response:
+                self.assertIn(b" 200 ", response.readline())
+                while True:
+                    line = response.readline()
+                    if line in (b"", b"\r\n"):
+                        break
+                # Do not drain the connection. The new Action must free the old tree anyway.
+                self.call(400, "POST", project + "/actions", b"{")
+                result = self.call(200, "GET", project + "/actions")
+                self.assertEqual((result["status"], result["phase"]), ("failed", "validate"), result)
+                self.assertFalse((worktree / "pending.bin").exists())
+                try:
+                    self.assertLess(len(response.read()), size)
+                except ConnectionResetError:
+                    pass
+
     def test_simultaneous_case_insensitive_project_registration(self):
         ready = threading.Barrier(2)
 

@@ -3,8 +3,10 @@
 import ctypes
 import os
 import struct
+import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import patch
@@ -52,10 +54,106 @@ class WinFilesTests(unittest.TestCase):
                 else:
                     self.assertEqual(value, target)
                     self.assertEqual(value.read_bytes(), b"0123456789")
-                for path in (self.parent, self.root, git_dir, target):
+                pinned_names = (self.parent, self.root, git_dir)
+                if pin is pinned_path:
+                    pinned_names += (target,)
+                for path in pinned_names:
                     with self.assertRaises(PermissionError):
                         path.rename(path.with_name(path.name + "-renamed"))
+        with pinned_entry(self.root, ".git") as entry:
+            self.assertTrue(entry.is_dir)
+            with self.assertRaises(PermissionError):
+                git_dir.rename(git_dir.with_name("moved"))
         target.rename(target.with_name("renamed"))
+
+    @contextmanager
+    def native_handle(self, path, access, share):
+        handle = winfiles._create_file(str(path), access, share, None, 3, 0, None)
+        if handle == winfiles._INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield handle
+        finally:
+            winfiles._close_handle(handle)
+
+    def set_file_info(self, handle, info_class, info):
+        setter = winfiles._kernel32.SetFileInformationByHandle
+        setter.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        setter.restype = wintypes.BOOL
+        if not setter(handle, info_class, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def test_download_survives_rename_and_unlink_with_shared_writer(self):
+        target, rotated = self.root / "artifact", self.root / "rotated"
+        old = b"original payload" * 4096
+        target.write_bytes(old)
+        # Rotate with a writer that permits deletion (Python's builtin open
+        # does not share delete on Windows; the reader cannot change that).
+        with self.native_handle(target, 0x40000000, 7):  # GENERIC_WRITE, share all
+            with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+                self.assertEqual(file.read(8), old[:8])
+                target.rename(rotated)
+                target.write_bytes(b"new file at the original name")
+                self.assertEqual(file.read(), old[8:])
+                rotated.unlink()
+                file.seek(0)
+                self.assertEqual(file.read(), old)
+        self.assertFalse(rotated.exists())
+        self.assertEqual(target.read_bytes(), b"new file at the original name")
+
+    def test_download_survives_atomic_replacement(self):
+        if sys.getwindowsversion().build < 16299:
+            self.skipTest("FileRenameInfoEx requires Windows 10 version 1709 or later")
+        target, replacement = self.root / "artifact", self.root / "replacement"
+        old, new = b"original payload" * 4096, b"new payload"
+        target.write_bytes(old)
+        replacement.write_bytes(new)
+        target_name_bytes = len(str(target).encode("utf-16-le"))
+
+        class FileRenameInfo(ctypes.Structure):
+            _fields_ = [
+                ("flags", wintypes.DWORD), ("root_directory", wintypes.HANDLE),
+                ("name_bytes", wintypes.DWORD), ("name", wintypes.WCHAR * (target_name_bytes // 2 + 1)),
+            ]
+
+        # FileRenameInfoEx with REPLACE_IF_EXISTS | POSIX_SEMANTICS. This is
+        # one atomic replacement, not an unlink followed by a rename. Legacy
+        # MoveFileEx (os.replace) can reject any open destination on Windows.
+        rename_info = FileRenameInfo(3, None, target_name_bytes, str(target))
+        with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+            self.assertEqual(file.read(8), old[:8])
+            with self.native_handle(replacement, 0x10000, 7) as handle:  # DELETE access
+                self.set_file_info(handle, 22, rename_info)
+            self.assertFalse(replacement.exists())
+            with pinned_entry(self.root, target.name) as current, current.open_file() as current_file:
+                self.assertEqual(current_file.read(), new)
+            self.assertEqual(os.fstat(file.fileno()).st_size, len(old))
+            self.assertEqual(file.read(), old[8:])
+
+    def test_delete_pending_is_not_available_to_new_downloads(self):
+        target = self.root / "artifact"
+        target.write_bytes(b"old payload")
+        with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+            with self.native_handle(target, 0x10000, 7) as handle:  # DELETE access
+                self.set_file_info(handle, 4, wintypes.BOOL(True))  # legacy FileDispositionInfo
+            with self.assertRaises(FileNotFoundError):
+                with pinned_entry(self.root, target.name):
+                    self.fail("unexpectedly opened a new handle to a delete-pending file")
+            self.assertEqual(file.read(), b"old payload")
+        self.assertFalse(target.exists())
+
+    def test_download_with_writer_and_exclusive_sharing_violation(self):
+        target = self.root / "artifact"
+        with target.open("wb") as writer:
+            writer.write(b"payload")
+            writer.flush()
+            with pinned_entry(self.root, target.name) as entry, entry.open_file() as file:
+                self.assertEqual(file.read(), b"payload")
+        with self.native_handle(target, 0x40000000, 0):  # GENERIC_WRITE, exclusive
+            with self.assertRaises(OSError) as error:
+                with pinned_entry(self.root, target.name):
+                    self.fail("unexpectedly opened an exclusively held file")
+            self.assertEqual(error.exception.winerror, 32)
 
     def test_directory_inventory_and_missing(self):
         (self.root / ".git").mkdir()
@@ -141,10 +239,10 @@ class WinFilesTests(unittest.TestCase):
         clear_junction()
         make_junction_into = winfiles._pin_child
 
-        def replace_parent_before_open(parent, path, name):
+        def replace_parent_before_open(parent, path, name, *, file_leaf=False):
             if name == "secret.txt":
                 make_junction()
-            return make_junction_into(parent, path, name)
+            return make_junction_into(parent, path, name, file_leaf=file_leaf)
 
         with patch.object(winfiles, "_pin_child", replace_parent_before_open):
             with self.assertRaises((BadPath, FileNotFoundError)):

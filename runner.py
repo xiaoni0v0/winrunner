@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -24,6 +25,7 @@ from winprocess import Job, JobCancelled
 PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)
 COMMIT = re.compile(r"[0-9a-fA-F]{1,64}\Z")
+LOG = logging.getLogger(__name__)
 
 
 class APIError(Exception):
@@ -141,15 +143,62 @@ def _remove_tree(path):
         path.unlink()
 
 
+def _clean_paths(paths):
+    failures = {}
+    for path in paths:
+        try:
+            _remove_tree(path)
+        except OSError as exc:
+            failures[path] = exc
+    return failures
+
+
+def _cleanup_error(code, message, exc):
+    return APIError(409, code, f"{message}; release any file or directory handles and retry. {exc}")
+
+
 def child_env():
     return {key: value for key, value in os.environ.items() if key.upper() != "RUNNER_TOKEN"}
 
 
+class DeferredJob:
+    """Allocate native resources only when work runs, never under a registry lock."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.native = None
+        self.stopped = False
+
+    def run(self, *args, **kwargs):
+        with self.lock:
+            if self.stopped:
+                raise JobCancelled()
+            if self.native is None:
+                self.native = Job()
+            job = self.native
+        return job.run(*args, **kwargs)
+
+    def cancel(self):
+        with self.lock:
+            self.stopped = True
+            job = self.native
+        if job is not None:
+            job.cancel()
+
+    def close(self):
+        with self.lock:
+            self.stopped = True
+            job, self.native = self.native, None
+        if job is not None:
+            job.close()
+
+
 class Task:
     def __init__(self, phase, *, command_id=None, mode=None):
-        self.job = Job()
+        self.job = DeferredJob()
         self.lock = threading.RLock()
         self.done = threading.Event()
+        self.cancelled = threading.Event()
         self.status, self.phase = "preparing", phase
         self.source, self.exit_code, self.error, self.commit = None, None, None, None
         self.output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -182,26 +231,35 @@ class Task:
                             stderr=lambda data: self.append("stderr", data),
                             on_started=self.started)
 
-    def cancel(self):
+    def cancel(self, wake=None):
         with self.lock:
             if self.done.is_set():
                 return
             self.status = "cancelling"
+            self.cancelled.set()
+        if wake is not None:
+            wake()
         self.job.cancel()
 
     def finish(self, *, exit_code=None, error=None, source=None, stdout=b"", stderr=b""):
-        self.job.close()
+        try:
+            self.job.close()
+        except Exception as exc:
+            LOG.exception("Could not close finished job")
+            if error is None:
+                error = APIError(200, "job_cleanup_failed", str(exc))
         with self.lock:
             self.exit_code = exit_code
-            if self.status == "cancelling":
+            if self.cancelled.is_set():
                 self.status = "cancelled"
             elif error is not None or exit_code not in (None, 0):
                 if error is None:
                     error = APIError(200, "process_exit_nonzero", f"Process exited with code {exit_code}")
-                self.error = error.payload()
                 self.status = "failed"
             else:
                 self.status = "succeeded"
+            if error is not None:
+                self.error = error.payload()
             if source is not None:
                 self.source = source
             self.output["stdout"].extend(stdout)
@@ -246,9 +304,10 @@ class Project:
         self.worktree, self.cache = projects_dir / name, caches_dir / name
         self.lifecycle = "cloning"
         self.cloned = threading.Event()
+        self.create_failed = False
         self.task = None
         self.visible = False
-        self.readers = 0
+        self.readers = {}
         self.delete_in_progress = False
 
     def snapshot(self):
@@ -270,6 +329,7 @@ class Runner:
         self.reader_changed = threading.Condition(self.lock)
         self.closing = False
         self.projects, self.commands = {}, {}
+        self.pending_cleanup = {}
         self.started_at = time.monotonic()
         self.base = Path(data_dir).resolve()
         self.base.mkdir(parents=True, exist_ok=True)
@@ -299,7 +359,7 @@ class Runner:
 
     def _project(self, name):
         project = self.projects.get(name.lower())
-        if project is None:
+        if project is None or project.create_failed:
             raise not_found("Project not found")
         return project
 
@@ -314,7 +374,7 @@ class Runner:
 
     def list_projects(self):
         with self.lock:
-            return [project.snapshot() for project in self.projects.values()]
+            return [project.snapshot() for project in self.projects.values() if not project.create_failed]
 
     def get_project(self, name):
         with self.lock:
@@ -327,15 +387,20 @@ class Runner:
             self._available()
             if key in self.projects:
                 raise conflict("Project name is already registered")
-            project = Project(name, url, Job(), self.projects_dir, self.caches_dir)
+            project = Project(name, url, DeferredJob(), self.projects_dir, self.caches_dir)
+            stale_paths = self.pending_cleanup.get(key, ())
             self.projects[key] = project
+        paths = tuple(dict.fromkeys((*stale_paths, project.worktree, project.cache)))
         success = False
+        failed_paths = {}
         try:
-            _remove_tree(project.worktree)
-            _remove_tree(project.cache)
+            failed_paths = _clean_paths(paths)
+            if failed_paths:
+                exc = next(iter(failed_paths.values()))
+                raise _cleanup_error("project_cleanup_blocked", "Could not clear stale project directories", exc)
             self._repo(project, project.clone_job).create()
             with self.lock:
-                if project.lifecycle == "deleting" or self.closing:
+                if project.lifecycle != "cloning" or self.closing:
                     raise conflict("Project creation was cancelled")
                 project.lifecycle = None
                 project.visible = True
@@ -347,21 +412,27 @@ class Runner:
         except JobCancelled as exc:
             raise conflict("Project creation was cancelled") from exc
         finally:
+            if not success:
+                with self.lock:
+                    project.create_failed = True
             try:
                 project.clone_job.close()
-                if not success:
-                    try:
-                        _remove_tree(project.worktree)
-                        _remove_tree(project.cache)
-                    except OSError:
-                        with self.lock:
-                            project.lifecycle = "deleting"
-                        raise
-                    with self.lock:
-                        if not project.delete_in_progress:
-                            self.projects.pop(key, None)
+            except Exception:
+                LOG.exception("Could not close clone job for %s", name)
+            try:
+                if not success and not failed_paths:
+                    failed_paths = _clean_paths(paths)
+                for path, exc in failed_paths.items():
+                    LOG.warning("Project rollback left %s: %s", path, exc)
             finally:
-                project.cloned.set()
+                with self.lock:
+                    if failed_paths:
+                        self.pending_cleanup[key] = tuple(failed_paths)
+                    else:
+                        self.pending_cleanup.pop(key, None)
+                    if not success and not project.delete_in_progress:
+                        self.projects.pop(key, None)
+                    project.cloned.set()
 
     def delete_project(self, name):
         with self.lock:
@@ -373,44 +444,94 @@ class Runner:
             project.lifecycle = "deleting"
             project.visible = False
             task = project.task
+        deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
         success = False
+        key = project.name.lower()
         try:
+            self._interrupt_readers(project)
             if not project.cloned.is_set():
                 project.clone_job.cancel()
             if task is not None:
-                task.cancel()
-            project.cloned.wait()
-            if task is not None:
-                task.done.wait()
-            self._wait_readers(project)
-            _remove_tree(project.worktree)
-            _remove_tree(project.cache)
+                self._cancel_task(task)
+            for event in (project.cloned, task.done if task is not None else None):
+                if event is not None and not event.wait(max(0, deadline - time.monotonic())):
+                    raise APIError(409, "project_busy", "Project is still stopping; retry DELETE")
+            self._wait_readers(project, deadline)
+            with self.lock:
+                stale_paths = self.pending_cleanup.get(key, ())
+            paths = tuple(dict.fromkeys((*stale_paths, project.worktree, project.cache)))
+            failures = _clean_paths(paths)
+            if failures:
+                if project.create_failed:
+                    with self.lock:
+                        self.pending_cleanup[key] = tuple(failures)
+                exc = next(iter(failures.values()))
+                raise _cleanup_error("project_cleanup_blocked", "Could not delete project directories", exc)
             success = True
         finally:
             with self.lock:
                 if success:
-                    self.projects.pop(project.name.lower(), None)
+                    self.pending_cleanup.pop(key, None)
+                if success or (project.create_failed and project.cloned.is_set()):
+                    self.projects.pop(key, None)
                 else:
                     project.delete_in_progress = False
+                    if not project.create_failed:
+                        project.lifecycle = "delete_failed"
 
     @contextmanager
-    def file_entry(self, name, relative):
+    def file_entry(self, name, relative, *, cancel_read=None):
+        key = object()
         with self.lock:
             project = self._project(name)
             if not project.visible or project.lifecycle is not None:
                 raise not_found("The current project directory is not available")
-            project.readers += 1
+            project.readers[key] = cancel_read
         try:
             with pinned_entry(project.worktree, relative) as entry:
                 yield entry
         finally:
             with self.reader_changed:
-                project.readers -= 1
+                del project.readers[key]
                 self.reader_changed.notify_all()
 
-    def _wait_readers(self, project):
+    def _interrupt_readers(self, project):
+        with self.lock:
+            callbacks = tuple(project.readers.values())
+        for cancel in callbacks:
+            if cancel is not None:
+                try:
+                    cancel()
+                except Exception:
+                    LOG.exception("Could not interrupt a file response for %s", project.name)
+
+    def _notify_readers(self):
         with self.reader_changed:
-            self.reader_changed.wait_for(lambda: project.readers == 0)
+            self.reader_changed.notify_all()
+
+    def _cancel_task(self, task):
+        task.cancel(self._notify_readers)
+
+    def _wait_readers(self, project, deadline, cancelled=None):
+        with self.reader_changed:
+            self.reader_changed.wait_for(
+                lambda: not project.readers or (cancelled is not None and cancelled.is_set()),
+                timeout=max(0, deadline - time.monotonic()),
+            )
+            if not project.readers:
+                return
+            if cancelled is not None and cancelled.is_set():
+                raise APIError(409, "reset_cancelled", "Cancelled before existing downloads released the old worktree")
+            raise APIError(409, "project_busy", "Project downloads have not released their files; retry the operation")
+
+    def _reset_action(self, project, task):
+        deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
+        self._interrupt_readers(project)
+        self._wait_readers(project, deadline, task.cancelled)
+        try:
+            _remove_tree(project.worktree)
+        except OSError as exc:
+            raise _cleanup_error("reset_blocked", "Could not clear the previous worktree", exc) from exc
 
     def start_action(self, name, raw, accepted_at):
         with self.lock:
@@ -424,7 +545,20 @@ class Runner:
             values, error = action_body(raw), None
         except APIError as exc:
             values, error = None, exc
-        self._start_thread(self._run_action, task, project, values, error)
+        try:
+            self._start_thread(self._run_action, task, project, values, error)
+        except Exception as exc:
+            worker_error = APIError(500, "worker_unavailable", "Could not start worker thread")
+            diagnostic = str(exc)
+            try:
+                self._reset_action(project, task)
+            except Exception as reset_exc:
+                worker_error = APIError(500, "worker_unavailable_reset_incomplete",
+                                        f"Could not start worker thread; worktree reset incomplete: {reset_exc}")
+                diagnostic = f"{diagnostic}\n{worker_error}"
+            finally:
+                task.finish(error=worker_error, source="runner", stderr=diagnostic.encode("utf-8", "replace"))
+            raise worker_error from exc
         if error is not None:
             task.done.wait()
             raise error
@@ -432,19 +566,15 @@ class Runner:
 
     @staticmethod
     def _start_thread(worker, task, *args):
-        try:
-            threading.Thread(target=worker, args=(task, *args), daemon=True).start()
-        except Exception as exc:
-            error = APIError(500, "worker_unavailable", "Could not start worker thread")
-            task.finish(error=error, source="runner", stderr=str(exc).encode("utf-8", "replace"))
-            raise error from exc
+        threading.Thread(target=worker, args=(task, *args), daemon=True).start()
 
     def _run_action(self, task, project, values, validation_error):
         result = {}
         checkout_started = False
         try:
-            self._wait_readers(project)
-            _remove_tree(project.worktree)
+            self._reset_action(project, task)
+            if task.cancelled.is_set():
+                raise JobCancelled()
             task.stage("validate")
             if validation_error:
                 raise validation_error
@@ -489,17 +619,33 @@ class Runner:
             code = {"launch": "launch_failed", "process": "process_error", "runner": "runner_error"}[source]
             result.update(_failure(APIError(200, code, str(exc)), source))
         finally:
-            if checkout_started:
+            try:
+                if checkout_started:
+                    self._publish_worktree(project)
+            except Exception as exc:
+                LOG.exception("Could not inspect current worktree for %s", project.name)
                 with self.lock:
-                    if project.lifecycle is None:
-                        project.visible = project.worktree.is_dir()
-            task.finish(**result)
+                    project.visible = False
+                if "error" not in result:
+                    error = APIError(200, "worktree_status_failed", f"Could not inspect current worktree: {exc}")
+                    if task.phase == "run":
+                        result["error"] = error  # Do not mix Runner diagnostics into process logs.
+                    else:
+                        result.update(_failure(error, "runner"))
+            finally:
+                task.finish(**result)
+
+    def _publish_worktree(self, project):
+        visible = project.worktree.is_dir()
+        with self.lock:
+            if project.lifecycle is None:
+                project.visible = visible
 
     def get_action(self, name, offsets=None, limit=65536):
         with self.lock:
             project = self._project(name)
-            if project.lifecycle == "deleting":
-                raise conflict("Project is being deleted")
+            if project.lifecycle in ("deleting", "delete_failed"):
+                raise conflict("Project deletion is in progress or must be retried")
             if project.task is None:
                 raise not_found("No action has been submitted")
             return project.task.snapshot(offsets, limit)
@@ -508,12 +654,12 @@ class Runner:
         with self.lock:
             self._available()
             project = self._project(name)
-            if project.lifecycle == "deleting":
-                raise conflict("Project is being deleted")
+            if project.lifecycle in ("deleting", "delete_failed"):
+                raise conflict("Project deletion is in progress or must be retried")
             if project.task is None:
                 raise not_found("No action has been submitted")
             task = project.task
-            task.cancel()
+        self._cancel_task(task)
         task.done.wait()
 
     def start_command(self, raw, accepted_at):
@@ -525,7 +671,12 @@ class Runner:
                 command_id = uuid.uuid4().hex
             task = Task("launch", command_id=command_id, mode=mode)
             self.commands[command_id] = task
-        self._start_thread(self._run_command, task, command)
+        try:
+            self._start_thread(self._run_command, task, command)
+        except Exception as exc:
+            error = APIError(500, "worker_unavailable", "Could not start worker thread")
+            task.finish(error=error, source="runner", stderr=str(exc).encode("utf-8", "replace"))
+            raise error from exc
         return task.response(timeout, accepted_at)
 
     @staticmethod
@@ -540,8 +691,8 @@ class Runner:
                 executable = str(config.CMD)
                 argv = subprocess.list2cmdline([executable]) + ' /d /s /c "' + command + '"'
             result["exit_code"] = task.run(argv, executable=executable, cwd=Path.home())
-        except JobCancelled:
-            pass
+        except JobCancelled as exc:
+            result["exit_code"] = exc.exit_code
         except Exception as exc:
             source = "process" if task.phase == "run" else "launch"
             result = _failure(APIError(200, "process_error" if source == "process" else "launch_failed",
@@ -564,12 +715,13 @@ class Runner:
             if task.deleting:
                 raise conflict("Command deletion is already in progress")
             task.deleting = True
-            try:
-                task.cancel()
-            except Exception:
+        try:
+            self._cancel_task(task)
+            task.done.wait()
+        except BaseException:
+            with self.lock:
                 task.deleting = False
-                raise
-        task.done.wait()
+            raise
         with self.lock:
             self.commands.pop(command_id, None)
 
@@ -582,8 +734,10 @@ class Runner:
             for project in projects:
                 if not project.cloned.is_set():
                     project.clone_job.cancel()
+            for project in projects:
+                self._interrupt_readers(project)
             for task in tasks:
-                task.cancel()
+                self._cancel_task(task)
             for project in projects:
                 project.cloned.wait()
             for task in tasks:
