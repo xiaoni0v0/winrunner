@@ -1,7 +1,9 @@
 """HTTP regression tests with a loopback listener and a fake Runner."""
 
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 import http.client
+import io
+from pathlib import Path
 import json
 import socket
 import struct
@@ -12,7 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import config
-from winrunner import HTTPHandler, HTTPServer, ThreadingHTTPServer
+from winrunner import HTTPHandler, HTTPServer, ThreadingHTTPServer, service_logging
 
 TOKEN = "test-bearer-token"
 
@@ -69,6 +71,70 @@ class HTTPRegressionTests(unittest.TestCase):
             return response.status, json.loads(body) if body else body, response.headers
         finally:
             conn.close()
+
+    def test_request_metadata_is_bounded_redacted_and_appended(self):
+        self.start_server()
+        self.runner.start_command.return_value = (202, {"id": "z", "mode": "ps"})
+        self.runner.start_action.return_value = (202, {})
+        console = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            logfile = Path(folder) / "winrunner.log"
+            logfile.write_text("old run\n", encoding="utf-8")
+            with redirect_stdout(console), service_logging(logfile, TOKEN):
+                cases = [
+                    (
+                        "/commands",
+                        {
+                            "mode": "ps",
+                            "timeout": 0,
+                            "command": "never log this command",
+                        },
+                    ),
+                    (
+                        "/projects/demo/actions",
+                        {
+                            "commit": "abc1234",
+                            "interpreter": "python",
+                            "script": TOKEN + "/" + "宽" * 98 + "\nsecond line",
+                            "args": ["never log this argument"],
+                        },
+                    ),
+                ]
+                for route, body in cases:
+                    self.server.worker_done.clear()
+                    conn = self.connect()
+                    try:
+                        conn.request(
+                            "POST",
+                            route,
+                            body=json.dumps(body),
+                            headers={"Authorization": "Bearer " + TOKEN},
+                        )
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, 202)
+                        response.read()
+                    finally:
+                        conn.close()
+                    self.assertTrue(self.server.worker_done.wait(3))
+            text = console.getvalue()
+            self.assertEqual(logfile.read_text(encoding="utf-8"), "old run\n" + text)
+        for marker in (
+            "202 POST /commands",
+            'mode="ps"',
+            "timeout=0",
+            'id="z"',
+            "202 POST /projects/{id}/actions",
+            'project="demo"',
+            'commit="abc1234"',
+            'interpreter="python"',
+            'script="[redacted]',
+        ):
+            self.assertIn(marker, text)
+        for secret in (TOKEN, "never log this command", "never log this argument"):
+            self.assertNotIn(secret, text)
+        self.assertTrue(
+            all(len(line) <= 80 and line.isascii() for line in text.splitlines())
+        )
 
     def test_rejects_over_budget_before_starting_worker_and_reuses_permit(self):
         self.start_server(limit=1)
@@ -221,7 +287,7 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.assertEqual(body["error"]["code"], "file_busy")
 
                 self.runner.list_projects.side_effect = error
-                with patch("winrunner.traceback.print_exc") as log:
+                with patch("winrunner.LOG.exception") as log:
                     status, body, _ = self.request("GET", "/projects")
                     log.assert_called_once()
                 self.assertEqual(status, 500)
@@ -238,7 +304,7 @@ class HTTPRegressionTests(unittest.TestCase):
         entry = Mock(is_dir=True)
         entry.list_entries.side_effect = error
         self.runner.file_entry.return_value = nullcontext(entry)
-        with patch("winrunner.traceback.print_exc") as log:
+        with patch("winrunner.LOG.exception") as log:
             status, body, _ = self.request("GET", path)
             log.assert_called_once()
         self.assertEqual(status, 500)
@@ -285,7 +351,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.start_server()
         with (
             tempfile.TemporaryFile() as file,
-            patch("winrunner.traceback.print_exc") as log,
+            patch("winrunner.LOG.exception") as log,
         ):
             file.write(b"test data")
             file.flush()

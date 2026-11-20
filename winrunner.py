@@ -2,13 +2,17 @@
 
 import hmac
 import json
+import logging
 import os
 import re
 import sys
+import textwrap
 import time
 import traceback
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from socket import SHUT_RDWR
 from threading import BoundedSemaphore
 from typing import cast
@@ -20,6 +24,103 @@ from winprocess import health
 
 DECIMAL = re.compile(r"[0-9]+\Z")
 BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
+LOG = logging.getLogger("winrunner")
+LOG_FILE = Path(__file__).resolve().with_name("winrunner.log")
+
+
+class ServiceFormatter(logging.Formatter):
+    def __init__(self, token: str):
+        super().__init__()
+        self.secrets = sorted(
+            {token, json.dumps(token)[1:-1]} - {""}, key=len, reverse=True
+        )
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = record.getMessage()
+        if record.exc_info is not None:
+            kind, error, stack = record.exc_info
+            if kind is not None:
+                code = getattr(error, "winerror", None) or getattr(error, "errno", None)
+                error_name = (
+                    f"{kind.__name__}({code})"
+                    if isinstance(code, int)
+                    else kind.__name__
+                )
+                frames = " > ".join(
+                    f"{Path(frame.filename).name}:{frame.lineno} {frame.name}"
+                    for frame in traceback.extract_tb(stack)
+                )
+                message += f" | {error_name}: {frames}"
+        for secret in self.secrets:
+            message = message.replace(secret, "[redacted]")
+        # Printable ASCII makes the bound independent of the console code page.
+        message = "".join(c if c.isprintable() else ascii(c)[1:-1] for c in message)
+        message = message.encode("ascii", "backslashreplace").decode("ascii")
+        prefix = (
+            f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')} {record.levelname:<7} "
+        )
+        return textwrap.fill(
+            message,
+            width=80,
+            initial_indent=prefix,
+            subsequent_indent=" " * len(prefix),
+            break_on_hyphens=False,
+        )
+
+
+class ServiceFileHandler(logging.FileHandler):
+    def __init__(self, path: Path, console: logging.Handler):
+        super().__init__(path, mode="a", encoding="utf-8")
+        self.console = console
+        self.reported_error = False
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        if not self.reported_error:
+            self.reported_error = True
+            warning = logging.LogRecord(
+                record.name,
+                logging.WARNING,
+                __file__,
+                0,
+                "Cannot append to service log; console logging is still active",
+                (),
+                None,
+            )
+            self.console.handle(warning)
+
+
+@contextmanager
+def service_logging(path: Path, token: str):
+    channels = (LOG, logging.getLogger("runner"))
+    previous = [(channel, channel.level, channel.propagate) for channel in channels]
+    formatter = ServiceFormatter(token)
+    console = logging.StreamHandler(sys.stdout)
+    handlers: list[logging.Handler] = [console]
+    console.setFormatter(formatter)
+    try:
+        disk = ServiceFileHandler(path, console)
+    except OSError:
+        disk = None
+    if disk is not None:
+        disk.setFormatter(formatter)
+        handlers.append(disk)
+    try:
+        for channel in channels:
+            channel.setLevel(logging.INFO)
+            channel.propagate = False
+            for handler in handlers:
+                channel.addHandler(handler)
+        if disk is None:
+            LOG.warning("Cannot open service log %s; using stdout only", path)
+        yield
+    finally:
+        for channel, level, propagate in previous:
+            for handler in handlers:
+                channel.removeHandler(handler)
+            channel.setLevel(level)
+            channel.propagate = propagate
+        for handler in handlers:
+            handler.close()
 
 
 def uint(text, name):
@@ -98,6 +199,7 @@ class HTTPServer(ThreadingHTTPServer):
                 pass  # An overloaded connection must not stall the accept loop.
             finally:
                 self.shutdown_request(request)
+            LOG.warning("503 connection limit peer=%s", client_address[0])
             return
         try:
             super().process_request(request, client_address)
@@ -111,6 +213,9 @@ class HTTPServer(ThreadingHTTPServer):
         finally:
             self.connections.release()
 
+    def handle_error(self, request, client_address):
+        LOG.exception("Unhandled HTTP handler error peer=%s", client_address[0])
+
 
 class HTTPHandler(BaseHTTPRequestHandler):
     server: HTTPServer
@@ -122,12 +227,45 @@ class HTTPHandler(BaseHTTPRequestHandler):
         super().setup()
 
     def log_request(self, code="-", size="-"):
-        self.log_message("%s %s", self.command, code)
+        self.request_status = code
+
+    def note(self, key: str, value: object) -> None:
+        if isinstance(value, str):
+            token = self.server.token.decode("ascii")
+            if token:
+                value = value.replace(token, "[redacted]")
+            if len(value) > 100:
+                value = value[:97] + "..."
+            self.request_details.append(f"{key}={json.dumps(value, ensure_ascii=True)}")
+        elif type(value) in (int, float):
+            self.request_details.append(f"{key}={value}")
+
+    def note_body(self, raw: bytes, *fields: str) -> None:
+        # Metadata only; execution still validates and owns the original body.
+        if len(raw) > 16 * 1024:
+            return
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(body, dict):
+            return
+        for key in fields:
+            self.note(key, body.get(key))
+        if "name" in fields and isinstance(body.get("repo_url"), str):
+            try:
+                self.note("repo_host", urlsplit(body["repo_url"]).hostname)
+            except ValueError:
+                pass
 
     def handle_one_request(self):
         # Keep the base request-line bounds, but route every method after auth.
         self.response_started = False
         self.file_response_aborted = False
+        self.request_status = None
+        self.operation = "request"
+        self.request_details: list[str] = []
+        started = time.monotonic()
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
@@ -140,13 +278,28 @@ class HTTPHandler(BaseHTTPRequestHandler):
             if self.parse_request():
                 self.dispatch(self.command)
                 self.wfile.flush()
-        except TimeoutError as exc:
-            self.log_error("Request timed out: %r", exc)
+        except TimeoutError:
+            LOG.warning("HTTP request timed out peer=%s", self.client_address[0])
             self.close_connection = True
         except ConnectionError:
             # A client may reset the connection during parsing or while we
             # send an error reply. There is no peer left to respond to.
             self.close_connection = True
+        finally:
+            if self.request_status is not None:
+                elapsed = (time.monotonic() - started) * 1000
+                LOG.info(
+                    "%s %s %.0fms peer=%s%s",
+                    self.request_status,
+                    self.operation,
+                    elapsed,
+                    self.client_address[0],
+                    (
+                        " " + " ".join(self.request_details)
+                        if self.request_details
+                        else ""
+                    ),
+                )
 
     def parse_request(self):
         if not super().parse_request():
@@ -160,6 +313,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError):
             valid = False
         if not valid:
+            self.operation = "authentication rejected"
             self.reply(
                 401,
                 {
@@ -260,9 +414,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             elif self.response_started:
                 # A download that fails after its headers cannot send a second response.
-                traceback.print_exc()
+                LOG.exception("Response interrupted: %s", self.operation)
                 self.close_connection = True
             elif isinstance(exc, APIError):
+                self.note("error", exc.code)
                 self.reply(exc.status, exc.response_payload())
             elif isinstance(exc, ValueError):  # Includes BadPath.
                 self.reply(
@@ -279,7 +434,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     },
                 )
             else:
-                traceback.print_exc()
+                LOG.exception("Request failed: %s", self.operation)
                 self.reply(
                     500,
                     {
@@ -294,13 +449,24 @@ class HTTPHandler(BaseHTTPRequestHandler):
         key = (parts[0], None, *parts[2:]) if len(parts) > 1 else tuple(parts)
         route = self.routes.get(key)
         if route is None:
+            self.operation = "unknown route"
             raise not_found("Route not found")
         allowed, handler = route
+        route_name = "/" + "/".join(
+            part if part is not None else "{id}" for part in key
+        )
         if method not in allowed:
+            self.operation = f"unsupported method {route_name}"
             self.method_error(", ".join(allowed))
             return
+        self.operation = f"{method} {route_name}"
         name = parts[1] if len(parts) > 1 else None
-        handler(self, method, name, self.parse_query(raw_query))
+        self.note("project" if parts[0] == "projects" else "id", name)
+        query = self.parse_query(raw_query)
+        for field in ("stdout_offset", "stderr_offset", "limit"):
+            if field in query and DECIMAL.fullmatch(query[field]):
+                self.note(field, query[field])
+        handler(self, method, name, query)
 
     def get_health(self, _method, _name, query):
         self.no_query(query)
@@ -319,7 +485,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if method == "GET":
             self.reply(200, {"projects": runner.list_projects()})
         else:
-            self.reply(201, runner.create(self.raw_body()))
+            raw = self.raw_body()
+            self.note_body(raw, "name")
+            self.reply(201, runner.create(raw))
 
     def project(self, method, name, query):
         self.no_query(query)
@@ -337,7 +505,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
         elif method == "POST":
             self.no_query(query)
             raw = self.raw_body()
-            self.reply(*runner.start_action(name, raw, time.monotonic()))
+            accepted_at = time.monotonic()
+            self.note_body(raw, "commit", "interpreter", "script", "timeout")
+            self.reply(*runner.start_action(name, raw, accepted_at))
         else:
             self.no_query(query)
             runner.cancel_action(name)
@@ -347,6 +517,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if query.keys() - {"path"}:
             raise invalid("Unexpected query parameter")
         relative = query.get("path", "")
+        self.note("path", relative or ".")
         try:
             with self.server.runner.file_entry(
                 name, relative, cancel_read=self.abort_file_response
@@ -371,7 +542,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
             self.reply(200, {"commands": runner.list_commands()})
         else:
             raw = self.raw_body()
-            self.reply(*runner.start_command(raw, time.monotonic()))
+            accepted_at = time.monotonic()
+            self.note_body(raw, "mode", "timeout")
+            status, result = runner.start_command(raw, accepted_at)
+            self.note("id", result.get("id"))
+            if len(raw) > 16 * 1024:
+                self.note("mode", result.get("mode"))
+            self.reply(status, result)
 
     def command_task(self, method, name, query):
         runner = self.server.runner
@@ -434,6 +611,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 )
                 return
             file.seek(start)
+            if header is not None:
+                self.note("range", f"{start}-{stop - 1}")
             self.send_response(206 if header is not None else 200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(stop - start))
@@ -482,15 +661,24 @@ def main():
         sys.exit(
             "Set TOKEN in config.py to a non-placeholder ASCII token without spaces"
         )
+    with service_logging(LOG_FILE, token):
+        try:
+            serve(token)
+        except Exception:
+            LOG.exception("WinRunner stopped due to an error")
+            sys.exit(1)
+
+
+def serve(token: str) -> None:
     with HTTPServer((config.HOST, config.PORT), HTTPHandler) as server:
         server.token = token.encode("ascii")
         server.runner = Runner(config.DATA_DIR)
         host, port = cast(tuple[str, int], server.server_address)  # IPv4 listener
-        print(f"WinRunner listening on http://{host}:{port}", flush=True)
+        LOG.info("WinRunner listening on http://%s:%s", host, port)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
-            pass
+            LOG.info("WinRunner stopping")
         finally:
             server.runner.close()
 
