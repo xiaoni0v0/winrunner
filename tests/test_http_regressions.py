@@ -4,6 +4,8 @@ from contextlib import nullcontext
 import http.client
 import json
 import socket
+import struct
+import sys
 import tempfile
 import threading
 import unittest
@@ -95,6 +97,31 @@ class HTTPRegressionTests(unittest.TestCase):
         status, body, _ = self.request("GET", "/projects")
         self.assertEqual((status, body), (200, {"projects": []}))
         self.assertEqual(self.server.worker_count, 2)
+
+    def test_client_reset_before_request_or_headers_finish_is_quiet(self):
+        self.start_server(limit=1)
+        linger_format = "HH" if sys.platform == "win32" else "ii"
+        for fragment in (b"GET /pro", b"GET /projects HTTP/1.1\r\nHost: local"):
+            with self.subTest(fragment=fragment):
+                self.server.worker_started.clear()
+                self.server.worker_done.clear()
+                with patch.object(self.server, "handle_error") as unexpected:
+                    with socket.create_connection(
+                        ("127.0.0.1", self.port), timeout=3
+                    ) as conn:
+                        conn.setsockopt(
+                            socket.SOL_SOCKET,
+                            socket.SO_LINGER,
+                            struct.pack(linger_format, 1, 0),
+                        )
+                        self.assertTrue(self.server.worker_started.wait(3))
+                        conn.sendall(fragment)
+                        # Closing without a graceful shutdown sends TCP RST.
+                    self.assertTrue(self.server.worker_done.wait(3))
+                    unexpected.assert_not_called()
+        self.assertEqual(self.runner.mock_calls, [])
+        status, body, _ = self.request("GET", "/projects")
+        self.assertEqual((status, body), (200, {"projects": []}))
 
     def test_releases_connection_permit_when_thread_start_fails(self):
         self.start_server(limit=1)

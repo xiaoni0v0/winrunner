@@ -143,6 +143,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
         except TimeoutError as exc:
             self.log_error("Request timed out: %r", exc)
             self.close_connection = True
+        except ConnectionError:
+            # A client may reset the connection during parsing or while we
+            # send an error reply. There is no peer left to respond to.
+            self.close_connection = True
 
     def parse_request(self):
         if not super().parse_request():
