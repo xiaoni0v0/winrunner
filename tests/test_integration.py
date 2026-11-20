@@ -546,6 +546,28 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(self.call(200, "GET", project)["status"], "succeeded")
         self.assertEqual(self.call(200, "GET", file_url), b"new data")
 
+    def test_invalid_action_reports_locked_worktree_reset_in_post(self):
+        project = self.register()
+        endpoint = project + "/actions"
+        old_file = next(self.data.rglob("read me.txt"))
+        # A normal Windows Python file handle denies delete sharing.
+        with old_file.open("rb"):
+            response = self.call(400, "POST", endpoint, b"{")
+            self.assertEqual(response["error"]["code"], "invalid_request")
+            snapshot = response["action"]
+            self.assertEqual((snapshot["status"], snapshot["phase"]), ("failed", "reset"))
+            self.assertEqual(snapshot["output_source"], "runner")
+            self.assertEqual(snapshot["error"]["code"], "reset_blocked")
+            self.assertEqual(snapshot, self.call(200, "GET", endpoint))
+            self.assertTrue(old_file.is_file())
+            self.call(404, "GET", project + "/files?" + urlencode({"path": old_file.name}))
+
+        response = self.call(400, "POST", endpoint, b"{")
+        self.assertEqual(response["error"]["code"], "invalid_request")
+        self.assertNotIn("action", response)
+        self.assertEqual(self.call(200, "GET", endpoint)["phase"], "validate")
+        self.assertFalse(old_file.exists())
+
     def test_new_action_interrupts_an_existing_slow_download(self):
         project = self.register()
         worktree = next(self.data.rglob("read me.txt")).parent

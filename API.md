@@ -66,6 +66,7 @@
 
 - 每个 Project 只有一个槽位，没有 Action ID。正在准备、运行、取消中，或 Project 不可用时返回 `409`，不覆盖现有任务。
 - 已鉴权且 HTTP 层能接收的请求一旦占槽，旧日志和文件立即不再可读；重置工作树并清理旧文件后才准备新任务。JSON 或字段不合法也算一轮，返回 `400`；可通过 GET 查询失败阶段。若 Windows 文件占用导致未能清理，Action 在 `reset` 阶段失败，残留不会作为新产物提供。
+- 如果请求体非法，且工作线程在重置工作区时也失败，POST 仍返回 `400 invalid_request`，并附顶层 `action` 字段，含这次 Action 的状态快照（与 GET 相同，不附日志内容）。例如 `action.phase` 为 `reset`，`action.error.code` 为 `reset_blocked`。
 - 干净检出目标提交后，以仓库目录为工作目录运行。刷新并清理远端分支和标签引用，不 merge；不可达的缓存提交不能运行。找不到或匹配不唯一时不启动脚本，`error.code` 分别为 `commit_not_found`、`commit_ambiguous`。
 - `200` / `202`：`Task` 加字段 `commit`（解析后的完整 hash；尚未解析或解析失败为 `null`）。
 

@@ -230,7 +230,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 self.close_connection = True
             elif isinstance(exc, APIError):
-                self.reply(exc.status, {"error": exc.payload()})
+                self.reply(exc.status, exc.response_payload())
             elif isinstance(exc, ValueError):  # Includes BadPath.
                 self.reply(400, {"error": {"code": "invalid_request", "message": str(exc)}})
             elif isinstance(exc, (FileNotFoundError, NotADirectoryError)):

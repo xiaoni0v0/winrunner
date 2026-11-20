@@ -29,13 +29,20 @@ LOG = logging.getLogger(__name__)
 
 
 class APIError(Exception):
-    def __init__(self, status, code, message):
+    def __init__(self, status, code, message, *, action=None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.action = action
 
     def payload(self):
         return {"code": self.code, "message": str(self)}
+
+    def response_payload(self):
+        response = {"error": self.payload()}
+        if self.action is not None:
+            response["action"] = self.action
+        return response
 
 
 def invalid(message):
@@ -561,6 +568,10 @@ class Runner:
             raise worker_error from exc
         if error is not None:
             task.done.wait()
+            action = task.snapshot()
+            if action["phase"] == "reset" and action["error"] is not None:
+                # Report both failures without making the client race the next Action via GET.
+                raise APIError(error.status, error.code, str(error), action=action) from error
             raise error
         return task.response(values[-1], accepted_at)
 
