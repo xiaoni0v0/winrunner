@@ -1,0 +1,4 @@
+- insert:
+    - id: winrunner-client
+      name: '@local/dsh-winrunner-client'
+      config: {}

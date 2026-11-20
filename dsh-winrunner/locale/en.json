@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WinRunner client",
+    "description": "Manage WinRunner projects and artifacts, run Git-backed actions and Windows commands, and read incremental logs. Set the runner URL and token in ~/.winrunner/client.json. Enable only in trusted Harness profiles."
+  }
+}

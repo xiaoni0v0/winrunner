@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WinRunner 客户端",
+    "description": "管理 WinRunner 项目和文件、运行 Git Action 与 Windows 命令、分页读取日志。在 ~/.winrunner/client.json 配置服务地址和令牌；仅在可信的 Harness 配置中启用。"
+  }
+}
