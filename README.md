@@ -4,10 +4,21 @@
 
 ## 运行方式
 
-- 服务端用 Python 标准库，不依赖第三方 Python 包。镜像预装 Python、Git for Windows，以及任务需要的 Node.js 等解释器。
+- 支持 Windows 10 / Windows Server 2016 或更新版本。镜像预装 Python 3.10+、Git for Windows，以及任务需要的 Node.js 等解释器；Runner 不依赖第三方 Python 包。
 - 在 `config.py` 配置监听地址、专用数据目录和 Action 解释器白名单；首版提供 `python`、`python3` 和 `node`。令牌通过环境变量 `RUNNER_TOKEN` 提供，不进镜像或日志。
 - 客户端拿到实例公网 IP 后用 HTTP 直连。**云安全组只放行调用端的出口 IP**，所有 API 均要求 `Authorization: Bearer <token>`。HTTP 不防窃听或篡改；任务以 Runner 账号权限运行，不做沙箱，只接收可信调用方和脚本。
 - 数据目录由 Runner 独占。**每次启动都清理其中的旧项目和缓存，不自动恢复。** 镜像用来复用工具和配置，不用来续接任务。
+
+从项目目录在 PowerShell 启动：
+
+```powershell
+$env:RUNNER_TOKEN = python -c "import secrets; print(secrets.token_hex(32))"
+$env:RUNNER_HOST = '0.0.0.0'  # 仅在安全组已限制来源 IP 时启用公网入口
+$env:RUNNER_PORT = '8080'
+python -m winrunner
+```
+
+未指定监听地址时只监听 `127.0.0.1:8080`；可用 `RUNNER_DATA_DIR` 改用本机磁盘上的其他专用目录。Windows 上可用 `python -m unittest discover -s tests -v` 运行集成测试。
 
 ## 任务和结果
 
