@@ -77,6 +77,62 @@ test('registers just three tools; config is required, reread every request and n
   assert.equal(client.tools.size, 0)
 })
 
+test('health preserves all CPU windows, including zero and missing samples', async t => {
+  const client = await fixture(t)
+  const cpu = { logical_cores: 128, usage_percent: 0.57, usage_5s_percent: 0, usage_60s_percent: null }
+  await client.configure(await server(t, (_req, res) => json(res, { cpu })))
+  assert.deepEqual((await client.run('project', { op: 'health', params_json: '{}' })).cpu, cpu)
+  const schema = client.tools.get('winrunner_project').output.schema.properties.cpu.properties
+  for (const key of ['usage_percent', 'usage_5s_percent', 'usage_60s_percent']) {
+    assert.match(schema[key].description, /百分比，或 null/)
+  }
+})
+
+test('two-field tool schema works with strict transport and returns directly replayable hints', async t => {
+  const client = await fixture(t)
+  const seen = []
+  const base = await server(t, (req, res, body) => {
+    seen.push([req.method, req.url, body.length ? JSON.parse(body) : null])
+    if (req.method === 'POST' && req.url === '/commands') {
+      return json(res, { id: '0', status: 'running' }, 202)
+    }
+    if (req.url.startsWith('/commands/0?')) {
+      return json(res, { id: '0', status: 'succeeded', stdout_bytes: 2, stderr_bytes: 0,
+        stdout: { data_base64: 'eA==', next_offset: 1 }, stderr: { data_base64: '', next_offset: 0 } })
+    }
+    json(res, {})
+  })
+  await client.configure(base)
+  for (const tool of client.tools.values()) {
+    assert.deepEqual(Object.keys(tool.parameters.properties), ['op', 'params_json'])
+    assert.equal(tool.parameters.properties.params_json.type, 'string')
+  }
+  assert.equal((await client.run('project', { op: 'health', params_json: '' })).outcome, 'succeeded')
+  assert.equal((await client.run('command', { op: 'list', params_json: '{}' })).outcome, 'succeeded')
+  for (const raw of [
+    { op: 'health', params_json: '{' },
+    { op: 'health', params_json: 'null' },
+    { op: 'health', params_json: '[]' },
+    { op: 'health', params_json: '{"op":"delete"}' },
+    { op: 'health', params_json: '{"name":"demo"}' },
+    { op: 'health', params_json: '{}', name: 'demo' },
+    { op: 'delete', params_json: '' },
+  ]) assert.equal((await client.run('project', raw)).error.code, 'invalid_input')
+  const command = "Write-Output '中文'\nWrite-Output 'C:\\temp'"
+  const start = await client.run('command', { op: 'start', params_json: JSON.stringify({ mode: 'ps', command }) })
+  assert.deepEqual(start.next_wait, { op: 'wait', params_json: '{"id":"0"}' })
+  const done = await client.run('command', start.next_wait)
+  assert.equal(done.outcome, 'succeeded')
+  assert.deepEqual(done.next_get, { op: 'get', params_json: '{"id":"0","stdout_offset":1}' })
+  await client.run('command', done.next_get)
+  assert.deepEqual(seen, [
+    ['GET', '/health', null], ['GET', '/commands', null],
+    ['POST', '/commands', { mode: 'ps', command, timeout: 0 }],
+    ['GET', '/commands/0?stdout_offset=0&stderr_offset=0&limit=2048', null],
+    ['GET', '/commands/0?stdout_offset=1&limit=4096', null],
+  ])
+})
+
 test('maps project, action and command endpoints, preserves task and HTTP error details', async t => {
   const client = await fixture(t)
   const seen = []
@@ -160,11 +216,11 @@ test('previews both logs, distinguishes live end from completion, and supports s
   })
   await client.configure(base)
   const args = { op: 'get', id: 'id1' }
-  const preview = await client.run('command', { ...args, limit: 3 })
+  const preview = await client.run('command', { ...args, limit: 4 })
   assert.equal(preview.outcome, 'pending')
-  assert.deepEqual(preview.stdout, { text: 'abc', next_offset: 3, remaining: 'available' })
+  assert.deepEqual(preview.stdout, { text: 'abcd', next_offset: 4, remaining: 'available' })
   assert.deepEqual(preview.stderr, { text: '', next_offset: 0, remaining: 'caught_up' })
-  assert.deepEqual(preview.next_get, { op: 'get', id: 'id1', stdout_offset: 3, stderr_offset: 0, limit: 3 })
+  assert.deepEqual(preview.next_get, { op: 'get', id: 'id1', stdout_offset: 4, stderr_offset: 0, limit: 4 })
   assert(!Object.hasOwn(preview, 'next_wait'))
   const only = await client.run('command', { ...args, status_only: true })
   assert.equal(only.outcome, 'pending')
@@ -173,9 +229,9 @@ test('previews both logs, distinguishes live end from completion, and supports s
   status = 'cancelled'
   const tail = await client.run('command', { ...args, stdout_offset: preview.stdout.next_offset, encoding: 'base64' })
   assert.equal(tail.outcome, 'cancelled')
-  assert.deepEqual(tail.stdout, { data_base64: 'ZGVmZ2g=', next_offset: 8, remaining: 'complete' })
+  assert.deepEqual(tail.stdout, { data_base64: 'ZWZnaA==', next_offset: 8, remaining: 'complete' })
   assert(!Object.hasOwn(tail, 'stderr'))
-  assert.deepEqual(queries, [{ stdout_offset: '0', stderr_offset: '0', limit: '3' }, {}, { stdout_offset: '3', limit: '4096' }])
+  assert.deepEqual(queries, [{ stdout_offset: '0', stderr_offset: '0', limit: '4' }, {}, { stdout_offset: '4', limit: '4096' }])
 })
 
 test('start returns terminal logs and never replaces its result with a failed or mismatched follow-up', async t => {
@@ -234,7 +290,7 @@ test('wait polls only with GET and stops on completion or its own deadline', asy
   const expired = await client.run('command', { ...args, wait_seconds: 1 })
   assert.equal(expired.outcome, 'pending')
   assert.equal(expired.wait_expired, true)
-  assert.deepEqual(expired.next_wait, { op: 'wait', id: '0', wait_seconds: 1, stdout_offset: 1, stderr_offset: 0 })
+  assert.deepEqual(expired.next_wait, { op: 'wait', id: '0', stdout_offset: 1, stderr_offset: 0 })
   assert.equal((await client.run('command', { ...args, wait_seconds: 0 })).error.code, 'invalid_input')
   assert(methods.length >= 3 && methods.every(method => method === 'GET'))
 })
@@ -244,11 +300,11 @@ test('wait bounds an unresponsive request and can be cancelled without mutating 
   const methods = []
   const base = await server(t, (req, _res) => { methods.push(req.method) })
   await client.configure(base)
-  const args = { op: 'wait', id: '0', wait_seconds: 1 }
+  const args = { op: 'wait', params_json: '{"id":"0","wait_seconds":1}' }
   const expired = await client.run('command', args)
   assert.equal(expired.error.code, 'wait_expired')
-  assert.deepEqual(expired.next_wait, args)
-  const cancelled = await client.run('command', { ...args, wait_seconds: 2 }, AbortSignal.timeout(100))
+  assert.deepEqual(expired.next_wait, { op: 'wait', params_json: '{"id":"0"}' })
+  const cancelled = await client.run('command', expired.next_wait, AbortSignal.timeout(100))
   assert.equal(cancelled.error.code, 'cancelled')
   assert(!Object.hasOwn(cancelled, 'next_wait'))
   assert(methods.length >= 1 && methods.every(method => method === 'GET'))
@@ -285,27 +341,30 @@ test('uses a UTF-8 character boundary as the next log offset', async t => {
   const last = (await client.run('command', { ...args, stdout_offset: first.next_offset })).stdout
   assert.equal(first.text + last.text, bytes.toString())
   assert.equal(last.remaining, 'complete')
-  const tiny = (await client.run('command', { ...args, stdout_offset: first.next_offset, limit: 1 })).stdout
+  assert.equal((await client.run('command', { ...args, limit: 1 })).error.code, 'invalid_input')
+  const tiny = (await client.run('command', { ...args, stdout_offset: first.next_offset, limit: 1, encoding: 'base64' })).stdout
   assert.equal(tiny.next_offset, first.next_offset + 1)
 })
 
 test('handles empty files, bounded byte ranges, and small directory pages', async t => {
   const client = await fixture(t)
   const bytes = Buffer.from([0, 1, 2, 3, 0x80, 0xa0, 0xff])
+  const chinese = Buffer.from('abc中文!')
   const entries = Array.from({ length: 101 }, (_, i) => ({ name: `${i}.txt`, type: 'file', size_bytes: 3 }))
   const base = await server(t, (req, res) => {
     const path = new URL(req.url, 'http://localhost').searchParams.get('path')
+    const content = path === 'utf8' ? chinese : bytes
     if (!path) { json(res, { path: '', entries }); return }
     if (path === 'empty') { res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': 0 }); res.end(); return }
     const match = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range ?? '')
     if (match) {
       const start = Number(match[1])
-      const end = Math.min(bytes.length - 1, Number(match[2]))
-      const block = bytes.subarray(start, end + 1)
-      res.writeHead(206, { 'content-type': 'application/octet-stream', 'content-length': block.length, 'content-range': `bytes ${start}-${end}/${bytes.length}` })
+      const end = Math.min(content.length - 1, Number(match[2]))
+      const block = content.subarray(start, end + 1)
+      res.writeHead(206, { 'content-type': 'application/octet-stream', 'content-length': block.length, 'content-range': `bytes ${start}-${end}/${content.length}` })
       res.end(block)
     } else {
-      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': bytes.length }); res.end(bytes)
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': content.length }); res.end(content)
     }
   })
   await client.configure(base)
@@ -313,7 +372,15 @@ test('handles empty files, bounded byte ranges, and small directory pages', asyn
   const root = await client.run('project', args)
   assert.equal(root.entries.length, 100)
   assert.equal(root.next_entry_offset, 100)
-  assert.equal((await client.run('project', { ...args, entry_offset: 100 })).entries[0].name, '100.txt')
+  assert.equal((await client.run('project', root.next_get)).entries[0].name, '100.txt')
+  const u = await client.run('project', { op: 'files', params_json: '{"name":"demo","path":"utf8","length":4}' })
+  assert.equal(u.text, 'abc')
+  assert.equal(u.next_offset, 3)
+  assert.deepEqual(u.next_get, { op: 'files', params_json: '{"name":"demo","path":"utf8","length":4,"offset":3}' })
+  const v = await client.run('project', u.next_get)
+  const w = await client.run('project', v.next_get)
+  assert.equal(u.text + v.text + w.text, chinese.toString())
+  assert.equal(w.next_get, undefined)
   const empty = await client.run('project', { ...args, path: 'empty' })
   assert.equal(empty.size_bytes, 0)
   assert.equal(empty.text, '')
@@ -325,6 +392,59 @@ test('handles empty files, bounded byte ranges, and small directory pages', asyn
   assert.equal(second.http_status, 206)
   assert.equal(second.next_offset, null)
   assert.deepEqual(Buffer.concat([Buffer.from(first.data_base64, 'base64'), Buffer.from(second.data_base64, 'base64')]), bytes)
+})
+
+test('uses server directory cursors and falls back to plain reads only for an auto-detected file', async t => {
+  const client = await fixture(t)
+  const queries = []
+  const base = await server(t, (req, res) => {
+    const q = Object.fromEntries(new URL(req.url, 'http://localhost').searchParams)
+    queries.push(q)
+    if (q.path === 'file.txt') {
+      if (q.entry_limit) return json(res, { error: { code: 'invalid_request', message: 'entry_offset and entry_limit are only for directories' } }, 400)
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': 1 }); res.end('x'); return
+    }
+    json(res, { path: '', entries: [{ name: q.entry_offset }], next_entry_offset: q.entry_offset === '0' ? 1 : null })
+  })
+  await client.configure(base)
+  const first = await client.run('project', { op: 'files', params_json: '{"name":"demo","entry_limit":2}' })
+  assert.deepEqual(first.next_get, { op: 'files', params_json: '{"name":"demo","entry_limit":2,"entry_offset":1}' })
+  const last = await client.run('project', first.next_get)
+  assert.equal(last.entries[0].name, '1')
+  assert.equal(last.next_get, undefined)
+  assert.equal((await client.run('project', { op: 'files', name: 'demo', path: 'file.txt' })).text, 'x')
+  assert.equal((await client.run('project', { op: 'files', name: 'demo', path: 'file.txt', entry_limit: 1 })).http_status, 400)
+  assert.equal((await client.run('project', { op: 'files', name: 'demo', entry_limit: 1, length: 9 })).error.code, 'invalid_input')
+  assert.equal((await client.run('project', { op: 'files', name: 'demo', length: 2 })).error.code, 'invalid_input')
+  assert.deepEqual(queries, [{ entry_offset: '0', entry_limit: '2' }, { entry_offset: '1', entry_limit: '2' },
+    { path: 'file.txt', entry_offset: '0', entry_limit: '100' }, { path: 'file.txt' },
+    { path: 'file.txt', entry_offset: '0', entry_limit: '1' }])
+})
+
+test('passes explicit idempotency keys without automatic retry or merging snapshot logs', async t => {
+  const client = await fixture(t)
+  const seen = []
+  const base = await server(t, (req, res, bytes) => {
+    seen.push([req.method, req.url, req.headers['idempotency-key'], JSON.parse(bytes)])
+    if (req.headers['idempotency-key'] === 'lost') { req.socket.destroy(); return }
+    json(res, { id: '0', status: 'succeeded', stdout_bytes: 4 })
+  })
+  await client.configure(base)
+  const args = { op: 'start', mode: 'ps', command: 'echo ok', wait_seconds: 5, idempotency_key: 'abc-._~' }
+  const first = await client.run('command', args)
+  assert.equal(first.idempotency_key, args.idempotency_key)
+  assert.deepEqual(first.next_get, { op: 'get', id: '0' })
+  assert.equal(first.stdout, undefined)
+  const lost = await client.run('command', { ...args, idempotency_key: 'lost' })
+  assert.equal(lost.outcome, 'unknown')
+  assert.equal(lost.idempotency_key, 'lost')
+  assert.equal((await client.run('command', { ...args, idempotency_key: 'x\n' })).error.code, 'invalid_input')
+  assert.equal((await client.run('action', { op: 'start', name: 'demo', commit: 'abc', interpreter: 'python', script: 'no.py', idempotency_key: 'action' })).outcome, 'succeeded')
+  assert.deepEqual(seen, [
+    ['POST', '/commands', 'abc-._~', { mode: 'ps', command: 'echo ok', timeout: 5 }],
+    ['POST', '/commands', 'lost', { mode: 'ps', command: 'echo ok', timeout: 5 }],
+    ['POST', '/projects/demo/actions', 'action', { commit: 'abc', interpreter: 'python', script: 'no.py', args: [], timeout: 0 }],
+  ])
 })
 
 test('never follows redirects or retries mutations, and respects an already cancelled run', async t => {

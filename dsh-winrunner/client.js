@@ -129,9 +129,10 @@ async function fileResult(response, file) {
   }
   const bytes = await readBody(response, bytesToRead, bytesToRead < contentLength)
   if (bytes.length !== bytesToRead) throw new ClientError('incomplete_response', 'WinRunner 文件响应未完整送达。')
-  const next = file.offset + bytes.length
+  const page = file.encoding === 'utf8' && file.offset + bytes.length < total ? utf8Page(bytes) : bytes
+  const next = file.offset + page.length
   return { kind: 'file', offset: file.offset, size_bytes: total, next_offset: next < total ? next : null,
-    encoding: file.encoding, ...encoded(bytes, file.encoding) }
+    encoding: file.encoding, ...encoded(page, file.encoding) }
 }
 
 function responseJson(bytes) {
@@ -154,8 +155,16 @@ function utf8Page(bytes) {
 
 function projectResponse(body, spec) {
   if (spec.file && Array.isArray(body.entries)) {
-    const offset = spec.file.entryOffset
-    const entries = body.entries.slice(offset, offset + limits.entries)
+    const { entryOffset: offset, entryLimit } = spec.file
+    if (Object.hasOwn(body, 'next_entry_offset')) {
+      const next = body.next_entry_offset
+      if (body.entries.length > entryLimit || (next !== null &&
+          (!Number.isSafeInteger(next) || !body.entries.length || next !== offset + body.entries.length))) {
+        throw new ClientError('invalid_response', 'WinRunner 返回的目录游标与本页不一致。')
+      }
+      return { ...body, kind: 'directory' }
+    }
+    const entries = body.entries.slice(offset, offset + entryLimit)
     return { kind: 'directory', path: body.path, entries, total_entries: body.entries.length,
       next_entry_offset: offset + entries.length < body.entries.length ? offset + entries.length : null }
   }
@@ -190,6 +199,7 @@ export async function requestRunner(spec, signal, call = {}) {
   const active = signal ? AbortSignal.any([stop, signal]) : stop
   const url = new URL(spec.path, origin)
   const headers = { Authorization: `Bearer ${token}`, 'Accept-Encoding': 'identity', Connection: 'close' }
+  if (spec.idempotencyKey !== undefined) headers['Idempotency-Key'] = spec.idempotencyKey
   const data = spec.body === undefined ? undefined : Buffer.from(JSON.stringify(spec.body), 'utf8')
   if (data) {
     if (data.length > INPUT_LIMIT) throw new ClientError('invalid_input', '请求体超过 WinRunner 的 1 MiB 上限。')

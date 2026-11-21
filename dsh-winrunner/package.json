@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-winrunner-client",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DeepSeek Harness client tools for WinRunner",
   "private": true,
   "type": "module",

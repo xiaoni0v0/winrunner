@@ -8,56 +8,39 @@ const projectName = /^[a-z\d][a-z\d_-]{0,63}$/i
 const commandId = /^[a-z\d_-]{1,128}$/i
 const hex = /^[a-f\d]{1,64}$/i
 const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
-const string = description => ({ type: 'string', description })
-const integer = description => ({ type: 'integer', description })
 const choice = (description, choices) => ({ type: 'string', description, enum: choices })
-const name = string('项目注册名。')
-const id = string('start 返回的命令 ID。')
-const wait = { type: 'number', description: 'start：等待 0–60 秒，默认 0；wait：等待 1–60 秒，默认 15。结束就返回，等满也不会停止任务。' }
-const taskQuery = {
-  status_only: { type: 'boolean', description: 'start、get、wait：只返回任务状态，不请求日志。默认 false。' },
-  stdout_offset: integer('get、wait：用 stdout.next_offset 续读。两个偏移都省略则预览两路；只传一路则只读那一路。'),
-  stderr_offset: integer('get、wait：用 stderr.next_offset 续读；只传这一路就只读 stderr。'),
-  limit: integer(`get、wait：每路最多读取的字节数；默认预览 2048，指定偏移默认 4096，上限 ${limits.log}。`),
-  encoding: choice('get、wait：默认 utf8；需要无损时用 base64。', encodings),
+const taskFlow = '长任务前用 winrunner_project 的 health 查一次。看 outcome 判定结果；有 next_wait 或 next_get 就原样传回同一工具。pending 或 unknown 时先查询，别重复 start。'
+const taskOptions = `start/wait 可传 wait_seconds（start 默认 0，短任务可设 5；wait 默认 15，至少 1；都至多 60）。到点不停止任务，wait 不会重提；next_wait 用默认等待时长。UTF-8 日志每页至少 4 字节。start/get/wait 可传 status_only:true 不读日志；否则 get/wait 默认预览双路，也可传 stdout_offset、stderr_offset（只传一路就只读该路）、limit（每路字节上限 ${limits.log}）和 encoding（utf8/base64）。`
+const startKeyHelp = 'start 可传 idempotency_key（1–128 个字母、数字或 ._~-）；新提交用新键，只有确认同一 Runner 进程后，才可用原键和原参数（包括 wait_seconds）恢复断线提交。重放仅返回原提交快照，当前状态用 get 查询。'
+const taskLogKeys = ['status_only', 'stdout_offset', 'stderr_offset', 'limit', 'encoding']
+const exampleCall = (op, params = {}) => JSON.stringify({ op, params_json: JSON.stringify(params) })
+// DSH's output schema dialect cannot express a number/null type union.
+const cpuMetric = description => ({ description: `${description} 数字百分比，或 null。` })
+const cpuOutput = {
+  type: 'object',
+  description: 'health 返回的整机 CPU 指标，百分比为 0–100；缺少有效采样时为 null。',
+  properties: {
+    logical_cores: { type: 'integer', description: '逻辑核数。' },
+    usage_percent: cpuMetric('瞬时 CPU 使用率：最近约 1 秒的样本。'),
+    usage_5s_percent: cpuMetric('最近 5 秒的时间加权平均 CPU 使用率。'),
+    usage_60s_percent: cpuMetric('最近 60 秒的时间加权平均 CPU 使用率。'),
+  },
 }
 const groups = {
   project: {
-    description: '管理 WinRunner 项目、读取项目目录或文件、查询主机健康。delete 会停止项目并删除其文件和缓存。',
+    description: '管理 WinRunner 项目、读取目录或文件。health 的 cpu.usage_percent / usage_5s_percent / usage_60s_percent 分别是瞬时（约 1 秒）、5 秒和 60 秒整机 CPU 使用率（0–100；无样本为 null）。delete 会停止项目并删除其文件和缓存。',
     ops: ['health', 'list', 'get', 'create', 'delete', 'files'],
-    properties: {
-      name: string('get、create、delete、files 必填：项目注册名。'),
-      repo_url: string('create 必填：无凭据、查询或片段的 HTTPS Git 最终地址。'),
-      path: string('files：项目内相对路径；省略列根目录。'),
-      offset: integer('files 读文件的字节偏移；用上次 next_offset 继续。'),
-      length: integer(`files 每页文件字节数，默认 4096，上限 ${limits.file}。`),
-      entry_offset: integer('files 列目录的条目偏移；用上次 next_entry_offset 继续。'),
-      encoding: choice('files 文件编码，默认 utf8；二进制或无损读取用 base64。', encodings),
-    },
+    params: `health/list：传空字符串或 "{}"，如 ${exampleCall('health')}。get/delete/files：{"name":"demo"}。create：{"name":"demo","repo_url":"https://gitee.com/owner/repo.git"}（无凭据、查询或片段的公开 HTTPS Git 地址）。files 有 next_get 就原样续页；可传 path（相对路径，省略列根目录）、offset（文件字节偏移）、length（默认 4096，最大 ${limits.file}）、entry_offset / entry_limit（服务端目录分页，默认 100，最多 1000）、encoding（utf8/base64；UTF-8 每页至少 4 字节，无损用 base64）。`,
   },
   action: {
-    description: '提交、轮询或取消 WinRunner 项目的 Git Action。长任务前用 winrunner_project 的 health 查一次。start 覆盖上轮工作区和日志，忙时返回 409；pending 时用 wait，不要重复 start。',
+    description: `提交、查询或取消项目的 Git Action。start 覆盖上轮工作区和日志；忙时返回 409。先取完旧日志和产物再提交下一轮。${taskFlow}`,
     ops: ['start', 'get', 'wait', 'cancel'],
-    properties: {
-      name,
-      commit: string('start 必填：远端可达的十六进制提交哈希或唯一前缀；优先传完整哈希。不接受分支或标签名。'),
-      interpreter: string('start 必填：服务器解释器白名单中的别名，如 python 或 node。'),
-      script: string('start 必填：检出目录内的脚本相对路径。'),
-      args: { type: 'array', items: { type: 'string' }, description: 'start 可选：逐项传给脚本，不拼成 shell 命令，也不用给参数额外加引号。' },
-      wait_seconds: wait,
-      ...taskQuery,
-    },
+    params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。${taskOptions}${startKeyHelp}`,
   },
   command: {
-    description: '提交、列出、轮询或删除 WinRunner 临时 Windows 命令。长任务前用 winrunner_project 的 health 查一次。pending 时按 id 等待；delete 终止并丢弃记录和日志。',
+    description: `提交、列出、查询或删除临时 Windows 命令。delete 终止命令并丢弃记录和日志。${taskFlow}`,
     ops: ['start', 'get', 'wait', 'list', 'delete'],
-    properties: {
-      id,
-      mode: choice('start 必填：优先用 ps（PowerShell）；仅在需要 CMD 语法时用 cmd。', modes),
-      command: string('start 必填：直接给命令原文，不用再套一对引号或自行 Base64；ps 支持多行，cmd 仍遵守自身的引号和变量展开规则。'),
-      wait_seconds: wait,
-      ...taskQuery,
-    },
+    params: `list：空字符串或 {}。start：{"mode":"ps","command":"Write-Output 'hello'","wait_seconds":5}。优先 ps，需 CMD 语法用 cmd；命令不加 shell 包裹、不做 Base64，在 JSON 字符串中正常转义。完整多行调用：${exampleCall('start', { mode: 'ps', command: "Write-Output '第一行'\nWrite-Output '第二行'" })}。get/wait/delete：{"id":"0"}，用 start 返回的 ID。${taskOptions}${startKeyHelp}`,
   },
 }
 
@@ -103,6 +86,21 @@ function validateStatusOnly(args) {
   if (args.status_only !== undefined && typeof args.status_only !== 'boolean') invalid('status_only 必须是布尔值。')
 }
 
+function pageBytes(value, key, fallback, max, encoding) {
+  if (encoding === 'utf8' && Number.isSafeInteger(value) && value >= 1 && value < 4) {
+    invalid(`${key} 使用 UTF-8 时至少为 4 字节；更小的逐字节读取请用 base64。`)
+  }
+  return nonnegative(value === undefined ? fallback : value, key, encoding === 'utf8' ? 4 : 1, max)
+}
+
+function startOptions(args, timeout) {
+  const key = args.idempotency_key
+  if (key !== undefined && (typeof key !== 'string' || key.length < 1 || key.length > 128 || /[^A-Za-z0-9._~-]/.test(key))) {
+    invalid('idempotency_key 必须是 1–128 个字母、数字或 ._~-。')
+  }
+  return { idempotencyKey: key, deadline: (timeout + 20) * 1000 }
+}
+
 function getTask(path, args) {
   validateStatusOnly(args)
   if (args.status_only) {
@@ -120,8 +118,8 @@ function getTask(path, args) {
     params.set('stdout_offset', 0)
     params.set('stderr_offset', 0)
   }
-  params.set('limit', nonnegative(args.limit === undefined ? defaultLimit : args.limit, 'limit', 1, limits.log))
   const logEncoding = enumValue(args.encoding === undefined ? 'utf8' : args.encoding, 'encoding', encodings)
+  params.set('limit', pageBytes(args.limit, 'limit', defaultLimit, limits.log, logEncoding))
   return request('GET', queryPath(path, params), { logEncoding })
 }
 
@@ -147,15 +145,25 @@ function forProject(args) {
     return request('POST', '/projects', { body: { name: args.name, repo_url: repoUrl }, deadline: 120000 })
   }
   if (op === 'files') {
-    select(args, ['name', 'path', 'offset', 'length', 'entry_offset', 'encoding'])
+    select(args, ['name', 'path', 'offset', 'length', 'entry_offset', 'entry_limit', 'encoding'])
+    const explicitDir = args.entry_offset !== undefined || args.entry_limit !== undefined
+    const explicitFile = ['offset', 'length', 'encoding'].some(key => args[key] !== undefined)
+    if (explicitDir && explicitFile) invalid('目录分页参数不能和文件字节分页参数混用。')
     const relative = args.path === undefined ? '' : text(args.path, 'path', true)
     const params = new URLSearchParams()
     if (relative) params.set('path', relative)
     const offset = nonnegative(args.offset === undefined ? 0 : args.offset, 'offset', 0, Number.MAX_SAFE_INTEGER - limits.file)
-    const length = nonnegative(args.length === undefined ? 4096 : args.length, 'length', 1, limits.file)
-    const entryOffset = nonnegative(args.entry_offset === undefined ? 0 : args.entry_offset, 'entry_offset', 0, Number.MAX_SAFE_INTEGER - limits.entries)
     const encoding = enumValue(args.encoding === undefined ? 'utf8' : args.encoding, 'encoding', encodings)
-    return request('GET', queryPath(`${path}/files`, params), { file: { offset, length, entryOffset, encoding } })
+    const length = pageBytes(args.length, 'length', 4096, limits.file, encoding)
+    const entryLimit = nonnegative(args.entry_limit === undefined ? limits.entries : args.entry_limit, 'entry_limit', 1, 1000)
+    const entryOffset = nonnegative(args.entry_offset === undefined ? 0 : args.entry_offset, 'entry_offset', 0, Number.MAX_SAFE_INTEGER - entryLimit)
+    const file = { offset, length, entryOffset, entryLimit, encoding }
+    const plain = request('GET', queryPath(`${path}/files`, params), { file })
+    if (explicitFile) return plain
+    params.set('entry_offset', entryOffset)
+    params.set('entry_limit', entryLimit)
+    return { ...plain, path: queryPath(`${path}/files`, params),
+      ...(!explicitDir && relative && relative !== '.' ? { fileFallback: plain } : {}) }
   }
   select(args, ['name'])
   return op === 'delete' ? request('DELETE', path, { deadline: 30000 }) : request('GET', path)
@@ -164,7 +172,7 @@ function forProject(args) {
 function forAction(args) {
   const path = `${projectPath(args.name)}/actions`
   if (args.op === 'start') {
-    select(args, ['name', 'commit', 'interpreter', 'script', 'args', 'wait_seconds', 'status_only'])
+    select(args, ['name', 'commit', 'interpreter', 'script', 'args', 'wait_seconds', 'status_only', 'idempotency_key'])
     validateStatusOnly(args)
     const commit = match(args.commit, hex, 'commit')
     const interpreter = text(args.interpreter, 'interpreter')
@@ -172,10 +180,10 @@ function forAction(args) {
     const argv = args.args === undefined ? [] : args.args
     if (!Array.isArray(argv) || !argv.every(clean)) invalid('args 必须是字符串数组。')
     const timeout = waitSeconds(args)
-    return request('POST', path, { body: { commit, interpreter, script, args: argv, timeout }, deadline: (timeout + 20) * 1000 })
+    return request('POST', path, { body: { commit, interpreter, script, args: argv, timeout }, ...startOptions(args, timeout) })
   }
   if (args.op === 'get' || args.op === 'wait') {
-    select(args, ['name', ...Object.keys(taskQuery), ...(args.op === 'wait' ? ['wait_seconds'] : [])])
+    select(args, ['name', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
     return getTask(path, args)
   }
   select(args, ['name'])
@@ -188,16 +196,16 @@ function forCommand(args) {
     return request('GET', '/commands')
   }
   if (args.op === 'start') {
-    select(args, ['mode', 'command', 'wait_seconds', 'status_only'])
+    select(args, ['mode', 'command', 'wait_seconds', 'status_only', 'idempotency_key'])
     validateStatusOnly(args)
     const mode = enumValue(args.mode, 'mode', modes)
     const command = text(args.command, 'command')
     const timeout = waitSeconds(args)
-    return request('POST', '/commands', { body: { mode, command, timeout }, deadline: (timeout + 20) * 1000 })
+    return request('POST', '/commands', { body: { mode, command, timeout }, ...startOptions(args, timeout) })
   }
   const path = `/commands/${encodeURIComponent(match(args.id, commandId, 'id'))}`
   if (args.op === 'get' || args.op === 'wait') {
-    select(args, ['id', ...Object.keys(taskQuery), ...(args.op === 'wait' ? ['wait_seconds'] : [])])
+    select(args, ['id', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
     return getTask(path, args)
   }
   select(args, ['id'])
@@ -239,7 +247,6 @@ function taskHints(args, body, target, outcome) {
     body.next_get = { op: 'get', ...target, ...pagination }
   } else if (outcome === 'pending') {
     body.next_wait = { op: 'wait', ...target, ...pagination }
-    if (args.op === 'wait' && args.wait_seconds !== undefined) body.next_wait.wait_seconds = args.wait_seconds
   }
 }
 
@@ -305,6 +312,11 @@ function errorDetails(error) {
 
 function toolResult(group, args, response) {
   const { ok, outcome: _serverOutcome, ...body } = response
+  if (args.op === 'start' && args.idempotency_key !== undefined) {
+    body.idempotency_key = args.idempotency_key
+    if (ok) body.note = '这是首次提交的状态快照（重放也一样）；查询当前状态或日志请用 get。'
+    if (body.error?.code === 'idempotency_pending') body.note = '同键的首次提交尚未返回；仅在同一 Runner 进程中稍后用原参数重试。'
+  }
   if (!ok) {
     if (group === 'action' && args.op === 'start' && (body.action ||
         ['invalid_request', 'worker_unavailable', 'worker_unavailable_reset_incomplete'].includes(body.error?.code))) {
@@ -313,33 +325,80 @@ function toolResult(group, args, response) {
     }
     return { outcome: 'request_error', ...body }
   }
-  if (group === 'project' || !['start', 'get', 'wait'].includes(args.op)) return { outcome: 'succeeded', ...body }
+  if (group === 'project') {
+    if (args.op === 'files') {
+      const { offset, entry_offset, entry_limit, ...params } = args
+      if (body.kind === 'file' && Number.isSafeInteger(body.next_offset)) {
+        body.next_get = { ...params, offset: body.next_offset }
+      } else if (body.kind === 'directory' && Number.isSafeInteger(body.next_entry_offset)) {
+        body.next_get = { op: args.op, name: args.name, ...(args.path === undefined ? {} : { path: args.path }),
+          ...(entry_limit === undefined ? {} : { entry_limit }), entry_offset: body.next_entry_offset }
+      }
+    }
+    return { outcome: 'succeeded', ...body }
+  }
+  if (!['start', 'get', 'wait'].includes(args.op)) return { outcome: 'succeeded', ...body }
 
   const outcome = terminal.has(body.status) ? body.status : active.has(body.status) ? 'pending' : 'unknown'
-  taskHints(args, body, taskTarget(group, args, body), outcome)
+  const target = taskTarget(group, args, body)
+  taskHints(args, body, target, outcome)
+  if (args.op === 'start' && args.idempotency_key !== undefined && target && terminal.has(body.status) &&
+      !args.status_only && (body.stdout_bytes > 0 || body.stderr_bytes > 0)) body.next_get = { op: 'get', ...target }
   return { outcome, ...body }
 }
 
-function definition(group, { description, ops, properties }) {
+function unpackArgs(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) invalid('参数必须是对象。')
+  if (!Object.hasOwn(raw, 'params_json')) return raw // Compatibility for direct callers.
+  select(raw, ['params_json'])
+  if (typeof raw.params_json !== 'string') invalid('params_json 必须是 JSON 对象字符串。')
+  let payload
+  try { payload = JSON.parse(raw.params_json.trim() || '{}') } catch {
+    invalid('params_json 不是有效 JSON；请传 JSON 对象字符串，例如 {"name":"demo"}。')
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.hasOwn(payload, 'op')) {
+    invalid('params_json 必须是 JSON 对象，op 只能在外层。')
+  }
+  return { ...payload, op: raw.op }
+}
+
+function packHints(result) {
+  for (const key of ['next_get', 'next_wait']) {
+    if (!result[key]) continue
+    const { op, ...params } = result[key]
+    result[key] = { op, params_json: JSON.stringify(params) }
+  }
+  return result
+}
+
+function definition(group, { description, ops, params }) {
   return {
     name: `winrunner_${group}`,
     description,
     parameters: {
       type: 'object', additionalProperties: false,
-      properties: { op: choice('选择操作。', ops), ...properties }, required: ['op'],
+      properties: {
+        op: choice('选择操作。', ops),
+        params_json: { type: 'string', description: `填 JSON 对象字符串，仅含该操作参数，不重复写 op。${params}` },
+      }, required: ['op', 'params_json'],
     },
     output: {
       schema: {
         type: 'object', additionalProperties: true, required: ['outcome'],
-        properties: { outcome: choice('操作或任务结果；HTTP 状态只用于诊断。', ['succeeded', 'failed', 'cancelled', 'pending', 'request_error', 'unknown']) },
+        properties: {
+          outcome: choice('操作或任务结果；HTTP 状态只用于诊断。', ['succeeded', 'failed', 'cancelled', 'pending', 'request_error', 'unknown']),
+          ...(group === 'project' ? { cpu: cpuOutput } : {}),
+        },
       },
       render(_args, value) { return [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     },
     timeoutMs: 130000,
     isConcurrencySafe: args => readOnly.has(args?.op),
-    async execute(args, exec) {
+    async execute(raw, exec) {
+      let args
+      const format = raw && Object.hasOwn(raw, 'params_json') ? packHints : result => result
       try {
-        if (!args || typeof args !== 'object' || Array.isArray(args)) invalid('参数必须是对象。')
+        args = unpackArgs(raw)
         enumValue(args.op, 'op', ops)
         const spec = builders[group](args)
         const signal = exec?.signal
@@ -347,18 +406,29 @@ function definition(group, { description, ops, properties }) {
         let response = args.op === 'wait'
           ? await waitForTask(spec, waitSeconds(args), signal, call)
           : await requestRunner(spec, signal, call)
-        if (args.op === 'start') response = await withStartLogs(group, args, response, signal, call)
-        return toolResult(group, args, response)
+        if (spec.fileFallback && response.http_status === 400 && response.error?.code === 'invalid_request' &&
+            response.error.message === 'entry_offset and entry_limit are only for directories') {
+          response = await requestRunner(spec.fileFallback, signal, call)
+        }
+        if (args.op === 'start' && spec.idempotencyKey === undefined) {
+          response = await withStartLogs(group, args, response, signal, call)
+        }
+        return format(toolResult(group, args, response))
       } catch (error) {
         if (!(error instanceof ClientError)) throw error
-        return {
+        const { wait_seconds, ...resume } = args ?? {}
+        return format({
           outcome: error.outcomeUnknown ? 'unknown' : 'request_error',
           error: { code: error.code, message: error.message },
           ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
           ...(error.retryAfter === undefined ? {} : { retry_after_seconds: error.retryAfter }),
           ...(error.outcomeUnknown ? { outcome_unknown: true } : {}),
-          ...(args?.op === 'wait' && transientWaitErrors.has(error.code) ? { next_wait: args } : {}),
-        }
+          ...(args?.op === 'start' && error.outcomeUnknown && args.idempotency_key !== undefined ? {
+            idempotency_key: args.idempotency_key,
+            note: '仅确认 Runner 未重启且地址未变后，才用原键和原参数重试；不要换键重试同一次提交。',
+          } : {}),
+          ...(args?.op === 'wait' && transientWaitErrors.has(error.code) ? { next_wait: resume } : {}),
+        })
       }
     },
   }
