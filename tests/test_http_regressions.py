@@ -14,7 +14,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 import config
-from winrunner import HTTPHandler, HTTPServer, ThreadingHTTPServer, service_logging
+from winrunner import (
+    HTTPHandler,
+    HTTPServer,
+    ThreadingHTTPServer,
+    serve_with_gui,
+    service_logging,
+)
 
 TOKEN = "test-bearer-token"
 
@@ -79,6 +85,38 @@ class HTTPRegressionTests(unittest.TestCase):
             return response.status, json.loads(body) if body else body, response.headers
         finally:
             conn.close()
+
+    def test_integrated_window_reads_state_while_http_serves_and_stops_on_return(self):
+        with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
+            server.token = TOKEN.encode("ascii")
+            server.runner = runner = Mock()
+            server.cpu_sampler = Mock()
+            runner.list_projects.return_value = [{"name": "demo"}]
+            runner.list_commands.return_value = []
+            self.port = server.server_address[1]
+
+            def window(snapshot, on_close, is_running):
+                self.assertIs(threading.current_thread(), threading.main_thread())
+                self.assertTrue(is_running())
+                state = snapshot()
+                self.assertEqual(state.health.data, {"run_id": "demo-run"})
+                self.assertEqual(state.projects.data, {"projects": [{"name": "demo"}]})
+                self.assertEqual(state.commands.data, {"commands": []})
+                runner.list_projects.assert_called_once_with()
+                status, body, _ = self.request("GET", "/projects")
+                self.assertEqual(
+                    (status, body), (200, {"projects": [{"name": "demo"}]})
+                )
+                self.backend_is_running = is_running
+                on_close()
+
+            with (
+                patch("winrunner.health_snapshot", return_value={"run_id": "demo-run"}),
+                patch("winrunner_gui.run_integrated", side_effect=window) as gui,
+            ):
+                serve_with_gui(server)
+            gui.assert_called_once()
+            self.assertFalse(self.backend_is_running())
 
     def test_request_metadata_is_bounded_redacted_and_appended(self):
         self.start_server(reported_peer="203.0.113.42")

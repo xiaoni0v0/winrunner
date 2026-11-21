@@ -136,7 +136,7 @@
 
 | 字段 | 内容 |
 |---|---|
-| `cpu` | `{"logical_cores":16,"usage_percent":12.5}`；CPU 总使用率，尚无采样时为 `null`。 |
+| `cpu` | `logical_cores` 为逻辑核数；`usage_percent` 为最近约 1 秒的 CPU 使用率，`usage_5s_percent` 和 `usage_60s_percent` 为相应窗口的时间加权平均。启动初期按窗口内已有有效样本计算；无对应有效样本时为 `null`。采样由后台定时进行，查询频率不影响数值。 |
 | `memory` | `{"total_bytes":…,"available_bytes":…}`；物理内存。 |
 | `disk` | `{"total_bytes":…,"available_bytes":…}`；项目数据目录所在卷。 |
 | `uptime_seconds` | number；Runner 进程运行秒数。 |

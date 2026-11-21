@@ -9,8 +9,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from queue import Empty, SimpleQueue
 from socket import SHUT_RDWR
 from tkinter import ttk
@@ -20,6 +22,8 @@ ROUTES = ("/health", "/projects", "/commands")
 REQUEST_SECONDS = 2.0
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 REFRESH_MS = 5000
+INTEGRATED_REFRESH_MS = 850
+BACKEND_EXIT_MS = 850
 
 BG = "#eef3f8"
 WHITE = "#ffffff"
@@ -160,6 +164,22 @@ def _poll(
         results.put(Snapshot(health, projects, commands))
 
 
+def _poll_snapshot(
+    snapshot: Callable[[], Snapshot],
+    stop: threading.Event,
+    results: SimpleQueue[Snapshot],
+) -> None:
+    if stop.is_set():
+        return
+    try:
+        result = snapshot()
+    except Exception:
+        # Like HTTP polling, show an unavailable state and let the next refresh retry.
+        result = Snapshot(Response(error="无法读取本机 Runner 状态"))
+    if not stop.is_set():
+        results.put(result)
+
+
 def _object(value: object) -> JsonObject:
     return value if isinstance(value, dict) else {}
 
@@ -207,6 +227,20 @@ def _capacity(data: JsonObject) -> tuple[str, str, float]:
     used = total - free
     percent = 100 * used / total
     return f"{percent:.0f}%", f"已用 {_size(used)} / {_size(total)}", percent
+
+
+def _cpu_usage(data: JsonObject) -> tuple[str, str, float]:
+    def percent(key: str) -> int | float | None:
+        value = _number(data.get(key))
+        return value if value is not None and value <= 100 else None
+
+    def label(value: int | float | None) -> str:
+        return f"{value:.1f}%" if value is not None else DASH
+
+    latest = percent("usage_percent")
+    short = label(percent("usage_5s_percent"))
+    long = label(percent("usage_60s_percent"))
+    return label(latest), f"5s {short}  ·  60s {long}", latest or 0
 
 
 def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
@@ -274,7 +308,8 @@ def _label(
 class Metric(tk.Frame):
     def __init__(self, parent: tk.Misc, title: str, bar: bool = True) -> None:
         super().__init__(parent, bg=WHITE, padx=15, pady=10)
-        _label(self, title, fg=MUTED, bold=True).pack(fill="x")
+        self.title = _label(self, title, fg=MUTED, bold=True)
+        self.title.pack(fill="x")
         self.value = _label(self, DASH, size=21, bold=True)
         self.value.pack(fill="x", pady=(3, 0))
         self.detail = _label(self, DASH, fg=MUTED, size=9)
@@ -363,15 +398,38 @@ class StatusTable(tk.Frame):
 
 
 class Dashboard:
-    def __init__(self, root: tk.Tk, port: int, token: str) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        port: int | None = None,
+        token: str | None = None,
+        *,
+        snapshot: Callable[[], Snapshot] | None = None,
+        on_close: Callable[[], None] | None = None,
+        is_running: Callable[[], bool] | None = None,
+    ) -> None:
         self.root = root
-        self.port = port
-        self._token = token
         self._stop = threading.Event()
         self._results: SimpleQueue[Snapshot] = SimpleQueue()
         self._after_id: str | None = None
         self._busy = False
+        self._backend_exited = False
         self._run_id = DASH
+        self._on_close = on_close
+        self._is_running = is_running
+
+        if snapshot is None:
+            if port is None or token is None:
+                raise TypeError("Standalone dashboard requires a port and token")
+            self._poll = partial(_poll, port, token, self._stop, self._results)
+            self._refresh_ms = REFRESH_MS
+            subtitle = f"只读仪表盘  ·  {HOST}:{port}"
+            initial_notice = "正在向本机 Runner 请求状态…"
+        else:
+            self._poll = partial(_poll_snapshot, snapshot, self._stop, self._results)
+            self._refresh_ms = INTEGRATED_REFRESH_MS
+            subtitle = "只读仪表盘  ·  内置监控"
+            initial_notice = "正在读取本机 Runner 状态…"
 
         root.title("WinRunner · 本机监控")
         root.geometry("1020x710")
@@ -434,9 +492,7 @@ class Dashboard:
         _label(
             heading, "WinRunner  本机监控", bg=NAVY, fg=WHITE, size=21, bold=True
         ).pack(fill="x")
-        _label(
-            heading, f"只读仪表盘  ·  {HOST}:{port}", bg=NAVY, fg="#a9c0da", size=9
-        ).pack(fill="x")
+        _label(heading, subtitle, bg=NAVY, fg="#a9c0da", size=9).pack(fill="x")
         self.refresh_button = ttk.Button(
             hero, text="立即刷新  F5", style="Refresh.TButton", command=self.refresh
         )
@@ -492,25 +548,36 @@ class Dashboard:
 
         footer = tk.Frame(root, bg="#e2eaf4", padx=22, pady=6)
         footer.grid(row=2, column=0, sticky="ew")
-        self.notice = _label(
-            footer, "正在向本机 Runner 请求状态…", bg="#e2eaf4", fg=MUTED, size=9
-        )
+        self.notice = _label(footer, initial_notice, bg="#e2eaf4", fg=MUTED, size=9)
         self.notice.pack(side="left")
         _label(footer, "自动刷新  ·  只读取状态", bg="#e2eaf4", fg=MUTED, size=9).pack(
             side="right"
         )
         self._after_id = root.after_idle(self.refresh)
 
+    def _check_backend(self) -> bool:
+        if self._backend_exited:
+            return False
+        if self._is_running is None or self._is_running():
+            return True
+        self._backend_exited = True
+        if self._after_id is not None:
+            self.root.after_cancel(self._after_id)
+        self.refresh_button.state(["disabled"])
+        offline = Response(error="本机 Runner 已停止")
+        self._show(Snapshot(offline, offline, offline))
+        self._after_id = self.root.after(BACKEND_EXIT_MS, self.close)
+        return False
+
     def refresh(self) -> None:
-        if self._stop.is_set() or self._busy:
+        if self._stop.is_set() or not self._check_backend() or self._busy:
             return
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
         self._busy = True
         self.refresh_button.state(["disabled"])
         threading.Thread(
-            target=_poll,
-            args=(self.port, self._token, self._stop, self._results),
+            target=self._poll,
             daemon=True,
             name="winrunner-dashboard-poll",
         ).start()
@@ -518,6 +585,8 @@ class Dashboard:
 
     def _receive(self) -> None:
         self._after_id = None
+        if self._stop.is_set() or not self._check_backend():
+            return
         try:
             snapshot = self._results.get_nowait()
         except Empty:
@@ -526,25 +595,26 @@ class Dashboard:
         self._show(snapshot)
         self._busy = False
         self.refresh_button.state(["!disabled"])
-        self._after_id = self.root.after(REFRESH_MS, self.refresh)
+        self._after_id = self.root.after(self._refresh_ms, self.refresh)
 
     def _show(self, snapshot: Snapshot) -> None:
         health = snapshot.health.data
         if health is None:
-            self.connection.configure(text="● 未连接", fg="#f5c386")
+            status = "已停止" if self._backend_exited else "未连接"
+            self.connection.configure(text=f"● {status}", fg="#f5c386")
             self.notice.configure(text=snapshot.health.error)
-            for metric in (self.cpu, self.memory, self.disk, self.uptime):
-                metric.update_value(DASH, "等待 Runner 连接")
+            self.cpu.title.configure(text="CPU 使用率")
+            self.cpu.update_value(*_cpu_usage({}))
+            detail = "Runner 已停止" if self._backend_exited else "等待 Runner 连接"
+            for metric in (self.memory, self.disk, self.uptime):
+                metric.update_value(DASH, detail)
             run_id = DASH
         else:
             cpu = _object(health.get("cpu"))
-            percent = _number(cpu.get("usage_percent"))
             cores = _number(cpu.get("logical_cores"))
-            self.cpu.update_value(
-                f"{percent:.1f}%" if percent is not None and percent <= 100 else DASH,
-                f"{cores:g} 个逻辑核心" if cores else "核心数暂不可用",
-                percent if percent is not None and percent <= 100 else 0,
-            )
+            title = f"CPU 使用率 · {cores:g} 核" if cores else "CPU 使用率"
+            self.cpu.title.configure(text=title)
+            self.cpu.update_value(*_cpu_usage(cpu))
             self.memory.update_value(*_capacity(_object(health.get("memory"))))
             self.disk.update_value(*_capacity(_object(health.get("disk"))))
             self.uptime.update_value(
@@ -562,11 +632,34 @@ class Dashboard:
         self.commands.show_rows(*_rows(snapshot.commands, "commands"), reset=reset)
 
     def close(self) -> None:
+        if self._stop.is_set():
+            return
         self._stop.set()
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
             self._after_id = None
-        self.root.destroy()
+        try:
+            if not self._backend_exited and self._on_close is not None:
+                self._on_close()
+        finally:
+            self.root.destroy()
+
+
+def run_integrated(
+    snapshot: Callable[[], Snapshot],
+    on_close: Callable[[], None],
+    is_running: Callable[[], bool],
+) -> None:
+    """Run Tk on the main thread; only snapshot collection runs in a worker.
+
+    The liveness check and user-close notification run on the Tk thread and
+    must not block. Backend exit closes the dashboard without a notification.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("The integrated dashboard must run on the main thread")
+    root = tk.Tk()
+    Dashboard(root, snapshot=snapshot, on_close=on_close, is_running=is_running)
+    root.mainloop()
 
 
 def main() -> None:

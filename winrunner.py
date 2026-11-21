@@ -1,5 +1,6 @@
 """Start WinRunner with: python winrunner.py."""
 
+import argparse
 import hmac
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -20,7 +22,15 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 import config
 from runner import APIError, Runner, invalid, not_found
-from winprocess import health
+from winprocess import CpuSampler, health
+
+
+def health_snapshot(runner: Runner, sampler: CpuSampler) -> dict:
+    return {
+        **health(runner.base, time.monotonic() - runner.started_at, sampler),
+        "run_id": runner.run_id,
+    }
+
 
 DECIMAL = re.compile(r"[0-9]+\Z")
 BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
@@ -168,6 +178,7 @@ def range_bounds(header, size):
 class HTTPServer(ThreadingHTTPServer):
     token: bytes
     runner: Runner
+    cpu_sampler: CpuSampler
 
     def __init__(self, *args, **kwargs):
         limit = getattr(config, "MAX_HTTP_CONNECTIONS", 64)
@@ -479,14 +490,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def get_health(self, _method, _name, query):
         self.no_query(query)
-        runner = self.server.runner
-        self.reply(
-            200,
-            {
-                **health(runner.base, time.monotonic() - runner.started_at),
-                "run_id": runner.run_id,
-            },
-        )
+        self.reply(200, health_snapshot(self.server.runner, self.server.cpu_sampler))
 
     def projects(self, method, _name, query):
         self.no_query(query)
@@ -657,7 +661,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 remaining -= len(data)
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(description="WinRunner HTTP compute service")
+    parser.add_argument("--nogui", action="store_true", help="run without Tkinter")
+    args = parser.parse_args()
     if sys.platform != "win32":
         sys.exit("WinRunner only supports Windows")
     token = config.TOKEN
@@ -672,24 +679,68 @@ def main():
         )
     with service_logging(LOG_FILE, token):
         try:
-            serve(token)
+            serve(token, nogui=args.nogui)
         except Exception:
             LOG.exception("WinRunner stopped due to an error")
             sys.exit(1)
 
 
-def serve(token: str) -> None:
+def serve(token: str, *, nogui: bool) -> None:
     with HTTPServer((config.HOST, config.PORT), HTTPHandler) as server:
         server.token = token.encode("ascii")
+        server.cpu_sampler = CpuSampler()
         server.runner = Runner(config.DATA_DIR)
         host, port = cast(tuple[str, int], server.server_address)  # IPv4 listener
-        LOG.info("WinRunner listening on http://%s:%s", host, port)
         try:
-            server.serve_forever()
+            server.cpu_sampler.start()
+            LOG.info("WinRunner listening on http://%s:%s", host, port)
+            if nogui:
+                server.serve_forever()
+            else:
+                serve_with_gui(server)
         except KeyboardInterrupt:
-            LOG.info("WinRunner stopping")
+            pass
         finally:
-            server.runner.close()
+            LOG.info("WinRunner stopping")
+            try:
+                server.runner.close()
+            finally:
+                server.cpu_sampler.close()
+
+
+def serve_with_gui(server: HTTPServer) -> None:
+    import tkinter
+
+    from winrunner_gui import Response, Snapshot, run_integrated
+
+    def snapshot() -> Snapshot:
+        runner = server.runner
+        return Snapshot(
+            Response(health_snapshot(runner, server.cpu_sampler)),
+            Response({"projects": runner.list_projects()}),
+            Response({"commands": runner.list_commands()}),
+        )
+
+    errors: list[Exception] = []
+
+    def serve_http() -> None:
+        try:
+            server.serve_forever(poll_interval=0.1)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=serve_http, name="winrunner-http")
+    worker.start()
+    try:
+        run_integrated(snapshot, lambda: None, worker.is_alive)
+    except tkinter.TclError as exc:
+        LOG.error("Cannot open Tkinter window; use --nogui on headless hosts")
+        raise RuntimeError("Tkinter window failed") from exc
+    finally:
+        server.shutdown()
+        worker.join()
+    if errors:
+        raise errors[0]
 
 
 if __name__ == "__main__":

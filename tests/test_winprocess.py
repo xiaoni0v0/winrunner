@@ -10,7 +10,15 @@ import unittest
 from unittest.mock import patch
 
 if os.name == "nt":
-    from winprocess import Job, JobCancelled, _PdhCpu, health
+    from winprocess import (
+        CpuSampler,
+        Job,
+        JobCancelled,
+        _CpuHistory,
+        _CpuReader,
+        _PdhCpu,
+        health,
+    )
 
 
 @unittest.skipUnless(os.name == "nt", "requires Windows Job Objects")
@@ -275,53 +283,128 @@ class WinProcessTests(unittest.TestCase):
         self.assertEqual(self.finish(slow), 0)
         self.assertEqual((self.out, self.err), (b"slow", b"slow"))
 
-    def test_health_native_metrics(self):
-        with (
-            patch("winprocess._previous_cpu_times", None),
-            patch("winprocess._GetActiveProcessorGroupCount", return_value=1),
-        ):
-            first = health(self.cwd, 3.5)
-            self.assertEqual(first["uptime_seconds"], 3.5)
-            self.assertGreater(first["cpu"]["logical_cores"], 0)
-            self.assertIsNone(first["cpu"]["usage_percent"])
-            for key in ("disk", "memory"):
-                self.assertGreater(first[key]["total_bytes"], 0)
-                self.assertGreaterEqual(
-                    first[key]["total_bytes"], first[key]["available_bytes"]
-                )
-            time.sleep(0.08)
-            usage = health(self.cwd, 4)["cpu"]["usage_percent"]
-            self.assertIsNotNone(usage)
-            self.assertTrue(0 <= usage <= 100)
 
-    def test_health_multi_group_uses_native_total_pdh_counter(self):
+@unittest.skipUnless(os.name == "nt", "requires Windows performance counters")
+class CpuSamplerTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="winprocess CPU ")
+        self.addCleanup(folder.cleanup)
+        self.cwd = Path(folder.name)
+        self.sampler = CpuSampler()
+        self.addCleanup(self.sampler.close)
+
+    def test_health_background_single_group_native_metrics(self):
+        first = health(self.cwd, 3.5, self.sampler)
+        self.assertEqual(first["uptime_seconds"], 3.5)
+        self.assertGreater(first["cpu"]["logical_cores"], 0)
+        for name in ("usage_percent", "usage_5s_percent", "usage_60s_percent"):
+            self.assertIsNone(first["cpu"][name])
+        for key in ("disk", "memory"):
+            self.assertGreater(first[key]["total_bytes"], 0)
+            self.assertGreaterEqual(
+                first[key]["total_bytes"], first[key]["available_bytes"]
+            )
+        with patch("winprocess._GetActiveProcessorGroupCount", return_value=1):
+            try:
+                self.sampler.start()
+                # Wait without calling health: no request establishes the baseline.
+                deadline = time.monotonic() + 4
+                while None in self.sampler.snapshot() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                cpu = health(self.cwd, 4, self.sampler)["cpu"]
+                for name in ("usage_percent", "usage_5s_percent", "usage_60s_percent"):
+                    self.assertIsNotNone(cpu[name], name)
+                    self.assertTrue(0 <= cpu[name] <= 100, name)
+            finally:
+                self.sampler.close()
+
+    def test_health_does_not_sample_or_wait_for_native_read(self):
+        entered, release = threading.Event(), threading.Event()
+        workers = []
+
+        def sample(_now):
+            workers.append(threading.current_thread())
+            entered.set()
+            release.wait(5)
+            return None
+
+        with patch("winprocess._CpuReader") as build:
+            reader = build.return_value
+            reader.sample.side_effect = sample
+            try:
+                self.sampler.start()
+                self.sampler.start()
+                self.assertTrue(entered.wait(5))
+                first = health(self.cwd, 0, self.sampler)["cpu"]
+                self.assertEqual(health(self.cwd, 0, self.sampler)["cpu"], first)
+                self.assertIsNone(first["usage_percent"])
+                self.assertEqual(reader.sample.call_count, 1)
+            finally:
+                release.set()
+                self.sampler.close()
+            self.sampler.close()
+            build.assert_called_once()
+            reader.close.assert_called_once()
+            self.assertFalse(workers[0].is_alive())
+
+    def test_windows_use_elapsed_time_and_clip_partial_intervals(self):
+        history = _CpuHistory()
+        self.assertEqual(history.record(0, None), (None, None, None))
+        self.assertEqual(history.record(2, 20), (20, 20, 20))
+        current, short, long = history.record(6, 80)
+        self.assertEqual(current, 80)
+        self.assertEqual(short, (1 * 20 + 4 * 80) / 5)
+        self.assertEqual(long, (2 * 20 + 4 * 80) / 6)
+        current, short, long = history.record(61, None)
+        self.assertIsNone(current)
+        self.assertIsNone(short)  # The gap is not counted as 0% or held at 80%.
+        self.assertEqual(long, (1 * 20 + 4 * 80) / 5)
+        self.assertEqual(history.record(66, None), (None, None, None))
+        self.assertEqual(history.record(67, 0), (0, 0, 0))
+
+    def test_native_pdh_total_counter(self):
         try:
-            sampler = _PdhCpu()
+            pdh = _PdhCpu()
         except (OSError, AttributeError) as error:
             self.skipTest(f"host performance counters unavailable: {error}")
-        self.addCleanup(sampler.close)
-        with (
-            patch("winprocess._pdh_cpu", sampler),
-            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
-        ):
-            self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
-            self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
-            time.sleep(1.05)
-            usage = health(self.cwd, 1)["cpu"]["usage_percent"]
-            self.assertIsNotNone(usage)
-            self.assertTrue(0 <= usage <= 100)
-            self.assertEqual(health(self.cwd, 1)["cpu"]["usage_percent"], usage)
+        self.addCleanup(pdh.close)
+        self.assertIsNone(pdh.sample())
+        time.sleep(1.0)
+        usage = pdh.sample()
+        assert usage is not None
+        self.assertTrue(0 <= usage <= 100)
 
-    def test_health_unavailable_pdh_does_not_report_partial_usage(self):
+    def test_multi_group_selects_pdh_instead_of_single_group(self):
+        reader = _CpuReader()
+        self.addCleanup(reader.close)
         with (
-            patch("winprocess._pdh_cpu", None),
-            patch("winprocess._pdh_retry_after", 0),
             patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
+            patch("winprocess._GetSystemTimes") as single_group,
+            patch("winprocess._PdhCpu") as build,
+        ):
+            pdh = build.return_value
+            pdh.sample.side_effect = [None, 34.5]
+            self.assertIsNone(reader.sample(0))
+            self.assertEqual(reader.sample(1), 34.5)
+            single_group.assert_not_called()
+            build.assert_called_once()
+            reader.close()
+            pdh.close.assert_called_once()
+
+    def test_unavailable_pdh_does_not_report_partial_usage(self):
+        reader = _CpuReader()
+        self.addCleanup(reader.close)
+        with (
+            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
+            patch("winprocess._GetSystemTimes") as single_group,
             patch("winprocess._PdhCpu", side_effect=OSError("unavailable")) as build,
         ):
-            self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
-            self.assertIsNone(health(self.cwd, 0)["cpu"]["usage_percent"])
+            self.assertIsNone(reader.sample(0))
+            self.assertIsNone(reader.sample(59))
             build.assert_called_once()
+            self.assertIsNone(reader.sample(60))
+            self.assertEqual(build.call_count, 2)
+            single_group.assert_not_called()
 
 
 if __name__ == "__main__":

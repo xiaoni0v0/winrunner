@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import atexit
+from collections import deque
 import ctypes as C
 from ctypes import wintypes as W
 from contextlib import ExitStack
@@ -508,8 +508,7 @@ class _PdhCpu:
             library=pdh,
         )
         self.query, self.counter = _H(), _H()
-        self.last_collection = None
-        self.last_usage = None
+        self._primed = False
         if op(None, 0, C.byref(self.query)):
             raise OSError("Could not open Windows performance query")
         if add(
@@ -521,18 +520,17 @@ class _PdhCpu:
             self.close()
             raise OSError("System-wide Windows processor counter unavailable")
 
-    def close(self):
+    def close(self) -> None:
         self._close(self.query)
 
-    def sample(self, now):
-        # PDH rate counters need two collections; allow at least one second
-        # between them, even when /health is polled by many clients.
-        previous = self.last_collection
-        if previous is not None and now - previous < 1.0:
-            return self.last_usage
-        self.last_collection = now
-        self.last_usage = None
-        if self._collect(self.query) or previous is None:
+    def sample(self) -> float | None:
+        # PDH rate counters need two successful collections. The sampler
+        # schedules them about one second apart, independent of health polls.
+        if self._collect(self.query):
+            self._primed = False
+            return None
+        if not self._primed:
+            self._primed = True
             return None
         value = _PdhValue()
         if (
@@ -542,65 +540,152 @@ class _PdhCpu:
             and value.status in (0, 1)
             and math.isfinite(value.value)
         ):
-            self.last_usage = min(100.0, max(0.0, value.value))
-        return self.last_usage
+            return min(100.0, max(0.0, value.value))
+        return None
 
 
-_cpu_lock = threading.Lock()
-_previous_cpu_times: tuple[int, int] | None = None
-_pdh_cpu: _PdhCpu | None = None
-_pdh_retry_after = 0.0
-
-
-def _multi_group_percent():
-    global _pdh_cpu, _pdh_retry_after
-    now = time.monotonic()
-    if _pdh_cpu is None:
-        if now < _pdh_retry_after:
-            return None
-        try:
-            _pdh_cpu = _PdhCpu()
-        except (OSError, AttributeError):
-            # Counter registration can be disabled. Do not return a misleading
-            # primary-group-only sample on a multi-group host.
-            _pdh_retry_after = now + 60.0
-            return None
-        atexit.register(_pdh_cpu.close)
-    return _pdh_cpu.sample(now)
-
-
-def _filetime(value):
+def _filetime(value: W.FILETIME) -> int:
     return (value.dwHighDateTime << 32) | value.dwLowDateTime
 
 
-def _cpu_percent():
-    global _previous_cpu_times
-    with _cpu_lock:
+class _CpuReader:
+    """Own the native counters and baselines for one sampling thread."""
+
+    def __init__(self) -> None:
+        self._previous_times: tuple[int, int] | None = None
+        self._pdh: _PdhCpu | None = None
+        self._pdh_retry_after = 0.0
+
+    def close(self) -> None:
+        if self._pdh is not None:
+            self._pdh.close()
+            self._pdh = None
+
+    def sample(self, now: float) -> float | None:
         if _GetActiveProcessorGroupCount() > 1:
-            return _multi_group_percent()
+            self._previous_times = None
+            if self._pdh is None:
+                if now < self._pdh_retry_after:
+                    return None
+                try:
+                    self._pdh = _PdhCpu()
+                except (OSError, AttributeError):
+                    # Do not fall back to misleading primary-group-only data.
+                    self._pdh_retry_after = now + 60.0
+                    return None
+            return self._pdh.sample()
+
+        self.close()
+        self._pdh_retry_after = 0.0
         idle, kernel, user = W.FILETIME(), W.FILETIME(), W.FILETIME()
-        _check(_GetSystemTimes(C.byref(idle), C.byref(kernel), C.byref(user)))
+        if not _GetSystemTimes(C.byref(idle), C.byref(kernel), C.byref(user)):
+            self._previous_times = None
+            return None
         sample = (_filetime(idle), _filetime(kernel) + _filetime(user))
-        previous, _previous_cpu_times = _previous_cpu_times, sample
+        previous, self._previous_times = self._previous_times, sample
         if previous is None:
             return None
         elapsed = sample[1] - previous[1]
-        if elapsed <= 0:
-            return None
         idle_elapsed = sample[0] - previous[0]
+        if elapsed <= 0 or idle_elapsed < 0:
+            return None
         return min(100.0, max(0.0, 100.0 * (elapsed - idle_elapsed) / elapsed))
 
 
-def health(workspace: Path, uptime_seconds: float) -> dict:
+class _CpuHistory:
+    """Time-weighted means of valid intervals, clipped to each window."""
+
+    def __init__(self) -> None:
+        self._intervals: deque[tuple[float, float, float]] = deque()
+        self._last_time: float | None = None
+
+    def record(
+        self, now: float, usage: float | None
+    ) -> tuple[float | None, float | None, float | None]:
+        previous, self._last_time = self._last_time, now
+        if previous is not None and now > previous and usage is not None:
+            self._intervals.append((previous, now, usage))
+        while self._intervals and self._intervals[0][1] <= now - 60.0:
+            self._intervals.popleft()
+        return usage, self._average(now - 5.0), self._average(now - 60.0)
+
+    def _average(self, cutoff: float) -> float | None:
+        total = duration = 0.0
+        for start, end, usage in reversed(self._intervals):
+            if end <= cutoff:
+                break
+            weight = end - max(start, cutoff)
+            total += usage * weight
+            duration += weight
+        return total / duration if duration else None
+
+
+class CpuSampler:
+    """Collect CPU usage in one background thread about once per second.
+
+    Health reads only the last published snapshot. A failed read makes the
+    latest value null; rolling means exclude missing intervals and use all
+    available history within each window, including during warm-up.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._usage: tuple[float | None, float | None, float | None] = (
+            None,
+            None,
+            None,
+        )
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._thread is None and not self._stop.is_set():
+                thread = threading.Thread(
+                    target=self._run, name="winprocess-cpu", daemon=True
+                )
+                thread.start()
+                self._thread = thread
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._thread is not None:
+                self._thread.join()
+                self._thread = None
+
+    def snapshot(self) -> tuple[float | None, float | None, float | None]:
+        with self._snapshot_lock:
+            return self._usage
+
+    def _run(self) -> None:
+        reader, history = _CpuReader(), _CpuHistory()
+        try:
+            while not self._stop.is_set():
+                usage = reader.sample(time.monotonic())
+                snapshot = history.record(time.monotonic(), usage)
+                with self._snapshot_lock:
+                    self._usage = snapshot
+                if self._stop.wait(1.0):
+                    break
+        finally:
+            reader.close()
+
+
+def health(workspace: Path, uptime_seconds: float, sampler: CpuSampler) -> dict:
     """Report Windows host utilization and capacity for the workspace volume."""
     memory = _MemoryStatus()
     memory.dwLength = C.sizeof(memory)
     _check(_GlobalMemoryStatusEx(C.byref(memory)))
     disk = shutil.disk_usage(workspace)
+    usage, usage_5s, usage_60s = sampler.snapshot()
     return {
         "cpu": {
             "logical_cores": _GetActiveProcessorCount(0xFFFF) or os.cpu_count() or 1,
-            "usage_percent": _cpu_percent(),
+            "usage_percent": usage,
+            "usage_5s_percent": usage_5s,
+            "usage_60s_percent": usage_60s,
         },
         "memory": {
             "total_bytes": memory.ullTotalPhys,

@@ -126,6 +126,114 @@ class PollTests(unittest.TestCase):
         self.assertEqual(results.get_nowait(), gui.Snapshot(health, projects, busy))
 
 
+class IntegratedTests(unittest.TestCase):
+    @staticmethod
+    def dashboard(snapshot, on_close, is_running):
+        root = MagicMock()
+        with (
+            patch.object(gui.tk, "Frame"),
+            patch.object(gui, "_label", side_effect=lambda *a, **kw: MagicMock()),
+            patch.object(gui.ttk, "Style"),
+            patch.object(gui.ttk, "Button"),
+            patch.object(gui, "Metric"),
+            patch.object(gui, "StatusTable"),
+        ):
+            dashboard = gui.Dashboard(
+                root, snapshot=snapshot, on_close=on_close, is_running=is_running
+            )
+        return dashboard
+
+    @patch.object(gui, "_get")
+    def test_integrated_poll_uses_worker_and_queue(self, getter: MagicMock) -> None:
+        sample = gui.Snapshot(gui.Response({"run_id": "integrated"}))
+        worker_threads = []
+
+        def snapshot() -> gui.Snapshot:
+            worker_threads.append(threading.current_thread())
+            return sample
+
+        on_close = MagicMock()
+        dashboard = self.dashboard(snapshot, on_close, lambda: True)
+        dashboard._show = MagicMock()
+        dashboard.refresh()
+        queued = dashboard._results.get(timeout=2)
+        self.assertIs(queued, sample)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertIsNot(worker_threads[0], threading.main_thread())
+        dashboard._show.assert_not_called()
+        dashboard._results.put(queued)
+        dashboard._receive()
+        dashboard._show.assert_called_once_with(sample)
+        dashboard.root.after.assert_called_with(
+            gui.INTEGRATED_REFRESH_MS, dashboard.refresh
+        )
+        getter.assert_not_called()
+
+        dashboard.close()
+        dashboard.close()
+        on_close.assert_called_once_with()
+        dashboard.root.destroy.assert_called_once_with()
+
+    def test_backend_exit_closes_without_notification_during_a_poll(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        alive = threading.Event()
+        alive.set()
+
+        def snapshot() -> gui.Snapshot:
+            entered.set()
+            release.wait(timeout=2)
+            return gui.Snapshot(gui.Response({"run_id": "old"}))
+
+        on_close = MagicMock()
+        dashboard = self.dashboard(snapshot, on_close, alive.is_set)
+        try:
+            dashboard.refresh()
+            self.assertTrue(entered.wait(timeout=2))
+            alive.clear()
+            dashboard._receive()
+            dashboard.connection.configure.assert_called_once_with(
+                text="● 已停止", fg="#f5c386"
+            )
+            dashboard.root.after.assert_called_with(
+                gui.BACKEND_EXIT_MS, dashboard.close
+            )
+            dashboard.close()
+            dashboard.root.destroy.assert_called_once_with()
+            on_close.assert_not_called()
+        finally:
+            release.set()
+
+    def test_snapshot_error_is_retried_and_details_are_not_displayed(self) -> None:
+        snapshot = MagicMock(side_effect=ValueError("private details"))
+        stop = threading.Event()
+        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
+        gui._poll_snapshot(snapshot, stop, results)
+        error = results.get_nowait().health.error
+        self.assertTrue(error)
+        self.assertNotIn("private details", error)
+        sample = gui.Snapshot(gui.Response({}))
+        snapshot.side_effect = None
+        snapshot.return_value = sample
+        gui._poll_snapshot(snapshot, stop, results)
+        self.assertIs(results.get_nowait(), sample)
+
+    @patch.object(gui, "Dashboard")
+    @patch.object(gui.tk, "Tk")
+    def test_entry_point_creates_the_integrated_dashboard(
+        self, tk_factory, dashboard
+    ) -> None:
+        snapshot, on_close, is_running = MagicMock(), MagicMock(), MagicMock()
+        gui.run_integrated(snapshot, on_close, is_running)
+        dashboard.assert_called_once_with(
+            tk_factory.return_value,
+            snapshot=snapshot,
+            on_close=on_close,
+            is_running=is_running,
+        )
+        tk_factory.return_value.mainloop.assert_called_once_with()
+
+
 class DisplayTests(unittest.TestCase):
     def test_short_command_ids_stay_strings(self) -> None:
         commands = gui.Response(
@@ -141,6 +249,22 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["10", "z"])
         self.assertEqual(rows[0][1][4], "0")
         self.assertEqual(rows[1][1][1], "PowerShell")
+
+    def test_cpu_usage_displays_latest_and_both_averages(self) -> None:
+        self.assertEqual(
+            gui._cpu_usage(
+                {
+                    "usage_percent": 28.5,
+                    "usage_5s_percent": 15,
+                    "usage_60s_percent": 0,
+                }
+            ),
+            ("28.5%", "5s 15.0%  ·  60s 0.0%", 28.5),
+        )
+        self.assertEqual(
+            gui._cpu_usage({"usage_percent": 101, "usage_5s_percent": float("nan")}),
+            (gui.DASH, f"5s {gui.DASH}  ·  60s {gui.DASH}", 0),
+        )
 
     def test_metrics_handle_missing_values(self) -> None:
         self.assertEqual(gui._uptime(90061.5), "1 天 01:01:01")

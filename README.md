@@ -15,19 +15,15 @@
 python winrunner.py
 ```
 
-按 **Ctrl+C** 停止。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
+默认同时打开本机监控窗口；关闭窗口或按 **Ctrl+C** 会停止服务并取消正在运行的任务。纯命令行或无桌面环境使用 `python winrunner.py --nogui`（不加载 Tkinter）。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
 
 服务日志输出到控制台，并追加到程序同目录的 `winrunner.log`，不自动轮转。每行最多 80 列；来自 `127.0.0.1` 的 HTTP 请求（包括 GUI 轮询）不记请求日志；其他来源的请求日志包含操作、HTTP 状态、耗时和部分参数，不记录鉴权头、命令正文或任务 stdout/stderr。任务输出仍只在内存中，通过 API 读取。
 
 ## 本机监控窗口
 
-服务启动后，在同一台机器的另一个终端运行：
+内置窗口约每秒通过后台线程读取内部状态，不占 HTTP 连接，也不产生请求日志。窗口显示 CPU 最近采样与 5 秒、60 秒平均值，以及内存、磁盘、运行指纹和任务状态。
 
-```powershell
-python winrunner_gui.py
-```
-
-窗口用同一份配置里的令牌和端口访问 `127.0.0.1`，只读显示 CPU、内存、磁盘、运行指纹，以及项目和临时命令状态。窗口不负责启停服务，关闭它不影响任务。需要带 Tcl/Tk 的 Python 和交互桌面；无桌面环境仍可单独运行服务。若服务改成绑定单个非回环 IP，监控窗口无法连接。
+若希望关闭窗口而不停止服务，可用 `--nogui` 启动服务，再单独运行 `python winrunner_gui.py`。独立窗口沿用本机 HTTP API，需要服务监听 `127.0.0.1` 或 `0.0.0.0`。两种窗口都需要带 Tcl/Tk 的 Python 和交互桌面。
 
 ## 任务和结果
 
