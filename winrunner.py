@@ -199,7 +199,8 @@ class HTTPServer(ThreadingHTTPServer):
                 pass  # An overloaded connection must not stall the accept loop.
             finally:
                 self.shutdown_request(request)
-            LOG.warning("503 connection limit peer=%s", client_address[0])
+            if self.should_log_request(client_address):
+                LOG.warning("503 connection limit peer=%s", client_address[0])
             return
         try:
             super().process_request(request, client_address)
@@ -214,7 +215,11 @@ class HTTPServer(ThreadingHTTPServer):
             self.connections.release()
 
     def handle_error(self, request, client_address):
-        LOG.exception("Unhandled HTTP handler error peer=%s", client_address[0])
+        if self.should_log_request(client_address):
+            LOG.exception("Unhandled HTTP handler error peer=%s", client_address[0])
+
+    def should_log_request(self, client_address: tuple[str, int]) -> bool:
+        return client_address[0] != "127.0.0.1"
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -265,6 +270,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.request_status = None
         self.operation = "request"
         self.request_details: list[str] = []
+        log_request = self.server.should_log_request(self.client_address)
         started = time.monotonic()
         try:
             self.raw_requestline = self.rfile.readline(65537)
@@ -279,14 +285,15 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 self.dispatch(self.command)
                 self.wfile.flush()
         except TimeoutError:
-            LOG.warning("HTTP request timed out peer=%s", self.client_address[0])
+            if log_request:
+                LOG.warning("HTTP request timed out peer=%s", self.client_address[0])
             self.close_connection = True
         except ConnectionError:
             # A client may reset the connection during parsing or while we
             # send an error reply. There is no peer left to respond to.
             self.close_connection = True
         finally:
-            if self.request_status is not None:
+            if log_request and self.request_status is not None:
                 elapsed = (time.monotonic() - started) * 1000
                 LOG.info(
                     "%s %s %.0fms peer=%s%s",
@@ -414,7 +421,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             elif self.response_started:
                 # A download that fails after its headers cannot send a second response.
-                LOG.exception("Response interrupted: %s", self.operation)
+                if self.server.should_log_request(self.client_address):
+                    LOG.exception("Response interrupted: %s", self.operation)
                 self.close_connection = True
             elif isinstance(exc, APIError):
                 self.note("error", exc.code)
@@ -434,7 +442,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
                     },
                 )
             else:
-                LOG.exception("Request failed: %s", self.operation)
+                if self.server.should_log_request(self.client_address):
+                    LOG.exception("Request failed: %s", self.operation)
                 self.reply(
                     500,
                     {

@@ -17,7 +17,7 @@ python winrunner.py
 
 按 **Ctrl+C** 停止。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
 
-服务日志输出到控制台，并追加到程序同目录的 `winrunner.log`，不自动轮转。每行最多 80 列；请求日志包含操作、HTTP 状态、耗时和部分参数，不记录鉴权头、命令正文或任务 stdout/stderr。任务输出仍只在内存中，通过 API 读取。
+服务日志输出到控制台，并追加到程序同目录的 `winrunner.log`，不自动轮转。每行最多 80 列；来自 `127.0.0.1` 的 HTTP 请求（包括 GUI 轮询）不记请求日志；其他来源的请求日志包含操作、HTTP 状态、耗时和部分参数，不记录鉴权头、命令正文或任务 stdout/stderr。任务输出仍只在内存中，通过 API 读取。
 
 ## 本机监控窗口
 

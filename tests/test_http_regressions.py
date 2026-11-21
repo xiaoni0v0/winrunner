@@ -29,7 +29,14 @@ class TrackingServer(HTTPServer):
         self.worker_count = 0
         self.worker_started = threading.Event()
         self.worker_done = threading.Event()
+        self.reported_peer: str | None = None
         super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, address = super().get_request()
+        if self.reported_peer is not None:
+            address = (self.reported_peer, address[1])
+        return request, address
 
     def process_request_thread(self, request, client_address):
         self.worker_count += 1
@@ -41,9 +48,10 @@ class TrackingServer(HTTPServer):
 
 
 class HTTPRegressionTests(unittest.TestCase):
-    def start_server(self, *, limit=64):
+    def start_server(self, *, limit=64, reported_peer=None):
         with patch.object(config, "MAX_HTTP_CONNECTIONS", limit, create=True):
             self.server = TrackingServer(("127.0.0.1", 0), QuietHandler)
+        self.server.reported_peer = reported_peer
         self.server.token = TOKEN.encode("ascii")
         self.server.runner = self.runner = Mock()
         self.runner.list_projects.return_value = []
@@ -73,7 +81,7 @@ class HTTPRegressionTests(unittest.TestCase):
             conn.close()
 
     def test_request_metadata_is_bounded_redacted_and_appended(self):
-        self.start_server()
+        self.start_server(reported_peer="203.0.113.42")
         self.runner.start_command.return_value = (202, {"id": "z", "mode": "ps"})
         self.runner.start_action.return_value = (202, {})
         console = io.StringIO()
@@ -135,6 +143,25 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertTrue(
             all(len(line) <= 80 and line.isascii() for line in text.splitlines())
         )
+
+    def test_loopback_requests_are_silent_in_console_and_file(self):
+        self.start_server()
+        console = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            logfile = Path(folder) / "winrunner.log"
+            with redirect_stdout(console), service_logging(logfile, TOKEN):
+                for auth, expected in ((True, 200), (False, 401)):
+                    self.server.worker_done.clear()
+                    status, _, _ = self.request("GET", "/projects", auth=auth)
+                    self.assertEqual(status, expected)
+                    self.assertTrue(self.server.worker_done.wait(3))
+                self.runner.list_projects.side_effect = RuntimeError("test failure")
+                self.server.worker_done.clear()
+                status, _, _ = self.request("GET", "/projects")
+                self.assertEqual(status, 500)
+                self.assertTrue(self.server.worker_done.wait(3))
+            self.assertEqual(console.getvalue(), "")
+            self.assertEqual(logfile.read_text(encoding="utf-8"), "")
 
     def test_rejects_over_budget_before_starting_worker_and_reuses_permit(self):
         self.start_server(limit=1)
@@ -275,7 +302,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertEqual(self.runner.mock_calls, [])
 
     def test_only_windows_sharing_and_lock_violations_on_files_are_busy(self):
-        self.start_server()
+        self.start_server(reported_peer="203.0.113.42")
         path = "/projects/demo/files?path=artifact.txt"
         for code in (32, 33):
             with self.subTest(winerror=code):
@@ -348,7 +375,7 @@ class HTTPRegressionTests(unittest.TestCase):
                 conn.close()
 
     def test_file_read_error_after_headers_is_logged_and_truncates_response(self):
-        self.start_server()
+        self.start_server(reported_peer="203.0.113.42")
         with (
             tempfile.TemporaryFile() as file,
             patch("winrunner.LOG.exception") as log,
