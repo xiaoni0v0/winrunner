@@ -28,5 +28,6 @@ GIT = shutil.which("git.exe")
 SYSTEM32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
 CMD = SYSTEM32 / "cmd.exe"
 POWERSHELL = SYSTEM32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-# Set False if local PowerShell policy does not permit loading script modules.
+# False skips the PowerShell startup module (quiet progress and UTF-8 defaults)
+# if local PowerShell policy does not permit loading script modules.
 PS_SUPPRESS_PROGRESS = True

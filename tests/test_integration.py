@@ -386,6 +386,26 @@ class CommandIntegrationTests(RunnerCase):
         )
         self.assertIn(b"runner-opt-in", log_bytes(task, "stderr"))
 
+    def test_powershell_text_uses_utf8_and_raw_output_stays_unchanged(self):
+        command = (
+            'Write-Output "中文 🚀"\n'
+            '[Console]::Error.WriteLine("标准错误 🧪")\n'
+            'Write-Error "错误记录"\n'
+            "exit 7"
+        )
+        task = self.call(200, "POST", "/commands", {"mode": "ps", "command": command})
+        task = self.finished("/commands/" + task["id"], expected="failed")
+        self.assertEqual(task["exit_code"], 7)
+        self.assertEqual(log_bytes(task, "stdout"), "中文 🚀\r\n".encode("utf-8"))
+        stderr = log_bytes(task, "stderr").decode("utf-8")
+        self.assertIn("标准错误 🧪", stderr)
+        self.assertIn("错误记录", stderr)
+
+        raw = "[Console]::OpenStandardOutput().Write([byte[]](255, 128, 0), 0, 3)"
+        task = self.call(200, "POST", "/commands", {"mode": "ps", "command": raw})
+        task = self.finished("/commands/" + task["id"])
+        self.assertEqual(log_bytes(task, "stdout"), b"\xff\x80\x00")
+
     def test_zero_timeout_multiline_powershell_and_concurrent_incremental_logs(self):
         def launch(label):
             gate = self.work / (label + " release")

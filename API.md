@@ -88,7 +88,9 @@
 | `command` | string | 一段 shell 命令；`ps` 支持多行，换行用 JSON 转义 `\n` 传输。不接受数组。 |
 | `timeout`（可选） | number | 只限制 POST 等待时间，见通用规则。 |
 
-非交互运行，不加载 PowerShell 用户配置。`ps` 默认关闭 PowerShell 进度提示，命令可自行设置 `$ProgressPreference = 'Continue'` 恢复；错误和程序写入 stderr 的内容不做过滤。若机器的 PowerShell 执行策略禁止加载本地脚本模块，可在 [config.py](<config.py>) 将 `PS_SUPPRESS_PROGRESS` 设为 `False`，无需放宽系统策略。工作目录为 Runner 账号的用户目录，命令可自行 `cd`。可并发。`200` / `202`：`Command`，即 `Task` 加字段 `id`（服务端分配的 string）、`mode`（`cmd` / `ps`）。
+非交互运行，不加载 PowerShell 用户配置。工作目录为 Runner 账号的用户目录，命令可自行 `cd`。可并发。`200` / `202`：`Command`，即 `Task` 加字段 `id`（服务端分配的 string）、`mode`（`cmd` / `ps`）。
+
+`ps` 默认关闭进度提示，并将 PowerShell 自己写入管道的文本设为 UTF-8（无 BOM）。命令可用 `$ProgressPreference = 'Continue'` 恢复进度提示。原生子程序仍可能使用自己的编码，Runner 不转码、不剥除 CLIXML，日志 API 仍返回原始字节。若执行策略禁止加载本地脚本模块，可在 [config.py](<config.py>) 将 `PS_SUPPRESS_PROGRESS` 设为 `False`，跳过这两项启动设置，无需放宽系统策略。
 
 `id` 是从 `0` 开始的 36 进制小写字符串（`0`–`z`，随后是 `10` 等），在本次服务运行中不复用。服务重启后从头编号；跨轮保存或操作任务时，应同时核对 `/health` 的 `run_id`。
 
