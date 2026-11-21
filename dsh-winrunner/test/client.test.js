@@ -120,7 +120,8 @@ test('maps project, action and command endpoints, preserves task and HTTP error 
   const commandStart = await client.run('command', { op: 'start', mode: 'ps', command: "Write-Output 'hello'\n", wait_seconds: 2.5 })
   assert.equal(commandStart.id, 'id1')
   assert.equal(commandStart.outcome, 'pending')
-  assert.deepEqual(commandStart.next_get, { op: 'get', id: 'id1' })
+  assert.deepEqual(commandStart.next_wait, { op: 'wait', id: 'id1' })
+  assert(!Object.hasOwn(commandStart, 'next_get'))
   await client.run('command', { op: 'list' })
   const command = await client.run('command', { op: 'get', id: 'id1', stdout_offset: 0, encoding: 'base64' })
   assert.equal(command.stdout.data_base64, 'w6k=')
@@ -163,6 +164,8 @@ test('previews both logs, distinguishes live end from completion, and supports s
   assert.equal(preview.outcome, 'pending')
   assert.deepEqual(preview.stdout, { text: 'abc', next_offset: 3, remaining: 'available' })
   assert.deepEqual(preview.stderr, { text: '', next_offset: 0, remaining: 'caught_up' })
+  assert.deepEqual(preview.next_get, { op: 'get', id: 'id1', stdout_offset: 3, stderr_offset: 0, limit: 3 })
+  assert(!Object.hasOwn(preview, 'next_wait'))
   const only = await client.run('command', { ...args, status_only: true })
   assert.equal(only.outcome, 'pending')
   assert(!Object.hasOwn(only, 'stdout'))
@@ -173,6 +176,95 @@ test('previews both logs, distinguishes live end from completion, and supports s
   assert.deepEqual(tail.stdout, { data_base64: 'ZGVmZ2g=', next_offset: 8, remaining: 'complete' })
   assert(!Object.hasOwn(tail, 'stderr'))
   assert.deepEqual(queries, [{ stdout_offset: '0', stderr_offset: '0', limit: '3' }, {}, { stdout_offset: '3', limit: '4096' }])
+})
+
+test('start returns terminal logs and never replaces its result with a failed or mismatched follow-up', async t => {
+  const client = await fixture(t)
+  const seen = []
+  let followup = 'matching'
+  const action = { status: 'failed', phase: 'run', commit: 'abc1234', exit_code: 7, stdout_bytes: 2, stderr_bytes: 0 }
+  const base = await server(t, (req, res) => {
+    seen.push(req.method)
+    if (req.method === 'POST') { json(res, action); return }
+    if (followup === 'missing') { json(res, { error: { code: 'not_found' } }, 404); return }
+    json(res, { ...action, commit: followup === 'changed' ? 'def5678' : action.commit,
+      stdout: { data_base64: 'aGk=', next_offset: 2 }, stderr: { data_base64: '', next_offset: 0 } })
+  })
+  await client.configure(base)
+  const args = { op: 'start', name: 'demo', commit: 'abc1234', interpreter: 'python', script: 'script.py', wait_seconds: 5 }
+  const result = await client.run('action', args)
+  assert.equal(result.outcome, 'failed')
+  assert.equal(result.exit_code, 7)
+  assert.deepEqual(result.stdout, { text: 'hi', next_offset: 2, remaining: 'complete' })
+  assert(!Object.hasOwn(result, 'next_get'))
+  followup = 'changed'
+  const mismatch = await client.run('action', args)
+  assert.equal(mismatch.commit, action.commit)
+  assert.equal(mismatch.logs_error.code, 'task_changed')
+  assert(!Object.hasOwn(mismatch, 'stdout'))
+  assert(!Object.hasOwn(mismatch, 'next_get'))
+  followup = 'missing'
+  const missing = await client.run('action', args)
+  assert.equal(missing.outcome, 'failed')
+  assert.equal(missing.logs_error.http_status, 404)
+  const only = await client.run('action', { ...args, status_only: true })
+  assert.equal(only.outcome, 'failed')
+  assert(!Object.hasOwn(only, 'logs_error'))
+  assert.deepEqual(seen, ['POST', 'GET', 'POST', 'GET', 'POST', 'GET', 'POST'])
+})
+
+test('wait polls only with GET and stops on completion or its own deadline', async t => {
+  const client = await fixture(t)
+  let hits = 0
+  let complete = true
+  const methods = []
+  const base = await server(t, (req, res) => {
+    methods.push(req.method)
+    const status = complete && ++hits > 1 ? 'succeeded' : 'running'
+    json(res, { id: '0', status, stdout_bytes: 1, stderr_bytes: 0,
+      stdout: { data_base64: 'eA==', next_offset: 1 }, stderr: { data_base64: '', next_offset: 0 } })
+  })
+  await client.configure(base)
+  const args = { op: 'wait', id: '0', wait_seconds: 1.5 }
+  const done = await client.run('command', args)
+  assert.equal(done.outcome, 'succeeded')
+  assert.equal(done.stdout.text, 'x')
+  assert(!Object.hasOwn(done, 'next_wait'))
+  complete = false
+  const expired = await client.run('command', { ...args, wait_seconds: 1 })
+  assert.equal(expired.outcome, 'pending')
+  assert.equal(expired.wait_expired, true)
+  assert.deepEqual(expired.next_wait, { op: 'wait', id: '0', wait_seconds: 1, stdout_offset: 1, stderr_offset: 0 })
+  assert.equal((await client.run('command', { ...args, wait_seconds: 0 })).error.code, 'invalid_input')
+  assert(methods.length >= 3 && methods.every(method => method === 'GET'))
+})
+
+test('wait bounds an unresponsive request and can be cancelled without mutating the task', async t => {
+  const client = await fixture(t)
+  const methods = []
+  const base = await server(t, (req, _res) => { methods.push(req.method) })
+  await client.configure(base)
+  const args = { op: 'wait', id: '0', wait_seconds: 1 }
+  const expired = await client.run('command', args)
+  assert.equal(expired.error.code, 'wait_expired')
+  assert.deepEqual(expired.next_wait, args)
+  const cancelled = await client.run('command', { ...args, wait_seconds: 2 }, AbortSignal.timeout(100))
+  assert.equal(cancelled.error.code, 'cancelled')
+  assert(!Object.hasOwn(cancelled, 'next_wait'))
+  assert(methods.length >= 1 && methods.every(method => method === 'GET'))
+})
+
+test('wait stops before querying another endpoint if configuration changes mid-call', async t => {
+  const client = await fixture(t)
+  let otherHits = 0
+  const other = await server(t, (_req, res) => { otherHits++; json(res, { status: 'succeeded' }) })
+  const base = await server(t, (_req, res) => {
+    void client.configure(other).then(() => json(res, { status: 'running' }))
+  })
+  await client.configure(base)
+  const result = await client.run('command', { op: 'wait', id: '0', wait_seconds: 2, status_only: true })
+  assert.equal(result.error.code, 'runner_changed')
+  assert.equal(otherHits, 0)
 })
 
 test('uses a UTF-8 character boundary as the next log offset', async t => {

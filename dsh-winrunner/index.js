@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { ClientError, limits, requestRunner } from './client.js'
 
 export const inject = ['tools']
@@ -12,13 +13,13 @@ const integer = description => ({ type: 'integer', description })
 const choice = (description, choices) => ({ type: 'string', description, enum: choices })
 const name = string('项目注册名。')
 const id = string('start 返回的命令 ID。')
-const wait = { type: 'number', description: 'start：等远端回报结果的秒数（0–60，默认 0）。等满只返回当前状态，不会停止任务；用 get 继续查。' }
+const wait = { type: 'number', description: 'start：等待 0–60 秒，默认 0；wait：等待 1–60 秒，默认 15。结束就返回，等满也不会停止任务。' }
 const taskQuery = {
-  status_only: { type: 'boolean', description: 'get：只查状态。默认 false；不指定偏移时从头预览两路日志。' },
-  stdout_offset: integer('get：从此字节续读 stdout，使用上次 stdout.next_offset。指定任一偏移后，只读显式指定的流。'),
-  stderr_offset: integer('get：从此字节续读 stderr，使用上次 stderr.next_offset。'),
-  limit: integer(`get：每路最多读取的字节数；默认预览 2048，指定偏移时默认 4096，上限 ${limits.log}。`),
-  encoding: choice('get：日志默认 utf8；非 UTF-8 或需要无损时用 base64。', encodings),
+  status_only: { type: 'boolean', description: 'start、get、wait：只返回任务状态，不请求日志。默认 false。' },
+  stdout_offset: integer('get、wait：用 stdout.next_offset 续读。两个偏移都省略则预览两路；只传一路则只读那一路。'),
+  stderr_offset: integer('get、wait：用 stderr.next_offset 续读；只传这一路就只读 stderr。'),
+  limit: integer(`get、wait：每路最多读取的字节数；默认预览 2048，指定偏移默认 4096，上限 ${limits.log}。`),
+  encoding: choice('get、wait：默认 utf8；需要无损时用 base64。', encodings),
 }
 const groups = {
   project: {
@@ -35,8 +36,8 @@ const groups = {
     },
   },
   action: {
-    description: '提交、轮询或取消 WinRunner 项目的 Git Action。start 占槽后覆盖上一轮工作区和日志，忙时返回 409。pending 时用 get，不要重复 start。',
-    ops: ['start', 'get', 'cancel'],
+    description: '提交、轮询或取消 WinRunner 项目的 Git Action。长任务前用 winrunner_project 的 health 查一次。start 覆盖上轮工作区和日志，忙时返回 409；pending 时用 wait，不要重复 start。',
+    ops: ['start', 'get', 'wait', 'cancel'],
     properties: {
       name,
       commit: string('start 必填：远端可达的十六进制提交哈希或唯一前缀；优先传完整哈希。不接受分支或标签名。'),
@@ -48,8 +49,8 @@ const groups = {
     },
   },
   command: {
-    description: '提交、列出、轮询或删除 WinRunner 临时 Windows 命令。命令以远端 Runner 账号运行；pending 时按 id 查询；delete 终止并丢弃记录和日志。',
-    ops: ['start', 'get', 'list', 'delete'],
+    description: '提交、列出、轮询或删除 WinRunner 临时 Windows 命令。长任务前用 winrunner_project 的 health 查一次。pending 时按 id 等待；delete 终止并丢弃记录和日志。',
+    ops: ['start', 'get', 'wait', 'list', 'delete'],
     properties: {
       id,
       mode: choice('start 必填：优先用 ps（PowerShell）；仅在需要 CMD 语法时用 cmd。', modes),
@@ -89,16 +90,21 @@ const projectPath = value => {
 const request = (method, path, extra) => ({ method, path, ...extra })
 const queryPath = (path, query) => query.size ? `${path}?${query}` : path
 
-function postWait(args) {
-  const seconds = args.wait_seconds === undefined ? 0 : args.wait_seconds
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0 || seconds > 60) {
-    invalid('wait_seconds 必须是 0–60 之间的秒数。')
+function waitSeconds(args) {
+  const minimum = args.op === 'wait' ? 1 : 0
+  const seconds = args.wait_seconds === undefined ? (minimum ? 15 : 0) : args.wait_seconds
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < minimum || seconds > 60) {
+    invalid(`wait_seconds 必须是 ${minimum}–60 之间的秒数。`)
   }
   return seconds
 }
 
-function getTask(path, args) {
+function validateStatusOnly(args) {
   if (args.status_only !== undefined && typeof args.status_only !== 'boolean') invalid('status_only 必须是布尔值。')
+}
+
+function getTask(path, args) {
+  validateStatusOnly(args)
   if (args.status_only) {
     if (['stdout_offset', 'stderr_offset', 'limit', 'encoding'].some(key => args[key] !== undefined)) {
       invalid('status_only 为 true 时不要传日志参数。')
@@ -158,17 +164,18 @@ function forProject(args) {
 function forAction(args) {
   const path = `${projectPath(args.name)}/actions`
   if (args.op === 'start') {
-    select(args, ['name', 'commit', 'interpreter', 'script', 'args', 'wait_seconds'])
+    select(args, ['name', 'commit', 'interpreter', 'script', 'args', 'wait_seconds', 'status_only'])
+    validateStatusOnly(args)
     const commit = match(args.commit, hex, 'commit')
     const interpreter = text(args.interpreter, 'interpreter')
     const script = text(args.script, 'script')
     const argv = args.args === undefined ? [] : args.args
     if (!Array.isArray(argv) || !argv.every(clean)) invalid('args 必须是字符串数组。')
-    const timeout = postWait(args)
+    const timeout = waitSeconds(args)
     return request('POST', path, { body: { commit, interpreter, script, args: argv, timeout }, deadline: (timeout + 20) * 1000 })
   }
-  if (args.op === 'get') {
-    select(args, ['name', ...Object.keys(taskQuery)])
+  if (args.op === 'get' || args.op === 'wait') {
+    select(args, ['name', ...Object.keys(taskQuery), ...(args.op === 'wait' ? ['wait_seconds'] : [])])
     return getTask(path, args)
   }
   select(args, ['name'])
@@ -181,15 +188,16 @@ function forCommand(args) {
     return request('GET', '/commands')
   }
   if (args.op === 'start') {
-    select(args, ['mode', 'command', 'wait_seconds'])
+    select(args, ['mode', 'command', 'wait_seconds', 'status_only'])
+    validateStatusOnly(args)
     const mode = enumValue(args.mode, 'mode', modes)
     const command = text(args.command, 'command')
-    const timeout = postWait(args)
+    const timeout = waitSeconds(args)
     return request('POST', '/commands', { body: { mode, command, timeout }, deadline: (timeout + 20) * 1000 })
   }
   const path = `/commands/${encodeURIComponent(match(args.id, commandId, 'id'))}`
-  if (args.op === 'get') {
-    select(args, ['id', ...Object.keys(taskQuery)])
+  if (args.op === 'get' || args.op === 'wait') {
+    select(args, ['id', ...Object.keys(taskQuery), ...(args.op === 'wait' ? ['wait_seconds'] : [])])
     return getTask(path, args)
   }
   select(args, ['id'])
@@ -197,9 +205,103 @@ function forCommand(args) {
 }
 
 const builders = { project: forProject, action: forAction, command: forCommand }
-const readOnly = new Set(['health', 'list', 'get', 'files'])
+const readOnly = new Set(['health', 'list', 'get', 'wait', 'files'])
 const terminal = new Set(['succeeded', 'failed', 'cancelled'])
 const active = new Set(['preparing', 'running', 'cancelling'])
+const streams = ['stdout', 'stderr']
+const pollInterval = 1000
+const transientWaitErrors = new Set(['request_timeout', 'transport_error', 'wait_expired'])
+
+function taskTarget(group, args, body) {
+  if (group === 'action') return { name: args.name }
+  const command = args.id ?? body.id
+  return typeof command === 'string' && commandId.test(command) ? { id: command } : null
+}
+
+function taskHints(args, body, target, outcome) {
+  if (!target || ['task_changed', 'runner_changed'].includes(body.logs_error?.code)) return
+  if (body.logs_error || outcome === 'unknown') {
+    body.next_get = { op: 'get', ...target }
+    return
+  }
+  const pagination = {}
+  if (args.status_only) pagination.status_only = true
+  else {
+    for (const stream of streams) {
+      const chunk = body[stream]
+      if (chunk && chunk.remaining !== 'complete') pagination[`${stream}_offset`] = chunk.next_offset
+    }
+    for (const key of ['limit', 'encoding']) {
+      if (args[key] !== undefined) pagination[key] = args[key]
+    }
+  }
+  if (streams.some(stream => body[stream]?.remaining === 'available')) {
+    body.next_get = { op: 'get', ...target, ...pagination }
+  } else if (outcome === 'pending') {
+    body.next_wait = { op: 'wait', ...target, ...pagination }
+    if (args.op === 'wait' && args.wait_seconds !== undefined) body.next_wait.wait_seconds = args.wait_seconds
+  }
+}
+
+async function withStartLogs(group, args, response, signal, call) {
+  if (!response.ok || args.status_only || !terminal.has(response.status) ||
+      !(response.stdout_bytes > 0 || response.stderr_bytes > 0)) return response
+  const target = taskTarget(group, args, response)
+  if (!target) return { ...response, logs_error: { code: 'missing_task_id', message: '未收到命令 ID，无法查询日志。' } }
+  try {
+    const preview = builders[group]({ op: 'get', ...target })
+    const logged = await requestRunner({ ...preview, deadline: 4000 }, signal, call)
+    if (!logged.ok) {
+      return { ...response, logs_error: { ...logged.error, http_status: logged.http_status } }
+    }
+    const fields = ['status', 'phase', 'commit', 'id', 'exit_code', 'output_source', 'stdout_bytes', 'stderr_bytes']
+    if (fields.some(key => logged[key] !== response[key]) ||
+        logged.error?.code !== response.error?.code || logged.error?.message !== response.error?.message) {
+      throw new ClientError('task_changed', '补读时当前任务已不同，没有合并日志。')
+    }
+    if (streams.some(stream => !logged[stream])) throw new ClientError('invalid_response', 'WinRunner 未返回请求的两路日志。')
+    return { ...response, stdout: logged.stdout, stderr: logged.stderr }
+  } catch (error) {
+    if (!(error instanceof ClientError)) throw error
+    return { ...response, logs_error: errorDetails(error) }
+  }
+}
+
+async function waitForTask(spec, seconds, signal, call) {
+  const budget = AbortSignal.timeout(Math.ceil(seconds * 1000))
+  const polling = signal ? AbortSignal.any([signal, budget]) : budget
+  const interval = Math.min(pollInterval, seconds * 500)
+  let last
+  try {
+    while (!polling.aborted) {
+      const response = await requestRunner(spec, polling, call)
+      if (!response.ok) return response
+      if (last?.commit && response.commit !== last.commit) {
+        throw new ClientError('task_changed', '等待期间项目的当前提交变了；未把新一轮当作原任务。')
+      }
+      if (!active.has(response.status)) return response
+      last = response
+      await delay(interval, undefined, { signal: polling })
+    }
+  } catch (error) {
+    if (signal?.aborted) throw new ClientError('cancelled', '已取消本地等待；远端任务继续。')
+    if (!budget.aborted || !(error.name === 'AbortError' || error.code === 'cancelled')) {
+      if (last && transientWaitErrors.has(error.code)) return { ...last, wait_error: errorDetails(error) }
+      throw error
+    }
+  }
+  if (signal?.aborted) throw new ClientError('cancelled', '已取消本地等待；远端任务继续。')
+  if (!last) throw new ClientError('wait_expired', '等待期间没有取得任务状态；可以再查询，远端任务未被停止。')
+  return { ...last, wait_expired: true }
+}
+
+function errorDetails(error) {
+  return {
+    code: error.code,
+    message: error.message,
+    ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
+  }
+}
 
 function toolResult(group, args, response) {
   const { ok, outcome: _serverOutcome, ...body } = response
@@ -211,13 +313,10 @@ function toolResult(group, args, response) {
     }
     return { outcome: 'request_error', ...body }
   }
-  if (group === 'project' || !['start', 'get'].includes(args.op)) return { outcome: 'succeeded', ...body }
+  if (group === 'project' || !['start', 'get', 'wait'].includes(args.op)) return { outcome: 'succeeded', ...body }
 
   const outcome = terminal.has(body.status) ? body.status : active.has(body.status) ? 'pending' : 'unknown'
-  if (args.op === 'start' && (outcome === 'pending' || outcome === 'unknown' || body.stdout_bytes > 0 || body.stderr_bytes > 0)) {
-    if (group === 'action') body.next_get = { op: 'get', name: args.name }
-    else if (body.id) body.next_get = { op: 'get', id: body.id }
-  }
+  taskHints(args, body, taskTarget(group, args, body), outcome)
   return { outcome, ...body }
 }
 
@@ -242,7 +341,13 @@ function definition(group, { description, ops, properties }) {
       try {
         if (!args || typeof args !== 'object' || Array.isArray(args)) invalid('参数必须是对象。')
         enumValue(args.op, 'op', ops)
-        const response = await requestRunner(builders[group](args), exec?.signal)
+        const spec = builders[group](args)
+        const signal = exec?.signal
+        const call = {}
+        let response = args.op === 'wait'
+          ? await waitForTask(spec, waitSeconds(args), signal, call)
+          : await requestRunner(spec, signal, call)
+        if (args.op === 'start') response = await withStartLogs(group, args, response, signal, call)
         return toolResult(group, args, response)
       } catch (error) {
         if (!(error instanceof ClientError)) throw error
@@ -252,6 +357,7 @@ function definition(group, { description, ops, properties }) {
           ...(error.httpStatus === undefined ? {} : { http_status: error.httpStatus }),
           ...(error.retryAfter === undefined ? {} : { retry_after_seconds: error.retryAfter }),
           ...(error.outcomeUnknown ? { outcome_unknown: true } : {}),
+          ...(args?.op === 'wait' && transientWaitErrors.has(error.code) ? { next_wait: args } : {}),
         }
       }
     },

@@ -17,16 +17,19 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 | 工具 | `op` | 常用调用 |
 |---|---|---|
 | `winrunner_project` | `health`、`list`、`get`、`create`、`delete`、`files` | `{"op":"files","name":"demo","path":"result.txt"}` |
-| `winrunner_action` | `start`、`get`、`cancel` | `{"op":"start","name":"demo","commit":"abc1234","interpreter":"python","script":"task.py"}` |
-| `winrunner_command` | `start`、`list`、`get`、`delete` | `{"op":"start","mode":"ps","command":"Write-Output 'hello'"}` |
+| `winrunner_action` | `start`、`get`、`wait`、`cancel` | `{"op":"start","name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","wait_seconds":5}` |
+| `winrunner_command` | `start`、`list`、`get`、`wait`、`delete` | `{"op":"start","mode":"ps","command":"Write-Output 'hello'","wait_seconds":5}` |
 
-- `start` 的 `wait_seconds`（原工具参数 `timeout`；0–60，默认 0）只决定等待多久再返回当前状态，不是执行时限，也不会杀掉任务。收到 `outcome: "pending"` 后用返回的 `next_get` 查询，不要重复提交。要停止 Action 用 `cancel`，要停止临时命令并丢弃记录用 `delete`。
+- 短任务可以给 `start` 传 `wait_seconds: 5`。任务已结束且有输出时，客户端顺带读取两路短日志；如果补读失败，仍返回原任务结果，并单列 `logs_error`。`start` 默认不等（0 秒），最多等 60 秒；终态日志是额外的只读请求，最多再等 4 秒。
+- `pending` 时优先用返回的 `next_wait`，不要重复提交。`wait` 默认最多等 15 秒，可指定 1–60 秒。它把约每秒一次的查询合在一次工具调用里；等满还没结束时返回最后一次状态，标记 `wait_expired: true`。`start` 和 `wait` 的等待上限都不会停止远端任务。要停止 Action 用 `cancel`，要停止临时命令并丢弃记录用 `delete`。
 - 优先读 `outcome`：`succeeded` / `failed` / `cancelled` 是任务终态；`pending` 表示仍在准备、运行或取消；`request_error` 表示请求失败，`unknown` 表示没有可靠结论。`http_status` 只用于诊断。任务的 `status`、`phase`、`output_source` 和 `error` 仍保留；请求错误也保留服务端提供的 `action` 诊断。
-- `get` 不传偏移就从头预览两路日志（每路最多 2048 字节），不必先取状态再补日志。只看状态用 `status_only: true`。长日志用各路 `next_offset` 续读；指定任一偏移后，只取显式指定的流。每路的 `remaining` 表示 `available`（有更多已存字节）、`caught_up`（暂时追平，之后可能还有）或 `complete`（任务已结束且该路读完）。默认 UTF-8；跨页字符或非 UTF-8 输出可用 `encoding: "base64"` 保留原字节。
+- `get` / `wait` 不传偏移就从头预览两路日志（每路最多 2048 字节）。只看状态用 `status_only: true`。返回 `next_get` 时可直接用它续读；如果两路已暂时追平而任务仍在运行，返回的是 `next_wait`，不必反复读同一页。每路的 `remaining` 表示 `available`（有更多已存字节）、`caught_up`（暂时追平）或 `complete`（已读完）。默认 UTF-8；跨页字符或非 UTF-8 输出可用 `encoding: "base64"` 保留原字节。
 - 文件按 `next_offset` 续读，目录按 `next_entry_offset` 续读（`null` 为末页）。翻页不保证快照。目录分页在客户端进行，Runner 仍返回完整目录；JSON 响应超出 512 KiB 时，请改查更小的子目录。
 - `outcome_unknown: true` 表示写操作结果无法确认。超时或断线后，先在同一台 Runner 核对状态，不要盲目重试。Action 可以用项目名和计划提交哈希核对，但同一哈希的两次运行可能无法区分；命令提交响应里的 ID 丢失时，可以通过 `list` 查候选，但未必能唯一定位。
 
-例如 `winrunner_action` 的 `start` 返回 `{"outcome":"pending","status":"preparing","next_get":{"op":"get","name":"demo"}}` 时，直接用 `next_get`，取回当前状态和短日志。若脚本退出码非零，`outcome` 为 `failed`，即使 `http_status` 为 200。PowerShell 命令传原文，不用额外加一层引号或自行 Base64；CMD 语法与变量展开仍由 CMD 解释。
+长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 只按项目名查询当前轮次，日志读完前不要对同一项目再次 `start`。客户端补读时会拒绝明显不同的快照，但无法区分状态、提交和输出长度都相同的两次运行；不会在每次轮询时另外调用 `health`。
+
+例如 `start` 返回 `{"outcome":"pending","next_wait":{"op":"wait","name":"demo"}}`，直接用同一个工具执行 `next_wait`。脚本退出码非零时，`outcome` 为 `failed`，即使 `http_status` 为 200。PowerShell 命令传原文，不用额外加一层引号或自行 Base64；CMD 语法与变量展开仍由 CMD 解释。
 
 ## Git 复合操作
 

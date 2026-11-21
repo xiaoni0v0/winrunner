@@ -179,9 +179,13 @@ function projectResponse(body, spec) {
   return body
 }
 
-export async function requestRunner(spec, signal) {
+export async function requestRunner(spec, signal, call = {}) {
   if (signal?.aborted) throw new ClientError('cancelled', '本地请求已取消，尚未向 WinRunner 发起请求。')
-  const { origin, token } = await loadConfig() // Never reuse an endpoint or token across HTTP requests.
+  const { origin, token } = await loadConfig() // Read configuration for every HTTP request, including polls.
+  if (call.origin !== undefined && call.origin !== origin.origin) {
+    throw new ClientError('runner_changed', '等待期间 WinRunner 地址已改变；未向新地址查询旧任务。')
+  }
+  call.origin = origin.origin
   const stop = AbortSignal.timeout(spec.deadline ?? 20000)
   const active = signal ? AbortSignal.any([stop, signal]) : stop
   const url = new URL(spec.path, origin)
