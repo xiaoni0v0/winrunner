@@ -1,6 +1,7 @@
 """Start WinRunner with: python winrunner.py."""
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -11,12 +12,14 @@ import textwrap
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socket import SHUT_RDWR
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 from typing import cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
@@ -175,6 +178,77 @@ def range_bounds(header, size):
     raise APIError(416, "range_not_satisfiable", "Expected one satisfiable byte range")
 
 
+@dataclass
+class StartRecord:
+    fingerprint: bytes
+    response: tuple[int, dict] | None = None
+
+
+class StartReplay:
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.records: dict[tuple[str, str], StartRecord] = {}
+
+    def submit(
+        self,
+        scope: str,
+        key: str,
+        raw: bytes,
+        start: Callable[[], tuple[int, dict]],
+        *,
+        log_errors: bool,
+    ) -> tuple[int, dict]:
+        try:
+            canonical = json.dumps(
+                json.loads(raw.decode("utf-8")), sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+            fingerprint = hashlib.sha256(b"json\0" + canonical).digest()
+        except (ValueError, RecursionError):
+            fingerprint = hashlib.sha256(b"raw\0" + raw).digest()
+        slot = (scope, key)
+        with self.lock:
+            record = self.records.get(slot)
+            if record is not None:
+                if record.fingerprint != fingerprint:
+                    raise APIError(
+                        409,
+                        "idempotency_conflict",
+                        "Key already used with different parameters",
+                    )
+                if record.response is None:
+                    raise APIError(
+                        409,
+                        "idempotency_pending",
+                        "Original submit is still processing; retry the same key",
+                    )
+                return record.response
+            if len(self.records) >= 4096:
+                raise APIError(
+                    503,
+                    "idempotency_capacity",
+                    "Idempotency cache is full for this Runner run",
+                )
+            record = self.records[slot] = StartRecord(fingerprint)
+        response = (
+            500,
+            {"error": {"code": "internal_error", "message": "Internal runner error"}},
+        )
+        try:
+            response = start()
+        except APIError as exc:
+            response = (exc.status, exc.response_payload())
+        except Exception:
+            # The task may have started before this failure. Give the original
+            # caller and replays the same generic 500, without starting again.
+            if log_errors:
+                LOG.exception("Start failed: %s", scope.split(":", 1)[0])
+        finally:
+            # Record the result before the caller attempts the HTTP write.
+            with self.lock:
+                record.response = response
+        return response
+
+
 class HTTPServer(ThreadingHTTPServer):
     token: bytes
     runner: Runner
@@ -185,6 +259,7 @@ class HTTPServer(ThreadingHTTPServer):
         if type(limit) is not int or limit < 1:
             raise ValueError("MAX_HTTP_CONNECTIONS must be a positive integer")
         self.connections = BoundedSemaphore(limit)
+        self.start_replay = StartReplay()
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
@@ -511,6 +586,24 @@ class HTTPHandler(BaseHTTPRequestHandler):
             runner.delete_project(name)
             self.reply(204)
 
+    def submit_start(
+        self, scope: str, raw: bytes, start: Callable[[], tuple[int, dict]]
+    ) -> tuple[int, dict]:
+        keys = self.headers.get_all("Idempotency-Key", [])
+        if not keys:
+            return start()
+        if len(keys) != 1 or not re.fullmatch(r"[A-Za-z0-9._~-]{1,128}", keys[0]):
+            raise invalid(
+                "Idempotency-Key must be a single 1–128 character URL-safe value"
+            )
+        return self.server.start_replay.submit(
+            scope,
+            keys[0],
+            raw,
+            start,
+            log_errors=self.server.should_log_request(self.client_address),
+        )
+
     def action(self, method, name, query):
         runner = self.server.runner
         if method == "GET":
@@ -520,14 +613,20 @@ class HTTPHandler(BaseHTTPRequestHandler):
             raw = self.raw_body()
             accepted_at = time.monotonic()
             self.note_body(raw, "commit", "interpreter", "script", "timeout")
-            self.reply(*runner.start_action(name, raw, accepted_at))
+            self.reply(
+                *self.submit_start(
+                    f"action:{name.lower()}",
+                    raw,
+                    lambda: runner.start_action(name, raw, accepted_at),
+                )
+            )
         else:
             self.no_query(query)
             runner.cancel_action(name)
             self.reply(204)
 
     def project_files(self, _method, name, query):
-        if query.keys() - {"path"}:
+        if query.keys() - {"path", "entry_offset", "entry_limit"}:
             raise invalid("Unexpected query parameter")
         relative = query.get("path", "")
         self.note("path", relative or ".")
@@ -535,7 +634,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
             with self.server.runner.file_entry(
                 name, relative, cancel_read=self.abort_file_response
             ) as entry:
-                self.files(entry, relative)
+                self.files(entry, relative, query)
         except OSError as exc:
             if not self.response_started and getattr(exc, "winerror", None) in (32, 33):
                 raise APIError(409, "file_busy", "File or directory is in use") from exc
@@ -557,7 +656,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
             raw = self.raw_body()
             accepted_at = time.monotonic()
             self.note_body(raw, "mode", "timeout")
-            status, result = runner.start_command(raw, accepted_at)
+            status, result = self.submit_start(
+                "command", raw, lambda: runner.start_command(raw, accepted_at)
+            )
             self.note("id", result.get("id"))
             if len(raw) > 16 * 1024:
                 self.note("mode", result.get("mode"))
@@ -594,22 +695,61 @@ class HTTPHandler(BaseHTTPRequestHandler):
             {"Allow": allow},
         )
 
-    def files(self, entry, relative):
-        if entry.is_dir:
-            items = sorted(
-                entry.list_entries(), key=lambda item: item["name"].casefold()
-            )
-            self.reply(
-                200,
-                {
-                    "path": (
-                        "" if relative in ("", ".") else relative.replace("\\", "/")
-                    ),
-                    "entries": items,
-                },
-            )
-        else:
+    def files(self, entry, relative, query):
+        paged = "entry_offset" in query or "entry_limit" in query
+        if not entry.is_dir:
+            if paged:
+                raise invalid("entry_offset and entry_limit are only for directories")
             self.download(entry)
+            return
+
+        if paged:
+            offset = uint(query.get("entry_offset", "0"), "entry_offset")
+            limit = uint(query.get("entry_limit", "100"), "entry_limit")
+            if not 1 <= limit <= 1000:
+                raise invalid("entry_limit must be between 1 and 1000")
+
+        items = sorted(
+            entry.list_entries(),
+            key=lambda item: (item["name"].casefold(), item["name"]),
+        )
+        result = {
+            "path": "" if relative in ("", ".") else relative.replace("\\", "/"),
+            "entries": items,
+        }
+        if paged:
+            page: list[dict] = []
+            result["entries"] = page
+            result["next_entry_offset"] = None
+            # Match reply() so escaping, commas, and the cursor count on the wire.
+            body_limit = 512 * 1024
+            body_bytes = len(
+                json.dumps(result, separators=(",", ":"), ensure_ascii=True)
+            )
+            if body_bytes > body_limit:
+                raise APIError(
+                    413,
+                    "response_too_large",
+                    "Directory path exceeds the page size limit",
+                )
+            for index, item in enumerate(items[offset : offset + limit], offset + 1):
+                item_bytes = len(
+                    json.dumps(item, separators=(",", ":"), ensure_ascii=True)
+                ) + (1 if page else 0)
+                cursor = index if index < len(items) else None
+                cursor_delta = len(json.dumps(cursor)) - len("null")
+                if body_bytes + item_bytes + cursor_delta > body_limit:
+                    if not page:
+                        raise APIError(
+                            413,
+                            "response_too_large",
+                            "Directory entry exceeds the page size limit",
+                        )
+                    break
+                page.append(item)
+                body_bytes += item_bytes
+                result["next_entry_offset"] = cursor
+        self.reply(200, result)
 
     def download(self, entry):
         with entry.open_file() as file:

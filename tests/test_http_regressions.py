@@ -75,16 +75,76 @@ class HTTPRegressionTests(unittest.TestCase):
     def connect(self):
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
 
-    def request(self, method, path, *, auth=True):
+    def request(self, method, path, *, auth=True, payload=None, key=None):
         conn = self.connect()
         try:
             headers = {"Authorization": "Bearer " + TOKEN} if auth else {}
-            conn.request(method, path, headers=headers)
+            if key is not None:
+                headers["Idempotency-Key"] = key
+            conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
             body = response.read()
             return response.status, json.loads(body) if body else body, response.headers
         finally:
             conn.close()
+
+    def test_start_replay_scopes_keys_and_returns_original_response(self):
+        self.start_server()
+        self.runner.start_command.side_effect = [(202, {"id": "0"}), (200, {"id": "1"})]
+        self.runner.start_action.return_value = (202, {"status": "preparing"})
+
+        def post(path, payload, key="one"):
+            status, body, _ = self.request("POST", path, payload=payload, key=key)
+            return status, body
+
+        payload = b'{"mode":"cmd","command":"echo test"}'
+        self.assertEqual(post("/commands", payload), (202, {"id": "0"}))
+        self.assertEqual(
+            post("/commands", b'{"command":"echo test", "mode":"cmd"}'),
+            (202, {"id": "0"}),
+        )
+        status, body = post("/commands", b'{"mode":"cmd","command":"echo other"}')
+        self.assertEqual((status, body["error"]["code"]), (409, "idempotency_conflict"))
+        self.assertEqual(post("/commands", payload, "two"), (200, {"id": "1"}))
+        self.assertEqual(self.runner.start_command.call_count, 2)
+
+        original = post("/projects/Demo/actions", b"{}")
+        self.assertEqual(original, (202, {"status": "preparing"}))
+        self.assertEqual(post("/projects/demo/actions", b"{}"), original)
+        self.assertEqual(post("/projects/Other/actions", b"{}"), original)
+        self.assertEqual(self.runner.start_action.call_count, 2)
+
+    def test_concurrent_start_replay_never_submits_twice(self):
+        self.start_server()
+        entered, release = threading.Event(), threading.Event()
+        first = []
+
+        def start(*args):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test timed out")
+            return 202, {"id": "0"}
+
+        self.runner.start_command.side_effect = start
+
+        def submit():
+            return self.request("POST", "/commands", payload=b"{}", key="one")[:2]
+
+        worker = threading.Thread(target=lambda: first.append(submit()))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            status, body = submit()
+            self.assertEqual(
+                (status, body["error"]["code"]), (409, "idempotency_pending")
+            )
+        finally:
+            release.set()
+            worker.join(4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(first, [(202, {"id": "0"})])
+        self.assertEqual(submit(), first[0])
+        self.runner.start_command.assert_called_once()
 
     def test_integrated_window_reads_state_while_http_serves_and_stops_on_return(self):
         with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
