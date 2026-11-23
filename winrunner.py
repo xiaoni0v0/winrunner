@@ -542,6 +542,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def route(self, method, parts, raw_query):
         key = (parts[0], None, *parts[2:]) if len(parts) > 1 else tuple(parts)
+        if len(parts) == 4:
+            # Project command items have a second variable path segment.
+            key = (*key[:3], None)
         route = self.routes.get(key)
         if route is None:
             self.operation = "unknown route"
@@ -557,11 +560,14 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.operation = f"{method} {route_name}"
         name = parts[1] if len(parts) > 1 else None
         self.note("project" if parts[0] == "projects" else "id", name)
+        extra = parts[3:]
+        if extra:
+            self.note("id", extra[0])
         query = self.parse_query(raw_query)
         for field in ("stdout_offset", "stderr_offset", "limit"):
             if field in query and DECIMAL.fullmatch(query[field]):
                 self.note(field, query[field])
-        handler(self, method, name, query)
+        handler(self, method, name, query, *extra)
 
     def get_health(self, _method, _name, query):
         self.no_query(query)
@@ -647,38 +653,51 @@ class HTTPHandler(BaseHTTPRequestHandler):
         except OSError:
             pass  # The client may have already disconnected.
 
-    def commands(self, method, _name, query):
+    def commands(self, method, name, query):
         self.no_query(query)
         runner = self.server.runner
         if method == "GET":
-            self.reply(200, {"commands": runner.list_commands()})
+            self.reply(200, {"commands": runner.list_commands(name=name)})
         else:
             raw = self.raw_body()
             accepted_at = time.monotonic()
             self.note_body(raw, "mode", "timeout")
-            status, result = self.submit_start(
-                "command", raw, lambda: runner.start_command(raw, accepted_at)
-            )
+            if name is None:
+                scope = "command"
+                start = lambda: runner.start_command(raw, accepted_at)
+            else:
+                project = runner.command_project(name)
+                scope = project.command_scope
+                start = lambda: runner.start_command(raw, accepted_at, project=project)
+            status, result = self.submit_start(scope, raw, start)
             self.note("id", result.get("id"))
             if len(raw) > 16 * 1024:
                 self.note("mode", result.get("mode"))
             self.reply(status, result)
 
-    def command_task(self, method, name, query):
+    def command_task(self, method, name, query, command_id=None):
+        if command_id is None:
+            command_id, name = name, None
         runner = self.server.runner
         if method == "GET":
-            self.reply(200, runner.get_command(name, *log_params(query)))
+            self.reply(
+                200, runner.get_command(command_id, *log_params(query), name=name)
+            )
         else:
             self.no_query(query)
-            runner.delete_command(name)
+            runner.delete_command(command_id, name=name)
             self.reply(204)
 
-    routes = {
+    routes: dict[
+        tuple[str | None, ...], tuple[tuple[str, ...], Callable[..., None]]
+    ] = {
         ("health",): (("GET",), get_health),
         ("projects",): (("GET", "POST"), projects),
         ("projects", None): (("GET", "DELETE"), project),
         ("projects", None, "actions"): (("GET", "POST", "DELETE"), action),
         ("projects", None, "files"): (("GET",), project_files),
+        ("projects", None, "commands"): (("GET", "POST"), commands),
+        ("projects", None, "commands", None): (("GET", "DELETE"), command_task),
         ("commands",): (("GET", "POST"), commands),
         ("commands", None): (("GET", "DELETE"), command_task),
     }

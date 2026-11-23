@@ -388,9 +388,17 @@ class Project:
         self.cloned = threading.Event()
         self.create_failed = False
         self.task = None
+        self.commands: dict[str, Task] = {}
+        self.command_scope = f"project_command:{secrets.token_hex(16)}"
         self.visible = False
         self.readers = {}
         self.delete_in_progress = False
+
+    def tasks(self) -> list[Task]:
+        tasks = list(self.commands.values())
+        if self.task is not None:
+            tasks.append(self.task)
+        return tasks
 
     def snapshot(self):
         if self.lifecycle is not None:
@@ -413,7 +421,9 @@ class Runner:
         self.projects: dict[str, Project] = {}
         self.commands: dict[str, Task] = {}
         self.pending_cleanup: dict[str, tuple[Path, ...]] = {}
-        self.next_command_number = 0
+        # Keep issuing new IDs for the same name even after project deletion.
+        # None is the independent global command namespace.
+        self.next_command_numbers: dict[str | None, int] = {}
         self.started_at = time.monotonic()
         self.run_id = secrets.token_hex(16)
         self.base = Path(data_dir).resolve()
@@ -450,11 +460,19 @@ class Runner:
             raise not_found("Project not found")
         return project
 
-    def _command(self, command_id):
-        task = self.commands.get(command_id)
+    @staticmethod
+    def _command(commands, command_id):
+        task = commands.get(command_id)
         if task is None:
             raise not_found("Command not found")
         return task
+
+    def _commands(self, name):
+        return self.commands if name is None else self._project(name).commands
+
+    def command_project(self, name) -> Project:
+        with self.lock:
+            return self._project(name)
 
     def _repo(self, project, job):
         return Repository(project.cache, project.worktree, project.url, job, self.base)
@@ -512,6 +530,18 @@ class Runner:
             if not success:
                 with self.lock:
                     project.create_failed = True
+                    tasks = project.tasks()
+                # Stop commands accepted during cloning before rolling back the
+                # worktree or releasing its name, even if a cancellation fails.
+                for task in tasks:
+                    try:
+                        self._cancel_task(task)
+                    except Exception:
+                        LOG.exception(
+                            "Could not cancel a task during rollback for %s", name
+                        )
+                for task in tasks:
+                    task.done.wait()
             try:
                 project.clone_job.close()
             except Exception:
@@ -540,7 +570,7 @@ class Runner:
             project.delete_in_progress = True
             project.lifecycle = "deleting"
             project.visible = False
-            task = project.task
+            tasks = project.tasks()
         deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
         success = False
         key = project.name.lower()
@@ -548,12 +578,10 @@ class Runner:
             self._interrupt_readers(project)
             if not project.cloned.is_set():
                 project.clone_job.cancel()
-            if task is not None:
+            for task in tasks:
                 self._cancel_task(task)
-            for event in (project.cloned, task.done if task is not None else None):
-                if event is not None and not event.wait(
-                    max(0, deadline - time.monotonic())
-                ):
+            for event in (project.cloned, *(task.done for task in tasks)):
+                if not event.wait(max(0, deadline - time.monotonic())):
                     raise APIError(
                         409, "project_busy", "Project is still stopping; retry DELETE"
                     )
@@ -820,16 +848,27 @@ class Runner:
         self._cancel_task(task)
         task.done.wait()
 
-    def start_command(self, raw, accepted_at):
+    def start_command(self, raw, accepted_at, *, project: Project | None = None):
         mode, command, timeout = command_body(raw)
         with self.lock:
             self._available()
-            command_id = short_command_id(self.next_command_number)
-            self.next_command_number += 1
+            if project is None:
+                key, commands, cwd = None, self.commands, None
+            else:
+                key = project.name.lower()
+                # A submit bound to a project instance must not run in its replacement.
+                if self._project(key) is not project:
+                    raise not_found("Project not found")
+                if project.delete_in_progress:
+                    raise conflict("Project deletion is already in progress")
+                commands, cwd = project.commands, project.worktree
+            number = self.next_command_numbers.get(key, 0)
+            command_id = short_command_id(number)
+            self.next_command_numbers[key] = number + 1
             task = Task("launch", command_id=command_id, mode=mode)
-            self.commands[command_id] = task
+            commands[command_id] = task
         try:
-            self._start_thread(self._run_command, task, command)
+            self._start_thread(self._run_command, task, command, cwd)
         except Exception as exc:
             error = APIError(500, "worker_unavailable", "Could not start worker thread")
             task.finish(
@@ -839,7 +878,7 @@ class Runner:
         return task.response(timeout, accepted_at)
 
     @staticmethod
-    def _run_command(task, command):
+    def _run_command(task, command, cwd):
         result = {}
         try:
             if task.mode == "ps":
@@ -861,7 +900,9 @@ class Runner:
                     + command
                     + '"'
                 )
-            result["exit_code"] = task.run(argv, executable=executable, cwd=Path.home())
+            result["exit_code"] = task.run(
+                argv, executable=executable, cwd=Path.home() if cwd is None else cwd
+            )
         except JobCancelled as exc:
             result["exit_code"] = exc.exit_code
         except Exception as exc:
@@ -877,18 +918,21 @@ class Runner:
         finally:
             task.finish(**result)
 
-    def list_commands(self):
+    def list_commands(self, *, name=None):
         with self.lock:
-            return [task.snapshot() for task in self.commands.values()]
+            return [task.snapshot() for task in self._commands(name).values()]
 
-    def get_command(self, command_id, offsets=None, limit=65536):
+    def get_command(self, command_id, offsets=None, limit=65536, *, name=None):
         with self.lock:
-            return self._command(command_id).snapshot(offsets, limit)
+            return self._command(self._commands(name), command_id).snapshot(
+                offsets, limit
+            )
 
-    def delete_command(self, command_id):
+    def delete_command(self, command_id, *, name=None):
         with self.lock:
             self._available()
-            task = self._command(command_id)
+            commands = self._commands(name)
+            task = self._command(commands, command_id)
             if task.deleting:
                 raise conflict("Command deletion is already in progress")
             task.deleting = True
@@ -900,15 +944,15 @@ class Runner:
                 task.deleting = False
             raise
         with self.lock:
-            self.commands.pop(command_id, None)
+            commands.pop(command_id, None)
 
     def close(self):
         with self.lock:
             self.closing = True
             projects = list(self.projects.values())
-            tasks = list(self.commands.values()) + [
-                p.task for p in projects if p.task is not None
-            ]
+            tasks = list(self.commands.values())
+            for project in projects:
+                tasks.extend(project.tasks())
         try:
             for project in projects:
                 if not project.cloned.is_set():

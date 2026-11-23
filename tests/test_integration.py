@@ -758,6 +758,135 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertFalse(list(self.data.rglob("read me.txt")))
         self.register()
 
+    def test_project_commands_isolate_ids_replays_and_logs(self):
+        project = self.register()
+        commands = project + "/commands"
+        other = self.register("Other") + "/commands"
+        key = {"Idempotency-Key": "same-key"}
+        payload = {
+            "mode": "ps",
+            "command": "Write-Output (Get-Location).Path",
+            "timeout": 10,
+        }
+        self.call(404, "POST", "/projects/missing/commands", payload, headers=key)
+        self.call(404, "GET", "/projects/missing/commands")
+        self.assertEqual(self.call(200, "GET", commands), {"commands": []})
+        self.call(400, "POST", commands, {"mode": "unknown", "command": "cd"})
+
+        first = self.call(200, "POST", commands, payload, headers=key)
+        self.assertEqual(first["id"], "0")
+        self.assertEqual(
+            self.call(200, "POST", commands.lower(), payload, headers=key), first
+        )
+        global_task = self.call(200, "POST", "/commands", payload, headers=key)
+        other_task = self.call(200, "POST", other, payload, headers=key)
+        self.assertEqual((global_task["id"], other_task["id"]), ("0", "0"))
+        for endpoint, cwd in (
+            (commands + "/0", self.data / "projects" / "Fixture"),
+            (other + "/0", self.data / "projects" / "Other"),
+            ("/commands/0", Path.home()),
+        ):
+            self.assertEqual(
+                log_bytes(self.finished(endpoint), "stdout").decode().strip().lower(),
+                str(cwd).lower(),
+            )
+        self.call(204, "DELETE", commands + "/0")
+        self.call(404, "GET", commands + "/0")
+        self.assertEqual(self.call(200, "POST", commands, payload, headers=key), first)
+        self.call(200, "GET", other + "/0")
+        self.call(200, "GET", "/commands/0")
+
+        self.call(204, "DELETE", project)
+        self.call(404, "GET", commands)
+        rebuilt = self.register("fIXTURE") + "/commands"
+        self.assertEqual(self.call(200, "GET", rebuilt), {"commands": []})
+        second = self.call(200, "POST", rebuilt, payload, headers=key)
+        self.assertEqual(second["id"], "1")
+        self.call(404, "DELETE", rebuilt + "/0")
+        self.call(200, "GET", rebuilt + "/1")
+
+    def test_project_commands_share_worktree_and_can_run_alongside_action(self):
+        project = self.register()
+        commands = project + "/commands"
+        action = project + "/actions"
+        self.action(project)
+        self.poll(action, lambda task: task["stdout_bytes"] > 0)
+        gate = self.work / "release-command"
+        first = self.call(
+            202,
+            "POST",
+            commands,
+            {"mode": "ps", "command": self.gated_ps(gate), "timeout": 0},
+        )
+        first_url = commands + "/" + first["id"]
+        self.poll(first_url, lambda task: task["stdout_bytes"] == 4)
+
+        second = self.call(
+            200,
+            "POST",
+            commands,
+            {
+                "mode": "cmd",
+                "command": 'type "action output.txt" & echo kept>"cmd output.txt"',
+            },
+        )
+        second_url = commands + "/" + second["id"]
+        self.assertEqual(log_bytes(self.finished(second_url), "stdout"), b"new data")
+        file_url = project + "/files?" + urlencode({"path": "cmd output.txt"})
+        self.assertEqual(self.call(200, "GET", file_url).strip(), b"kept")
+        listed = self.call(200, "GET", commands)["commands"]
+        self.assertEqual(
+            [(item["id"], item["status"]) for item in listed],
+            [(first["id"], "running"), (second["id"], "succeeded")],
+        )
+        self.assertTrue(
+            all("stdout" not in item and "stderr" not in item for item in listed)
+        )
+        self.assertEqual(self.call(200, "GET", action)["status"], "running")
+        gate.touch()
+        finished = self.finished(first_url)
+        self.assertEqual(log_bytes(finished, "stdout"), b"out|done")
+        self.assertEqual(log_bytes(finished, "stderr"), b"err!")
+        self.call(204, "DELETE", action)
+        self.action(project, commit="0123456789012345678901234567890123456789")
+        self.finished(action, expected="failed")
+        self.call(404, "GET", file_url)
+        self.assertEqual(log_bytes(self.finished(first_url), "stdout"), b"out|done")
+        self.assertEqual(log_bytes(self.finished(second_url), "stdout"), b"new data")
+        failed = self.call(200, "POST", commands, {"mode": "cmd", "command": "cd"})
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error"]["code"], "launch_failed")
+        self.assertTrue(
+            log_bytes(
+                self.finished(commands + "/" + failed["id"], expected="failed"),
+                "stderr",
+            )
+        )
+
+    def test_deleting_project_command_or_project_terminates_only_its_trees(self):
+        project = self.register()
+        commands = project + "/commands"
+        tree = {
+            "mode": "cmd",
+            "command": f'"{sys.executable}" -u tree.py',
+            "timeout": 0,
+        }
+        first = self.call(202, "POST", commands, tree)
+        second = self.call(202, "POST", commands, tree)
+        first_url = commands + "/" + first["id"]
+        second_url = commands + "/" + second["id"]
+        with (
+            self.live_tree(first_url) as first_stopped,
+            self.live_tree(second_url) as second_stopped,
+        ):
+            self.call(204, "DELETE", first_url)
+            first_stopped()
+            self.call(404, "GET", first_url)
+            self.assertEqual(self.call(200, "GET", second_url)["status"], "running")
+            self.call(204, "DELETE", project)
+            second_stopped()
+        self.call(404, "GET", second_url)
+
     def test_action_conflict_cancel_preserves_logs_and_invalid_request_replaces_round(
         self,
     ):

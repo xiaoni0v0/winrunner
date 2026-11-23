@@ -304,6 +304,84 @@ class RunnerRegressions(unittest.TestCase):
         self.assert_api_error(404, "not_found", self.model.get_project, project.name)
         self.assertFalse(project.worktree.exists())
 
+    def test_project_commands_reject_submits_only_during_active_deletion(self):
+        project = self.create()
+        entered, release = threading.Event(), threading.Event()
+
+        def block_cleanup(paths):
+            entered.set()
+            self.assertTrue(release.wait(2 * WAIT), "test never released deletion")
+            return {project.worktree: PermissionError("open worktree handle")}
+
+        def start_command():
+            return self.model.start_command(COMMAND, time.monotonic(), project=project)
+
+        with patch.object(runner, "_clean_paths", side_effect=block_cleanup):
+            deletion = self.background(self.model.delete_project, project.name)
+            try:
+                self.assertTrue(entered.wait(WAIT), "deletion never started cleanup")
+                self.assert_api_error(409, "conflict", start_command)
+                self.assertEqual(self.model.list_commands(name=project.name), [])
+            finally:
+                release.set()
+            self.assert_api_error(
+                409, "project_cleanup_blocked", deletion.result, timeout=WAIT
+            )
+
+        self.assertEqual(
+            self.model.get_project(project.name)["status"], "delete_failed"
+        )
+        status, result = start_command()
+        self.assertEqual(
+            (status, result["id"], result["status"]), (200, "0", "succeeded")
+        )
+        self.model.delete_project(project.name)
+        self.create(project.name)
+        self.assert_api_error(404, "not_found", start_command)
+
+    def test_failed_clone_cancels_project_commands_before_rollback(self):
+        cloning, fail_clone = threading.Event(), threading.Event()
+        running, cancelled = threading.Event(), threading.Event()
+
+        def clone(repo):
+            repo.cache.mkdir()
+            repo.worktree.mkdir()
+            cloning.set()
+            self.assertTrue(fail_clone.wait(2 * WAIT), "test never released clone")
+            raise runner.GitFailure("clone failed")
+
+        def process(*args, on_started, cwd, **kwargs):
+            on_started()
+            running.set()
+            self.assertTrue(cancelled.wait(2 * WAIT), "rollback did not stop command")
+            self.assertTrue(cwd.is_dir(), "rollback removed the worktree too early")
+            raise runner.JobCancelled(exit_code=23)
+
+        self.job.run.side_effect = process
+        self.job.cancel.side_effect = cancelled.set
+        with patch.object(LocalRepository, "create", clone):
+            creation = self.background(self.create)
+            try:
+                self.assertTrue(cloning.wait(WAIT), "clone never started")
+                project = self.model.command_project("sample")
+                status, command = self.model.start_command(
+                    COMMAND.replace(b'"timeout":30', b'"timeout":0'),
+                    time.monotonic(),
+                    project=project,
+                )
+                self.assertEqual((status, command["id"]), (202, "0"))
+                self.assertTrue(running.wait(WAIT), "project command never started")
+            finally:
+                fail_clone.set()
+            self.assert_api_error(
+                502, "git_clone_failed", creation.result, timeout=WAIT
+            )
+
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(project.commands["0"].snapshot()["exit_code"], 23)
+        self.assertFalse(project.worktree.exists())
+        self.assert_api_error(404, "not_found", self.model.list_commands, name="sample")
+
     def test_cancelled_command_reports_reaped_exit_code(self):
         # #06: DELETE cancels while the caller is still waiting for the command result.
         running, release = threading.Event(), threading.Event()
