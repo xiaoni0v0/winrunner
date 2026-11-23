@@ -38,9 +38,9 @@ const groups = {
     params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。${taskOptions}${startKeyHelp}`,
   },
   command: {
-    description: `提交、列出、查询或删除临时 Windows 命令。delete 终止命令并丢弃记录和日志。${taskFlow}`,
+    description: `运行和管理项目内或全局的 Windows 命令。项目命令从当前工作树启动，不重置目录或覆盖旧日志，可与 Action 并行；调用端负责协调共享文件。delete 终止命令并删除记录和日志。${taskFlow}`,
     ops: ['start', 'get', 'wait', 'list', 'delete'],
-    params: `list：空字符串或 {}。start：{"mode":"ps","command":"Write-Output 'hello'","wait_seconds":5}。优先 ps，需 CMD 语法用 cmd；命令不加 shell 包裹、不做 Base64，在 JSON 字符串中正常转义。完整多行调用：${exampleCall('start', { mode: 'ps', command: "Write-Output '第一行'\nWrite-Output '第二行'" })}。get/wait/delete：{"id":"0"}，用 start 返回的 ID。${taskOptions}${startKeyHelp}`,
+    params: `所有操作都可传 name 选择项目，省略则用全局集合，从 Runner 用户目录启动。list：{"name":"demo"} 或 {}（全局）。start：{"name":"demo","mode":"ps","command":"Write-Output 'hello'","wait_seconds":5}。mode 用 ps 或 cmd，直接传命令原文，多行 PowerShell 用 JSON 转义换行。get/wait/delete：{"name":"demo","id":"0"}，用 start 返回的 ID 和同一作用域；各集合的 ID 可重复。${taskOptions}${startKeyHelp}项目删后重建时，不用旧键恢复提交。`,
   },
 }
 
@@ -191,24 +191,25 @@ function forAction(args) {
 }
 
 function forCommand(args) {
+  const collection = args.name === undefined ? '/commands' : `${projectPath(args.name)}/commands`
   if (args.op === 'list') {
-    select(args, [])
-    return request('GET', '/commands')
+    select(args, ['name'])
+    return request('GET', collection)
   }
   if (args.op === 'start') {
-    select(args, ['mode', 'command', 'wait_seconds', 'status_only', 'idempotency_key'])
+    select(args, ['name', 'mode', 'command', 'wait_seconds', 'status_only', 'idempotency_key'])
     validateStatusOnly(args)
     const mode = enumValue(args.mode, 'mode', modes)
     const command = text(args.command, 'command')
     const timeout = waitSeconds(args)
-    return request('POST', '/commands', { body: { mode, command, timeout }, ...startOptions(args, timeout) })
+    return request('POST', collection, { body: { mode, command, timeout }, ...startOptions(args, timeout) })
   }
-  const path = `/commands/${encodeURIComponent(match(args.id, commandId, 'id'))}`
+  const path = `${collection}/${encodeURIComponent(match(args.id, commandId, 'id'))}`
   if (args.op === 'get' || args.op === 'wait') {
-    select(args, ['id', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
+    select(args, ['name', 'id', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
     return getTask(path, args)
   }
-  select(args, ['id'])
+  select(args, ['name', 'id'])
   return request('DELETE', path, { deadline: 30000 })
 }
 
@@ -223,7 +224,8 @@ const transientWaitErrors = new Set(['request_timeout', 'transport_error', 'wait
 function taskTarget(group, args, body) {
   if (group === 'action') return { name: args.name }
   const command = args.id ?? body.id
-  return typeof command === 'string' && commandId.test(command) ? { id: command } : null
+  if (typeof command !== 'string' || !commandId.test(command)) return null
+  return args.name === undefined ? { id: command } : { name: args.name, id: command }
 }
 
 function taskHints(args, body, target, outcome) {

@@ -133,6 +133,62 @@ test('two-field tool schema works with strict transport and returns directly rep
   ])
 })
 
+test('keeps project command scope through start, preview, wait, pagination, list and delete', async t => {
+  const client = await fixture(t)
+  const seen = []
+  const collection = '/projects/Demo/commands'
+  const item = `${collection}/0`
+  const preview = `${item}?stdout_offset=0&stderr_offset=0&limit=2048`
+  const page = `${item}?stdout_offset=1&limit=4096`
+  const finished = { id: '0', mode: 'ps', status: 'succeeded', stdout_bytes: 2, stderr_bytes: 0 }
+  await client.configure(await server(t, (req, res, body) => {
+    seen.push([req.method, req.url, body.length ? JSON.parse(body) : null, req.headers['idempotency-key']])
+    if (req.method === 'POST' && req.url === collection) {
+      if (req.headers['idempotency-key']) return json(res, { ...finished, status: 'running' }, 202)
+      return json(res, finished)
+    }
+    if (req.method === 'GET' && req.url === preview) {
+      return json(res, { ...finished, stdout: { data_base64: 'YQ==', next_offset: 1 }, stderr: { data_base64: '', next_offset: 0 } })
+    }
+    if (req.method === 'GET' && req.url === page) {
+      return json(res, { ...finished, stdout: { data_base64: 'Yg==', next_offset: 2 } })
+    }
+    if (req.method === 'GET' && req.url === collection) return json(res, { commands: [finished] })
+    if (req.method === 'DELETE' && req.url === item) { res.writeHead(204); res.end(); return }
+    return json(res, { error: { code: 'not_found' } }, 404)
+  }))
+  const run = (op, params) => client.run('command', { op, params_json: JSON.stringify(params) })
+  const name = 'Demo'
+  const command = 'Write-Output ab'
+  const args = { name, mode: 'ps', command }
+  const short = await run('start', { ...args, wait_seconds: 5 })
+  assert.equal(short.outcome, 'succeeded')
+  assert.equal(short.stdout.text, 'a')
+  assert.deepEqual(short.next_get, { op: 'get', params_json: '{"name":"Demo","id":"0","stdout_offset":1}' })
+  assert.equal((await client.run('command', short.next_get)).stdout.text, 'b')
+
+  const pending = await run('start', { ...args, idempotency_key: 'one' })
+  assert.equal(pending.outcome, 'pending')
+  assert.deepEqual(pending.next_wait, { op: 'wait', params_json: '{"name":"Demo","id":"0"}' })
+  assert.equal((await client.run('command', pending.next_wait)).outcome, 'succeeded')
+  assert.deepEqual((await run('list', { name })).commands, [finished])
+  assert.equal((await run('delete', { name, id: '0' })).http_status, 204)
+  assert.equal((await run('get', { name: 'Missing', id: '0' })).http_status, 404)
+  for (const invalidName of ['', null, '../Other', 'NUL']) {
+    assert.equal((await run('list', { name: invalidName })).error.code, 'invalid_input')
+  }
+  assert.deepEqual(seen, [
+    ['POST', collection, { mode: 'ps', command, timeout: 5 }, undefined],
+    ['GET', preview, null, undefined],
+    ['GET', page, null, undefined],
+    ['POST', collection, { mode: 'ps', command, timeout: 0 }, 'one'],
+    ['GET', preview, null, undefined],
+    ['GET', collection, null, undefined],
+    ['DELETE', item, null, undefined],
+    ['GET', '/projects/Missing/commands/0?stdout_offset=0&stderr_offset=0&limit=2048', null, undefined],
+  ])
+})
+
 test('maps project, action and command endpoints, preserves task and HTTP error details', async t => {
   const client = await fixture(t)
   const seen = []
