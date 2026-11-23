@@ -125,6 +125,8 @@ Action、项目命令和全局命令的 POST 都可传 `timeout`：非负有限�
 
 `Command` 是 `Task` 加 `id` 和 `mode`。`id` 为小写 36 进制字符串（`0` 至 `z`，然后 `10` 等）。两种命令均非交互运行，可以自行 `cd`；一次命令改变的当前目录不会传给下一次。
 
+全局和项目的单条命令 GET 都可加 `include_input=1`，额外返回 `command`（提交时的完整字符串，含原有换行）。单条 Action GET 加同一参数时额外返回 `action_id`，可用来识别 Action 是否被替换。该参数可与日志偏移一起使用，只接受值 `1`。默认响应、列表和服务日志不包含命令原文；原文可能含敏感信息，按需读取。
+
 PowerShell 不加载用户配置，默认关闭进度提示，并以 UTF-8（无 BOM）向管道写入文本。可用 `$ProgressPreference = 'Continue'` 恢复进度。原生子程序可能使用其他编码；Runner 不转码、不剥除 CLIXML。若执行策略禁止加载本地模块，在 [config.py](<config.py>) 中把 `PS_SUPPRESS_PROGRESS` 设为 `False` 可跳过这两项默认设置，无需放宽系统策略。
 
 ### Task 字段

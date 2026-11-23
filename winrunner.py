@@ -159,6 +159,14 @@ def log_params(query):
     return offsets, limit
 
 
+def task_query(query):
+    query = dict(query)
+    include_input = query.pop("include_input", None)
+    if include_input not in (None, "1"):
+        raise invalid("include_input must be 1")
+    return log_params(query), {"include_input": True} if include_input else {}
+
+
 def range_bounds(header, size):
     if header is None:
         return 0, size
@@ -614,7 +622,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
     def action(self, method, name, query):
         runner = self.server.runner
         if method == "GET":
-            self.reply(200, runner.get_action(name, *log_params(query)))
+            logs, options = task_query(query)
+            self.reply(200, runner.get_action(name, *logs, **options))
         elif method == "POST":
             self.no_query(query)
             raw = self.raw_body()
@@ -681,9 +690,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
             command_id, name = name, None
         runner = self.server.runner
         if method == "GET":
-            self.reply(
-                200, runner.get_command(command_id, *log_params(query), name=name)
-            )
+            logs, options = task_query(query)
+            self.reply(200, runner.get_command(command_id, *logs, name=name, **options))
         else:
             self.no_query(query)
             runner.delete_command(command_id, name=name)
@@ -871,14 +879,45 @@ def serve(token: str, *, nogui: bool) -> None:
 def serve_with_gui(server: HTTPServer) -> None:
     import tkinter
 
-    from winrunner_gui import Response, Snapshot, run_integrated
+    from winrunner_gui import (
+        LOG_PAGE,
+        Response,
+        Snapshot,
+        Target,
+        View,
+        read_view,
+        run_integrated,
+    )
 
-    def snapshot() -> Snapshot:
-        runner = server.runner
+    runner = server.runner
+
+    def list_commands(name: str) -> Response:
+        try:
+            return Response({"commands": runner.list_commands(name=name)})
+        except APIError as exc:
+            return Response(error=str(exc), status=exc.status)
+
+    def get_task(target: Target, offsets: dict[str, int] | None) -> Response:
+        try:
+            options = {"include_input": True} if offsets is not None else {}
+            if target.command is None:
+                return Response(
+                    runner.get_action(target.project, offsets, LOG_PAGE, **options)
+                )
+            return Response(
+                runner.get_command(
+                    target.command, offsets, LOG_PAGE, name=target.project, **options
+                )
+            )
+        except APIError as exc:
+            return Response(error=str(exc), status=exc.status)
+
+    def snapshot(view: View) -> Snapshot:
         return Snapshot(
             Response(health_snapshot(runner, server.cpu_sampler)),
             Response({"projects": runner.list_projects()}),
             Response({"commands": runner.list_commands()}),
+            selected=read_view(view, list_commands, get_task),
         )
 
     errors: list[Exception] = []
@@ -892,7 +931,7 @@ def serve_with_gui(server: HTTPServer) -> None:
     worker = threading.Thread(target=serve_http, name="winrunner-http")
     worker.start()
     try:
-        run_integrated(snapshot, lambda: None, worker.is_alive)
+        run_integrated(snapshot, worker.is_alive)
     except tkinter.TclError as exc:
         LOG.error("Cannot open Tkinter window; use --nogui on headless hosts")
         raise RuntimeError("Tkinter window failed") from exc

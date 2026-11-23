@@ -1,5 +1,6 @@
 """Exercise the dashboard without launching Tk or listening on a port."""
 
+import signal
 import threading
 import unittest
 from queue import SimpleQueue
@@ -123,24 +124,52 @@ class PollTests(unittest.TestCase):
         getter.side_effect = [health, projects, busy, gui.Response({"run_id": "same"})]
         results: SimpleQueue[gui.Snapshot] = SimpleQueue()
         gui._poll(18080, "test-token", threading.Event(), results)
-        self.assertEqual(results.get_nowait(), gui.Snapshot(health, projects, busy))
+        self.assertEqual(
+            results.get_nowait(),
+            gui.Snapshot(health, projects, busy, selected=gui.ViewData(gui.View())),
+        )
+
+    def test_project_detail_is_lazy_and_uses_both_offsets(self) -> None:
+        list_commands = MagicMock(return_value=gui.Response({}))
+        get_task = MagicMock(return_value=gui.Response({}))
+        target = gui.Target("Demo", "0")
+        view = gui.View("Demo", target, 32768, 65536)
+        state = gui.read_view(view, list_commands, get_task)
+        self.assertEqual(state.view, view)
+        list_commands.assert_called_once_with("Demo")
+        self.assertEqual(
+            get_task.call_args_list,
+            [
+                call(gui.Target("Demo"), None),
+                call(target, {"stdout": 32768, "stderr": 65536}),
+            ],
+        )
+        self.assertEqual(
+            gui._task_route(target, view.offsets()),
+            "/projects/Demo/commands/0?include_input=1&limit=32768&stdout_offset=32768&stderr_offset=65536",
+        )
+        list_commands.reset_mock()
+        get_task.reset_mock()
+        gui.read_view(gui.View(), list_commands, get_task)
+        list_commands.assert_not_called()
+        get_task.assert_not_called()
 
 
 class IntegratedTests(unittest.TestCase):
     @staticmethod
-    def dashboard(snapshot, on_close, is_running):
+    def dashboard(snapshot, is_running):
         root = MagicMock()
         with (
             patch.object(gui.tk, "Frame"),
             patch.object(gui, "_label", side_effect=lambda *a, **kw: MagicMock()),
             patch.object(gui.ttk, "Style"),
             patch.object(gui.ttk, "Button"),
+            patch.object(gui.ttk, "Notebook"),
+            patch.object(gui, "TaskDetail"),
             patch.object(gui, "Metric"),
             patch.object(gui, "StatusTable"),
         ):
-            dashboard = gui.Dashboard(
-                root, snapshot=snapshot, on_close=on_close, is_running=is_running
-            )
+            dashboard = gui.Dashboard(root, snapshot=snapshot, is_running=is_running)
         return dashboard
 
     @patch.object(gui, "_get")
@@ -148,12 +177,11 @@ class IntegratedTests(unittest.TestCase):
         sample = gui.Snapshot(gui.Response({"run_id": "integrated"}))
         worker_threads = []
 
-        def snapshot() -> gui.Snapshot:
+        def snapshot(_view: gui.View) -> gui.Snapshot:
             worker_threads.append(threading.current_thread())
             return sample
 
-        on_close = MagicMock()
-        dashboard = self.dashboard(snapshot, on_close, lambda: True)
+        dashboard = self.dashboard(snapshot, lambda: True)
         dashboard._show = MagicMock()
         dashboard.refresh()
         queued = dashboard._results.get(timeout=2)
@@ -171,22 +199,57 @@ class IntegratedTests(unittest.TestCase):
 
         dashboard.close()
         dashboard.close()
-        on_close.assert_called_once_with()
         dashboard.root.destroy.assert_called_once_with()
 
-    def test_backend_exit_closes_without_notification_during_a_poll(self) -> None:
+    def test_window_close_hides_and_reopens_without_stopping_the_backend(self) -> None:
+        alive = threading.Event()
+        alive.set()
+        dashboard = self.dashboard(MagicMock(), alive.is_set)
+        dashboard._window_close()
+        dashboard._window_close()
+        dashboard.root.withdraw.assert_called_once_with()
+        dashboard.root.after.assert_called_once_with(gui.REOPEN_MS, dashboard._reopen)
+        dashboard.root.destroy.assert_not_called()
+        self.assertFalse(dashboard._stop.is_set())
+        dashboard._reopen()
+        dashboard.root.deiconify.assert_called_once_with()
+        dashboard._window_close()
+        alive.clear()
+        dashboard._reopen()
+        dashboard.root.deiconify.assert_called_once_with()
+        dashboard.root.after.assert_called_with(gui.BACKEND_EXIT_MS, dashboard.close)
+        dashboard.close()
+        dashboard.root.destroy.assert_called_once_with()
+
+    def test_replaced_action_resets_open_log_offsets(self) -> None:
+        dashboard = self.dashboard(MagicMock(), lambda: True)
+        dashboard._run_id = "current"
+        view = gui.View("Demo", gui.Target("Demo"), gui.LOG_PAGE, 0, 3)
+        dashboard._view = view
+        dashboard._action_id = "old-action"
+        detail = gui.Response({"action_id": "new-action", "status": "running"})
+        dashboard._show(
+            gui.Snapshot(
+                gui.Response({"run_id": "current"}),
+                selected=gui.ViewData(view, action=detail, detail=detail),
+            )
+        )
+        expected = gui.View("Demo", gui.Target("Demo"), revision=4)
+        self.assertEqual(dashboard._view, expected)
+        dashboard.detail.show.assert_called_once_with(expected, None)
+
+    def test_backend_exit_closes_during_a_poll(self) -> None:
         entered = threading.Event()
         release = threading.Event()
         alive = threading.Event()
         alive.set()
 
-        def snapshot() -> gui.Snapshot:
+        def snapshot(_view: gui.View) -> gui.Snapshot:
             entered.set()
             release.wait(timeout=2)
             return gui.Snapshot(gui.Response({"run_id": "old"}))
 
-        on_close = MagicMock()
-        dashboard = self.dashboard(snapshot, on_close, alive.is_set)
+        dashboard = self.dashboard(snapshot, alive.is_set)
         try:
             dashboard.refresh()
             self.assertTrue(entered.wait(timeout=2))
@@ -200,7 +263,6 @@ class IntegratedTests(unittest.TestCase):
             )
             dashboard.close()
             dashboard.root.destroy.assert_called_once_with()
-            on_close.assert_not_called()
         finally:
             release.set()
 
@@ -223,14 +285,20 @@ class IntegratedTests(unittest.TestCase):
     def test_entry_point_creates_the_integrated_dashboard(
         self, tk_factory, dashboard
     ) -> None:
-        snapshot, on_close, is_running = MagicMock(), MagicMock(), MagicMock()
-        gui.run_integrated(snapshot, on_close, is_running)
-        dashboard.assert_called_once_with(
-            tk_factory.return_value,
-            snapshot=snapshot,
-            on_close=on_close,
-            is_running=is_running,
-        )
+        snapshot, is_running = MagicMock(), MagicMock()
+        previous = signal.getsignal(signal.SIGINT)
+
+        def mainloop() -> None:
+            check = dashboard.call_args.kwargs["is_running"]
+            self.assertTrue(check())
+            signal.raise_signal(signal.SIGINT)
+            self.assertFalse(check())
+
+        tk_factory.return_value.mainloop.side_effect = mainloop
+        gui.run_integrated(snapshot, is_running)
+        self.assertEqual(dashboard.call_args.args, (tk_factory.return_value,))
+        self.assertIs(dashboard.call_args.kwargs["snapshot"], snapshot)
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
         tk_factory.return_value.mainloop.assert_called_once_with()
 
 

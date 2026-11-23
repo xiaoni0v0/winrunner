@@ -253,7 +253,9 @@ class DeferredJob:
 
 
 class Task:
-    def __init__(self, phase, *, command_id=None, mode=None):
+    def __init__(self, phase, *, command_id=None, mode=None, command=None):
+        self.action_id = secrets.token_hex(16) if command_id is None else None
+        self.command = command
         self.job = DeferredJob()
         self.lock = threading.RLock()
         self.done = threading.Event()
@@ -829,14 +831,18 @@ class Runner:
             if project.lifecycle is None:
                 project.visible = visible
 
-    def get_action(self, name, offsets=None, limit=65536):
+    def get_action(self, name, offsets=None, limit=65536, *, include_input=False):
         with self.lock:
             project = self._project(name)
             if project.lifecycle in ("deleting", "delete_failed"):
                 raise conflict("Project deletion is in progress or must be retried")
-            if project.task is None:
+            task = project.task
+            if task is None:
                 raise not_found("No action has been submitted")
-            return project.task.snapshot(offsets, limit)
+            result = task.snapshot(offsets, limit)
+            if include_input:
+                result["action_id"] = task.action_id
+            return result
 
     def cancel_action(self, name):
         with self.lock:
@@ -867,7 +873,7 @@ class Runner:
             number = self.next_command_numbers.get(key, 0)
             command_id = short_command_id(number)
             self.next_command_numbers[key] = number + 1
-            task = Task("launch", command_id=command_id, mode=mode)
+            task = Task("launch", command_id=command_id, mode=mode, command=command)
             commands[command_id] = task
         try:
             self._start_thread(self._run_command, task, command, cwd)
@@ -924,11 +930,15 @@ class Runner:
         with self.lock:
             return [task.snapshot() for task in self._commands(name).values()]
 
-    def get_command(self, command_id, offsets=None, limit=65536, *, name=None):
+    def get_command(
+        self, command_id, offsets=None, limit=65536, *, name=None, include_input=False
+    ):
         with self.lock:
-            return self._command(self._commands(name), command_id).snapshot(
-                offsets, limit
-            )
+            task = self._command(self._commands(name), command_id)
+            result = task.snapshot(offsets, limit)
+            if include_input:
+                result["command"] = task.command
+            return result
 
     def delete_command(self, command_id, *, name=None):
         with self.lock:

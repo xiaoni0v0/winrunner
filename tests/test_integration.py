@@ -773,7 +773,7 @@ class ProjectIntegrationTests(RunnerCase):
         key = {"Idempotency-Key": "same-key"}
         payload = {
             "mode": "ps",
-            "command": "Write-Output (Get-Location).Path",
+            "command": "# Keep the exact input, including CRLF\r\nWrite-Output (Get-Location).Path",
             "timeout": 10,
         }
         self.call(404, "POST", "/projects/missing/commands", payload, headers=key)
@@ -794,10 +794,17 @@ class ProjectIntegrationTests(RunnerCase):
             (other + "/0", self.data / "projects" / "Other"),
             ("/commands/0", Path.home()),
         ):
-            self.assertEqual(
-                log_bytes(self.finished(endpoint), "stdout").decode().strip().lower(),
-                str(cwd).lower(),
+            self.assertNotIn("command", self.call(200, "GET", endpoint))
+            detail = self.call(
+                200, "GET", endpoint + "?include_input=1&stdout_offset=0"
             )
+            self.assertEqual(detail["command"], payload["command"])
+            self.assertEqual(
+                log_bytes(detail, "stdout").decode().strip().lower(), str(cwd).lower()
+            )
+        self.assertNotIn("command", first)
+        self.assertNotIn("command", self.call(200, "GET", commands)["commands"][0])
+        self.call(400, "GET", commands + "/0?include_input=0")
         self.call(204, "DELETE", commands + "/0")
         self.call(404, "GET", commands + "/0")
         self.assertEqual(self.call(200, "POST", commands, payload, headers=key), first)
@@ -911,6 +918,11 @@ class ProjectIntegrationTests(RunnerCase):
         )
         self.assertEqual(running["status"], "running")
         self.assertEqual(running["commit"], self.commit)
+        self.assertNotIn("action_id", running)
+        original_action = self.call(200, "GET", endpoint + "?include_input=1")[
+            "action_id"
+        ]
+        self.assertTrue(original_action)
         self.assertEqual(running["output_source"], "process")
         self.assertEqual(json.loads(log_bytes(running, "stdout")), args)
         self.assertEqual(log_bytes(running, "stderr"), b"action-stderr")
@@ -931,6 +943,9 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(self.call(200, "GET", endpoint)["status"], "cancelled")
         self.call(400, "POST", endpoint, b"{")
         invalid = self.finished(endpoint, expected="failed")
+        replaced = self.call(200, "GET", endpoint + "?include_input=1")["action_id"]
+        self.assertTrue(replaced)
+        self.assertNotEqual(replaced, original_action)
         self.assertIsNone(invalid["commit"])
         self.assertEqual(invalid["output_source"], "runner")
         self.assertEqual(log_bytes(invalid, "stdout"), b"")

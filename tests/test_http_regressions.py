@@ -147,6 +147,8 @@ class HTTPRegressionTests(unittest.TestCase):
         self.runner.start_command.assert_called_once()
 
     def test_integrated_window_reads_state_while_http_serves_and_stops_on_return(self):
+        from winrunner_gui import Target, View
+
         with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
             server.token = TOKEN.encode("ascii")
             server.runner = runner = Mock()
@@ -155,10 +157,21 @@ class HTTPRegressionTests(unittest.TestCase):
             runner.list_commands.return_value = []
             self.port = server.server_address[1]
 
-            def window(snapshot, on_close, is_running):
+            runner.get_action.return_value = {"status": "running"}
+            runner.get_command.return_value = {"command": "echo exact"}
+
+            def window(snapshot, is_running):
                 self.assertIs(threading.current_thread(), threading.main_thread())
                 self.assertTrue(is_running())
-                state = snapshot()
+                state = snapshot(View("demo", Target("demo", "0")))
+                self.assertEqual(state.selected.detail.data, {"command": "echo exact"})
+                runner.get_command.assert_called_once_with(
+                    "0",
+                    {"stdout": 0, "stderr": 0},
+                    32768,
+                    name="demo",
+                    include_input=True,
+                )
                 self.assertEqual(state.health.data, {"run_id": "demo-run"})
                 self.assertEqual(state.projects.data, {"projects": [{"name": "demo"}]})
                 self.assertEqual(state.commands.data, {"commands": []})
@@ -168,7 +181,6 @@ class HTTPRegressionTests(unittest.TestCase):
                     (status, body), (200, {"projects": [{"name": "demo"}]})
                 )
                 self.backend_is_running = is_running
-                on_close()
 
             with (
                 patch("winrunner.health_snapshot", return_value={"run_id": "demo-run"}),
