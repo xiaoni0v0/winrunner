@@ -23,15 +23,17 @@ Action、项目命令和文件接口使用同一个工作树。不同项目的�
 
 | 接口 | 结果 |
 |---|---|
-| `POST /projects` | 同步克隆并检出默认分支，成功返回 `201` 和 `Project`。 |
 | `GET /projects` | `200`：`{"projects":[Project, …]}`。 |
+| `POST /projects/{name}` | 同步克隆并检出默认分支，成功返回 `201` 和 `Project`；只创建，不覆盖。 |
 | `GET /projects/{name}` | `200`：`Project`；项目不存在返回 `404`。 |
 | `DELETE /projects/{name}` | 停止项目的克隆、Action 和所有项目命令，中断该项目的下载；删除工作树、Git 缓存及记录后释放名字，返回 `204`。不影响其他项目和全局命令。 |
 
-创建时必填 `name` 和 `repo_url`（均为 string）：
+创建时由调用端在路径中指定 `name`，请求体只传 `{"repo_url":"https://example.com/owner/repo.git"}`。
 
-- `name` 匹配 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`，大小写不敏感、全局唯一，不接受 Windows 设备保留名。工作目录按注册名命名；重名返回 `409`。
+- `name` 匹配 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`，大小写不敏感、全局唯一，不接受 Windows 设备保留名。工作目录按注册名命名；重名返回 `409`，不重新克隆或改动已有项目。
 - `repo_url` 是公开 HTTPS Git 仓库的最终地址，不含凭据、查询或片段。Runner 不跟随重定向，不取子模块或 Git LFS 内容。Git 克隆失败返回 `502`，含原始原因，不留下可见项目。
+
+创建请求断线后，可用同一路径的 GET 核对 `repo_url` 和 `status`；`cloning` 表示同步克隆尚未完成。`POST /projects` 不再接受创建请求，返回 `405`。
 
 创建时先占用名字并清理同名残留目录，不复用残留。清理受阻返回 `409 project_cleanup_blocked`，释放占用后可重试创建。删除项目时，默认最多等 5 秒让任务和下载退出，超时返回 `409 project_busy`；磁盘清理受阻返回 `409 project_cleanup_blocked`。这两种删除失败都可重试 DELETE。项目不存在时 DELETE 返回 `404`。
 

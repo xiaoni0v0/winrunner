@@ -142,7 +142,7 @@ function forProject(args) {
     } catch {
       invalid('repo_url 必须是无凭据、查询或片段的 HTTPS Git 最终地址。')
     }
-    return request('POST', '/projects', { body: { name: args.name, repo_url: repoUrl }, deadline: 120000 })
+    return request('POST', path, { body: { repo_url: repoUrl }, deadline: 120000 })
   }
   if (op === 'files') {
     select(args, ['name', 'path', 'offset', 'length', 'entry_offset', 'entry_limit', 'encoding'])

@@ -178,6 +178,20 @@ class HTTPRegressionTests(unittest.TestCase):
             gui.assert_called_once()
             self.assertFalse(self.backend_is_running())
 
+    def test_project_creation_uses_path_name_and_logs_only_repository_host(self):
+        self.start_server(reported_peer="203.0.113.42")
+        self.runner.create.return_value = {"name": "Demo", "status": "idle"}
+        payload = b'{"repo_url":"https://git.example.invalid/private-path"}'
+        with self.assertLogs("winrunner", "INFO") as logs:
+            status, body, _ = self.request("POST", "/projects/%44emo", payload=payload)
+            self.assertTrue(self.server.worker_done.wait(3))
+        self.assertEqual((status, body), (201, {"name": "Demo", "status": "idle"}))
+        self.runner.create.assert_called_once_with("Demo", payload)
+        text = "\n".join(logs.output)
+        self.assertIn('project="Demo"', text)
+        self.assertIn('repo_host="git.example.invalid"', text)
+        self.assertNotIn("private-path", text)
+
     def test_request_metadata_is_bounded_redacted_and_appended(self):
         self.start_server(reported_peer="203.0.113.42")
         self.runner.start_command.return_value = (202, {"id": "z", "mode": "ps"})
@@ -338,8 +352,8 @@ class HTTPRegressionTests(unittest.TestCase):
         self.start_server()
         cases = [
             ("POST", "/health", "GET"),
-            ("OPTIONS", "/projects", "GET, POST"),
-            ("POST", "/projects/missing", "GET, DELETE"),
+            ("POST", "/projects", "GET"),
+            ("PUT", "/projects/missing", "GET, POST, DELETE"),
             ("PATCH", "/projects/missing/actions", "GET, POST, DELETE"),
             ("DELETE", "/projects/missing/files?path=one&path=two", "GET"),
             ("PUT", "/commands", "GET, POST"),

@@ -15,7 +15,9 @@ from unittest.mock import patch
 
 import runner
 
-REPO_URL = "https://example.invalid/repo.git"
+PROJECT_BODY = json.dumps({"repo_url": "https://example.invalid/repo.git"}).encode(
+    "utf-8"
+)
 COMMIT = "a" * 40
 ACTION = b'{"commit":"aaaa","interpreter":"python","script":"script.py","timeout":0}'
 COMMAND = b'{"mode":"cmd","command":"exit 0","timeout":30}'
@@ -83,12 +85,8 @@ class RunnerRegressions(unittest.TestCase):
         stderr(b"process stderr")
         return 0
 
-    @staticmethod
-    def project_body(name):
-        return json.dumps({"name": name, "repo_url": REPO_URL}).encode("utf-8")
-
     def create(self, name="sample"):
-        self.model.create(self.project_body(name))
+        self.model.create(name, PROJECT_BODY)
         return self.model.projects[name.lower()]
 
     def assert_api_error(self, status, code, operation, *args, **kwargs):
@@ -228,7 +226,6 @@ class RunnerRegressions(unittest.TestCase):
 
     def test_failed_clone_rollback_stays_private_and_retry_cleans_stale_path(self):
         # #04: simulate a sharing violation only after the clone leaves files.
-        raw = self.project_body("Sample")
         worktree = self.model.projects_dir / "Sample"
         cache = self.model.caches_dir / "Sample"
         remove_tree = runner._remove_tree
@@ -252,7 +249,7 @@ class RunnerRegressions(unittest.TestCase):
             self.assertLogs("runner", "WARNING") as logs,
         ):
             error = self.assert_api_error(
-                502, "git_clone_failed", self.model.create, raw
+                502, "git_clone_failed", self.model.create, "Sample", PROJECT_BODY
             )
             self.assertEqual(str(error), "simulated Git transport error")
 
@@ -263,20 +260,23 @@ class RunnerRegressions(unittest.TestCase):
         self.assertTrue((worktree / "partial").is_file())
         self.assertFalse(cache.exists(), "unblocked paths should still be cleaned")
 
-        retry = self.project_body("sample")
         with (
             patch.object(runner, "_remove_tree", side_effect=block_rollback),
             patch.object(LocalRepository, "create", autospec=True) as clone,
             self.assertLogs("runner", "WARNING"),
         ):
             self.assert_api_error(
-                409, "project_cleanup_blocked", self.model.create, retry
+                409,
+                "project_cleanup_blocked",
+                self.model.create,
+                "sample",
+                PROJECT_BODY,
             )
             clone.assert_not_called()
         self.assert_api_error(404, "not_found", self.model.get_project, "sample")
 
         # LocalRepository.create uses mkdir(exist_ok=False): it cannot reuse stale paths.
-        retried = self.model.create(retry)
+        retried = self.model.create("sample", PROJECT_BODY)
         self.assertEqual(retried["status"], "idle")
         self.assertNotIn("sample", self.model.pending_cleanup)
         self.assertFalse((worktree / "partial").exists())

@@ -152,7 +152,7 @@ test('maps project, action and command endpoints, preserves task and HTTP error 
       return
     }
     if (req.method === 'POST' && req.url === '/commands') { json(res, { id: 'id1', status: 'running' }, 202); return }
-    if (req.method === 'POST' && req.url === '/projects') { json(res, { name: 'demo' }, 201); return }
+    if (req.method === 'POST' && req.url === '/projects/demo') { json(res, { name: 'demo' }, 201); return }
     json(res, { ok: false }) // the client owns `ok`, rather than trusting a server field.
   })
   await client.configure(base)
@@ -184,10 +184,11 @@ test('maps project, action and command endpoints, preserves task and HTTP error 
   assert(!Object.hasOwn(command, 'stderr'))
   assert.equal((await client.run('command', { op: 'delete', id: 'id1' })).http_status, 204)
   assert.deepEqual(seen.map(([method, path]) => `${method} ${path}`), [
-    'GET /projects', 'POST /projects', 'GET /projects/demo', 'DELETE /projects/demo',
+    'GET /projects', 'POST /projects/demo', 'GET /projects/demo', 'DELETE /projects/demo',
     'POST /projects/demo/actions', 'GET /projects/demo/actions?stdout_offset=0&stderr_offset=0&limit=2048',
     'DELETE /projects/demo/actions', 'POST /commands', 'GET /commands', 'GET /commands/id1?stdout_offset=0&limit=4096', 'DELETE /commands/id1',
   ])
+  assert.deepEqual(seen[1][2], { repo_url: 'https://example.invalid/repo.git' })
   assert.deepEqual(seen[4][2], { commit: 'abc1234', interpreter: 'python', script: '任务.py', args: [], timeout: 0 })
   assert.equal(Number(seen[4][3]), seen[4][4])
   assert.equal(seen[7][2].timeout, 2.5)
@@ -454,7 +455,7 @@ test('never follows redirects or retries mutations, and respects an already canc
   const target = await server(t, (_req, res) => { redirectedHits++; json(res, {}) })
   const base = await server(t, (req, res) => {
     hits++
-    if (req.url === '/projects') { res.writeHead(502, { 'content-type': 'text/html', 'retry-after': '5' }); res.end('<h1>proxy only</h1>'); return }
+    if (req.method === 'POST' && req.url === '/projects/demo') { res.writeHead(502, { 'content-type': 'text/html', 'retry-after': '5' }); res.end('<h1>proxy only</h1>'); return }
     if (req.method === 'GET') { res.writeHead(302, { location: `${target}/unexpected` }); res.end(); return }
     json(res, { error: { code: 'server_busy' } }, 503, { 'retry-after': '1' })
   })

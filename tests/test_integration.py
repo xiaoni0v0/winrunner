@@ -26,7 +26,7 @@ import threading
 import time
 import unittest
 from typing import ClassVar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -290,7 +290,7 @@ class CommandIntegrationTests(RunnerCase):
             ("GET", "/commands", None),
             ("POST", "/commands", b"{"),
             ("DELETE", "/commands/nonexistent", None),
-            ("POST", "/projects", b"{"),
+            ("POST", "/projects/demo", b"{"),
         ):
             for auth in (False, "Bearer incorrect", f"Basic {self.token}"):
                 with self.subTest(method=method, path=path, auth=auth):
@@ -684,8 +684,9 @@ class ProjectIntegrationTests(RunnerCase):
         return env
 
     def register(self, name="Fixture"):
-        self.call(201, "POST", "/projects", {"name": name, "repo_url": self.repo_url})
-        return "/projects/" + name
+        path = "/projects/" + name
+        self.call(201, "POST", path, {"repo_url": self.repo_url})
+        return path
 
     def action(self, project, **kwargs):
         fields = {
@@ -703,12 +704,18 @@ class ProjectIntegrationTests(RunnerCase):
             ("Sample", self.repo_url.replace("https:", "http:")),
             ("Sample", self.repo_url.replace("https://", "https://user:secret@")),
         ):
-            self.call(400, "POST", "/projects", {"name": name, "repo_url": url})
+            self.call(400, "POST", f"/projects/{quote(name)}", {"repo_url": url})
+        self.call(
+            400,
+            "POST",
+            "/projects/Fixture",
+            {"name": "Other", "repo_url": self.repo_url},
+        )
         self.call(
             502,
             "POST",
-            "/projects",
-            {"name": "Fixture", "repo_url": self.repo_url + "-missing"},
+            "/projects/Fixture",
+            {"repo_url": self.repo_url + "-missing"},
         )
         self.call(404, "GET", "/projects/Fixture")
         project = self.register()
@@ -716,8 +723,9 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(self.call(200, "GET", project.lower()), expected)
         self.assertEqual(self.call(200, "GET", "/projects")["projects"], [expected])
         self.call(
-            409, "POST", "/projects", {"name": "FIXTURE", "repo_url": self.repo_url}
+            409, "POST", "/projects/FIXTURE", {"repo_url": self.repo_url + "-other"}
         )
+        self.assertEqual(self.call(200, "GET", project), expected)
         self.call(404, "GET", project + "/actions")
         self.call(404, "DELETE", project + "/actions")
         listing = self.call(200, "GET", project + "/files")
@@ -1016,7 +1024,7 @@ class ProjectIntegrationTests(RunnerCase):
         def submit(name):
             ready.wait(timeout=5)
             return self.request(
-                "POST", "/projects", {"name": name, "repo_url": self.repo_url}
+                "POST", f"/projects/{name}", {"repo_url": self.repo_url}
             )[0]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

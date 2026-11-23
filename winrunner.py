@@ -342,12 +342,15 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return
         for key in fields:
-            self.note(key, body.get(key))
-        if "name" in fields and isinstance(body.get("repo_url"), str):
-            try:
-                self.note("repo_host", urlsplit(body["repo_url"]).hostname)
-            except ValueError:
-                pass
+            value = body.get(key)
+            if key == "repo_url":
+                if isinstance(value, str):
+                    try:
+                        self.note("repo_host", urlsplit(value).hostname)
+                    except ValueError:
+                        pass
+            else:
+                self.note(key, value)
 
     def handle_one_request(self):
         # Keep the base request-line bounds, but route every method after auth.
@@ -573,21 +576,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.no_query(query)
         self.reply(200, health_snapshot(self.server.runner, self.server.cpu_sampler))
 
-    def projects(self, method, _name, query):
+    def projects(self, _method, _name, query):
         self.no_query(query)
-        runner = self.server.runner
-        if method == "GET":
-            self.reply(200, {"projects": runner.list_projects()})
-        else:
-            raw = self.raw_body()
-            self.note_body(raw, "name")
-            self.reply(201, runner.create(raw))
+        self.reply(200, {"projects": self.server.runner.list_projects()})
 
     def project(self, method, name, query):
         self.no_query(query)
         runner = self.server.runner
         if method == "GET":
             self.reply(200, runner.get_project(name))
+        elif method == "POST":
+            raw = self.raw_body()
+            self.note_body(raw, "repo_url")
+            self.reply(201, runner.create(name, raw))
         else:
             runner.delete_project(name)
             self.reply(204)
@@ -692,8 +693,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
         tuple[str | None, ...], tuple[tuple[str, ...], Callable[..., None]]
     ] = {
         ("health",): (("GET",), get_health),
-        ("projects",): (("GET", "POST"), projects),
-        ("projects", None): (("GET", "DELETE"), project),
+        ("projects",): (("GET",), projects),
+        ("projects", None): (("GET", "POST", "DELETE"), project),
         ("projects", None, "actions"): (("GET", "POST", "DELETE"), action),
         ("projects", None, "files"): (("GET",), project_files),
         ("projects", None, "commands"): (("GET", "POST"), commands),

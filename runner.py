@@ -107,15 +107,17 @@ def timeout_value(body):
     raise invalid("timeout must be a finite non-negative number of seconds")
 
 
-def project_body(raw):
-    body = object_body(raw)
-    name, url = body.get("name"), body.get("repo_url")
+def project_body(name, raw):
     if (
         not isinstance(name, str)
         or not PROJECT_NAME.fullmatch(name)
         or DEVICE_NAME.fullmatch(name)
     ):
         raise invalid("Invalid Windows project name")
+    body = object_body(raw)
+    if body.keys() - {"repo_url"}:
+        raise invalid("The project request body only accepts repo_url")
+    url = body.get("repo_url")
     if (
         not clean_string(url)
         or not url
@@ -140,7 +142,7 @@ def project_body(raw):
         raise invalid(
             "repo_url must be a public HTTPS Git URL without credentials"
         ) from exc
-    return name, url
+    return url
 
 
 def action_body(raw):
@@ -489,8 +491,8 @@ class Runner:
         with self.lock:
             return self._project(name).snapshot()
 
-    def create(self, raw):
-        name, url = project_body(raw)
+    def create(self, name, raw):
+        url = project_body(name, raw)
         key = name.lower()
         with self.lock:
             self._available()
