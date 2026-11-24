@@ -60,6 +60,11 @@ def _relative_parts(relative: str) -> list[str]:
     return parts
 
 
+def normalized_relative(relative: str) -> str:
+    """Spell an accepted relative path consistently, including the root alias."""
+    return "/".join(_relative_parts(relative))
+
+
 _FILE_READ_DATA = 0x0001  # FILE_LIST_DIRECTORY for directories
 _FILE_READ_ATTRIBUTES = 0x0080
 _FILE_SHARE_READ = 0x0001

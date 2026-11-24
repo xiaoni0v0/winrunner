@@ -79,9 +79,16 @@ def conflict(message):
     return APIError(409, "conflict", message)
 
 
+def json_value(raw):
+    def reject_constant(value):
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    return json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+
+
 def object_body(raw):
     try:
-        value = json.loads(raw.decode("utf-8"))
+        value = json_value(raw)
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise invalid("Expected a UTF-8 JSON object") from exc
     if not isinstance(value, dict):
@@ -121,7 +128,7 @@ def project_body(name, raw):
     if (
         not clean_string(url)
         or not url
-        or any(ord(c) <= 32 or c in "\\\x7f" for c in url)
+        or any(ord(c) <= 32 or c in "\\?#\x7f" for c in url)
     ):
         raise invalid("repo_url must be a public HTTPS Git URL without credentials")
     try:
@@ -227,6 +234,7 @@ class DeferredJob:
         self.lock = threading.Lock()
         self.native = None
         self.stopped = False
+        self.stop_requested = False
 
     def run(self, *args, **kwargs):
         with self.lock:
@@ -243,6 +251,32 @@ class DeferredJob:
             job = self.native
         if job is not None:
             job.cancel()
+
+    def request_stop(self):
+        with self.lock:
+            self.stopped = True
+            job = self.native
+            if job is None or self.stop_requested:
+                return
+            self.stop_requested = True
+
+        def terminate():
+            try:
+                job.cancel()
+            except Exception:
+                LOG.exception("Could not cancel job during project deletion")
+            finally:
+                with self.lock:
+                    self.stop_requested = False
+
+        try:
+            threading.Thread(
+                target=terminate, name="winrunner-cancel", daemon=True
+            ).start()
+        except Exception:
+            with self.lock:
+                self.stop_requested = False
+            raise
 
     def close(self):
         with self.lock:
@@ -297,7 +331,7 @@ class Task:
             on_started=self.started,
         )
 
-    def cancel(self, wake=None):
+    def cancel(self, wake=None, *, background=False):
         with self.lock:
             if self.done.is_set():
                 return
@@ -305,7 +339,10 @@ class Task:
             self.cancelled.set()
         if wake is not None:
             wake()
-        self.job.cancel()
+        if background:
+            self.job.request_stop()
+        else:
+            self.job.cancel()
 
     def finish(
         self, *, exit_code=None, error=None, source=None, stdout=b"", stderr=b""
@@ -378,6 +415,8 @@ class Task:
                     break
                 self.done.wait(min(remaining, threading.TIMEOUT_MAX))
         result = self.snapshot()
+        if self.action_id is not None:
+            result["action_id"] = self.action_id
         status = (
             200 if result["status"] in ("succeeded", "failed", "cancelled") else 202
         )
@@ -397,6 +436,8 @@ class Project:
         self.visible = False
         self.readers = {}
         self.delete_in_progress = False
+        self.delete_done = threading.Event()
+        self.delete_done.set()
 
     def tasks(self) -> list[Task]:
         tasks = list(self.commands.values())
@@ -572,6 +613,7 @@ class Runner:
             if project.delete_in_progress:
                 raise conflict("Project deletion is already in progress")
             project.delete_in_progress = True
+            project.delete_done.clear()
             project.lifecycle = "deleting"
             project.visible = False
             tasks = project.tasks()
@@ -580,10 +622,10 @@ class Runner:
         key = project.name.lower()
         try:
             self._interrupt_readers(project)
-            if not project.cloned.is_set():
-                project.clone_job.cancel()
             for task in tasks:
-                self._cancel_task(task)
+                self._request_task_stop(task)
+            if not project.cloned.is_set():
+                project.clone_job.request_stop()
             for event in (project.cloned, *(task.done for task in tasks)):
                 if not event.wait(max(0, deadline - time.monotonic())):
                     raise APIError(
@@ -617,11 +659,13 @@ class Runner:
                     project.delete_in_progress = False
                     if not project.create_failed:
                         project.lifecycle = "delete_failed"
+                project.delete_done.set()
 
     @contextmanager
     def file_entry(self, name, relative, *, cancel_read=None):
         key = object()
         with self.lock:
+            self._available()
             project = self._project(name)
             if not project.visible or project.lifecycle is not None:
                 raise not_found("The current project directory is not available")
@@ -652,6 +696,9 @@ class Runner:
 
     def _cancel_task(self, task):
         task.cancel(self._notify_readers)
+
+    def _request_task_stop(self, task):
+        task.cancel(self._notify_readers, background=True)
 
     def _wait_readers(self, project, deadline, cancelled=None):
         with self.reader_changed:
@@ -889,6 +936,13 @@ class Runner:
     def _run_command(task, command, cwd):
         result = {}
         try:
+            cwd = Path.home() if cwd is None else cwd
+            drive = cwd.drive.lower()
+            if task.mode == "cmd" and (
+                drive.startswith("\\\\?\\unc\\")
+                or (drive.startswith("\\\\") and not drive.startswith("\\\\?\\"))
+            ):
+                raise OSError("CMD cannot use a UNC working directory")
             if task.mode == "ps":
                 executable = str(config.POWERSHELL)
                 encoded = encode_ps_command(command)
@@ -908,9 +962,7 @@ class Runner:
                     + command
                     + '"'
                 )
-            result["exit_code"] = task.run(
-                argv, executable=executable, cwd=Path.home() if cwd is None else cwd
-            )
+            result["exit_code"] = task.run(argv, executable=executable, cwd=cwd)
         except JobCancelled as exc:
             result["exit_code"] = exc.exit_code
         except Exception as exc:
@@ -968,20 +1020,34 @@ class Runner:
         try:
             for project in projects:
                 if not project.cloned.is_set():
-                    project.clone_job.cancel()
+                    try:
+                        project.clone_job.cancel()
+                    except Exception:
+                        LOG.exception("Could not cancel clone during shutdown")
             for project in projects:
                 self._interrupt_readers(project)
             for task in tasks:
-                self._cancel_task(task)
+                try:
+                    self._cancel_task(task)
+                except Exception:
+                    LOG.exception("Could not cancel task during shutdown")
             for project in projects:
                 project.cloned.wait()
+                project.delete_done.wait()
             for task in tasks:
                 task.done.wait()
+            with self.reader_changed:
+                self.reader_changed.wait_for(
+                    lambda: not any(p.readers for p in projects)
+                )
         finally:
             self.lease.close()
 
 
 def _failure(error, source):
+    if source == "process":
+        # A monitor failure is metadata, not bytes emitted by the child.
+        return {"error": error, "source": source}
     return {
         "error": error,
         "source": source,

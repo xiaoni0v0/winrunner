@@ -119,6 +119,128 @@ class RunnerRegressions(unittest.TestCase):
         self.assertTrue(task.done.wait(WAIT), "action never signalled completion")
         return self.model.get_action(project.name, OFFSETS)
 
+    def test_shutdown_waits_for_project_deletion_before_releasing_lease(self):
+        project = self.create()
+        deleting, resume, draining = (threading.Event() for _ in range(3))
+        clean = runner._clean_paths
+        wait = project.delete_done.wait
+
+        def gated_clean(paths):
+            deleting.set()
+            if not resume.wait(WAIT):
+                raise TimeoutError("test did not release directory cleanup")
+            return clean(paths)
+
+        def observe_wait():
+            draining.set()
+            return wait(WAIT)
+
+        with (
+            patch.object(runner, "_clean_paths", side_effect=gated_clean),
+            patch.object(project.delete_done, "wait", side_effect=observe_wait),
+        ):
+            deletion = self.background(self.model.delete_project, project.name)
+            try:
+                self.assertTrue(deleting.wait(WAIT))
+                shutdown = self.background(self.model.close)
+                self.assertTrue(draining.wait(WAIT))
+                self.assertFalse(self.model.lease.closed)
+                with self.assertRaisesRegex(RuntimeError, "already in use"):
+                    runner.Runner(self.model.base)
+            finally:
+                resume.set()
+            deletion.result(timeout=WAIT)
+            shutdown.result(timeout=WAIT)
+        self.assertFalse(project.worktree.exists())
+        self.assertTrue(self.model.lease.closed)
+
+    def test_shutdown_drains_other_tasks_when_one_cancellation_fails(self):
+        first, second = runner.Task("launch"), runner.Task("launch")
+        self.model.commands.update({"0": first, "1": second})
+        cancelled = threading.Event()
+        with (
+            patch.object(first.job, "cancel", side_effect=OSError("cancel failed")),
+            patch.object(second.job, "cancel", side_effect=cancelled.set),
+            self.assertLogs("runner", "ERROR"),
+        ):
+            shutdown = self.background(self.model.close)
+            try:
+                self.assertTrue(cancelled.wait(WAIT))
+                self.assertFalse(self.model.lease.closed)
+                self.assertFalse(shutdown.done())
+            finally:
+                first.finish()
+                second.finish()
+            shutdown.result(timeout=WAIT)
+        self.assertTrue(self.model.lease.closed)
+
+    def test_shutdown_rejects_new_readers_and_drains_existing_reader(self):
+        project = self.create()
+        opened, interrupted, release = (threading.Event() for _ in range(3))
+
+        def read():
+            with self.model.file_entry(
+                project.name, "script.py", cancel_read=interrupted.set
+            ):
+                opened.set()
+                if not release.wait(WAIT):
+                    raise TimeoutError("test did not release file reader")
+
+        reader = self.background(read)
+        try:
+            self.assertTrue(opened.wait(WAIT))
+            shutdown = self.background(self.model.close)
+            self.assertTrue(interrupted.wait(WAIT))
+            self.assert_api_error(503, "shutting_down", self.open_script, project)
+            self.assertFalse(self.model.lease.closed)
+        finally:
+            release.set()
+        reader.result(timeout=WAIT)
+        shutdown.result(timeout=WAIT)
+        self.assertTrue(self.model.lease.closed)
+
+    def test_monitor_error_keeps_raw_process_output(self):
+        project = self.create()
+
+        def fail_after_start(*args, on_started, stdout, stderr, **kwargs):
+            on_started()
+            stdout(b"partial")
+            stderr(b"\xff\x80")
+            raise OSError("monitor failed")
+
+        self.job.run.side_effect = fail_after_start
+        action = self.wait_action(project, self.start_action(project))
+        status, result = self.model.start_command(COMMAND, time.monotonic())
+        self.assertEqual(status, 200)
+        command = self.model.get_command(result["id"], OFFSETS)
+        for task in (action, command):
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["error"]["code"], "process_error")
+            self.assertEqual(task["output_source"], "process")
+            self.assertEqual(task["stderr"]["next_offset"], 2)
+            self.assertEqual(
+                base64.b64decode(task["stderr"]["data_base64"]), b"\xff\x80"
+            )
+
+    def test_cmd_does_not_launch_with_a_unc_working_directory(self):
+        task = runner.Task("launch", command_id="0", mode="cmd")
+        self.model._run_command(task, "echo hello", Path(r"\\server\share\project"))
+        self.job.run.assert_not_called()
+        result = task.snapshot()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "launch_failed")
+
+    def test_repo_url_rejects_even_empty_query_and_fragment(self):
+        url = "https://example.invalid/a%3Fb%23c.git"
+        self.assertEqual(
+            runner.project_body("demo", json.dumps({"repo_url": url}).encode()), url
+        )
+        for suffix in ("?", "#"):
+            raw = json.dumps({"repo_url": url + suffix}).encode()
+            self.assert_api_error(
+                400, "invalid_request", runner.project_body, "demo", raw
+            )
+
     def test_worktree_status_error_finishes_action_and_releases_slot(self):
         # #01: successful execution must still finish if final inspection fails.
         project = self.create()
@@ -381,6 +503,40 @@ class RunnerRegressions(unittest.TestCase):
         self.assertEqual(project.commands["0"].snapshot()["exit_code"], 23)
         self.assertFalse(project.worktree.exists())
         self.assert_api_error(404, "not_found", self.model.list_commands, name="sample")
+
+    def test_delete_drain_deadline_survives_slow_native_cancel(self):
+        project = self.create()
+        running, cancelling, release = (threading.Event() for _ in range(3))
+
+        def process(*args, on_started, **kwargs):
+            on_started()
+            running.set()
+            self.assertTrue(release.wait(2 * WAIT))
+            return 0
+
+        def cancel():
+            cancelling.set()
+            self.assertTrue(release.wait(2 * WAIT))
+
+        self.job.run.side_effect = process
+        self.job.cancel.side_effect = cancel
+        self.model.start_command(
+            COMMAND.replace(b'"timeout":30', b'"timeout":0'),
+            time.monotonic(),
+            project=project,
+        )
+        try:
+            self.assertTrue(running.wait(WAIT))
+            with patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", 0.1):
+                deletion = self.background(self.model.delete_project, project.name)
+                self.assertTrue(cancelling.wait(WAIT))
+                self.assert_api_error(
+                    409, "project_busy", deletion.result, timeout=WAIT
+                )
+        finally:
+            release.set()
+        self.assertTrue(project.commands["0"].done.wait(WAIT))
+        self.model.delete_project(project.name)
 
     def test_cancelled_command_reports_reaped_exit_code(self):
         # #06: DELETE cancels while the caller is still waiting for the command result.

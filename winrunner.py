@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import textwrap
 import threading
@@ -24,7 +25,8 @@ from typing import cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import config
-from runner import APIError, Runner, invalid, not_found
+from runner import APIError, Runner, invalid, json_value, not_found
+from winfiles import normalized_relative
 from winprocess import CpuSampler, health
 
 
@@ -208,7 +210,7 @@ class StartReplay:
     ) -> tuple[int, dict]:
         try:
             canonical = json.dumps(
-                json.loads(raw.decode("utf-8")), sort_keys=True, separators=(",", ":")
+                json_value(raw), sort_keys=True, separators=(",", ":")
             ).encode("ascii")
             fingerprint = hashlib.sha256(b"json\0" + canonical).digest()
         except (ValueError, RecursionError):
@@ -273,22 +275,31 @@ class HTTPServer(ThreadingHTTPServer):
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
             body = b'{"error":{"code":"server_busy","message":"Too many HTTP connections"}}'
-            response = (
-                b"HTTP/1.0 503 Service Unavailable\r\n"
-                b"Content-Type: application/json; charset=utf-8\r\n"
-                b"Retry-After: 1\r\nCache-Control: no-store\r\nConnection: close\r\n"
-                b"Content-Length: %d\r\n\r\n" % len(body)
-            ) + body
             try:
-                # Closing with unread bytes can reset the connection on Windows.
-                # Discard one chunk, without waiting for a complete HTTP request.
+                # Discard one chunk without waiting for a complete request. If
+                # the method is not known, don't risk sending a body to HEAD.
                 request.settimeout(0.01)
                 try:
-                    request.recv(65536)
+                    prefix = request.recv(65536)
                 except TimeoutError:
-                    pass
+                    prefix = b""
+                method, sep, _ = prefix.partition(b" ")
+                known = bool(sep and re.fullmatch(rb"[A-Za-z]+", method))
+                headers = (
+                    b"Content-Type: application/json; charset=utf-8\r\n"
+                    if known
+                    else b""
+                )
+                response = (
+                    b"HTTP/1.0 503 Service Unavailable\r\n"
+                    b"Retry-After: 1\r\nCache-Control: no-store\r\nConnection: close\r\n"
+                    + headers
+                    + b"Content-Length: %d\r\n\r\n" % (len(body) if known else 0)
+                )
                 request.setblocking(False)
-                request.sendall(response)
+                request.sendall(
+                    response + (body if known and method != b"HEAD" else b"")
+                )
             except OSError:
                 pass  # An overloaded connection must not stall the accept loop.
             finally:
@@ -741,8 +752,8 @@ class HTTPHandler(BaseHTTPRequestHandler):
             entry.list_entries(),
             key=lambda item: (item["name"].casefold(), item["name"]),
         )
-        result = {
-            "path": "" if relative in ("", ".") else relative.replace("\\", "/"),
+        result: dict[str, object] = {
+            "path": normalized_relative(relative),
             "entries": items,
         }
         if paged:
@@ -880,7 +891,7 @@ def serve_with_gui(server: HTTPServer) -> None:
     import tkinter
 
     from winrunner_gui import (
-        LOG_PAGE,
+        LOG_READ,
         Response,
         Snapshot,
         Target,
@@ -902,11 +913,11 @@ def serve_with_gui(server: HTTPServer) -> None:
             options = {"include_input": True} if offsets is not None else {}
             if target.command is None:
                 return Response(
-                    runner.get_action(target.project, offsets, LOG_PAGE, **options)
+                    runner.get_action(target.project, offsets, LOG_READ, **options)
                 )
             return Response(
                 runner.get_command(
-                    target.command, offsets, LOG_PAGE, name=target.project, **options
+                    target.command, offsets, LOG_READ, name=target.project, **options
                 )
             )
         except APIError as exc:
@@ -929,15 +940,27 @@ def serve_with_gui(server: HTTPServer) -> None:
             errors.append(exc)
 
     worker = threading.Thread(target=serve_http, name="winrunner-http")
-    worker.start()
+    stopping = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+
+    previous = signal.signal(signal.SIGINT, request_stop)
     try:
-        run_integrated(snapshot, worker.is_alive)
+        worker.start()
+        if not stopping:
+            run_integrated(snapshot, lambda: not stopping and worker.is_alive())
     except tkinter.TclError as exc:
         LOG.error("Cannot open Tkinter window; use --nogui on headless hosts")
         raise RuntimeError("Tkinter window failed") from exc
     finally:
-        server.shutdown()
-        worker.join()
+        try:
+            if worker.ident is not None:
+                server.shutdown()
+                worker.join()
+        finally:
+            signal.signal(signal.SIGINT, previous)
     if errors:
         raise errors[0]
 

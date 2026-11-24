@@ -77,6 +77,15 @@ test('registers just three tools; config is required, reread every request and n
   assert.equal(client.tools.size, 0)
 })
 
+test('only a post-dispatch cancellation of a write adds the reconciliation warning', async t => {
+  const client = await fixture(t)
+  const { finalizeContent } = client.tools.get('winrunner_command')
+  const aborted = { error: { info: { code: 'ABORTED' } }, content: [{ type: 'text', text: 'Aborted' }] }
+  assert.match(finalizeContent({ args: { op: 'start' } }, aborted)[1].text, /不要盲目重试/)
+  assert.equal(finalizeContent({ args: { op: 'wait' } }, aborted), undefined)
+  assert.equal(finalizeContent({ args: { op: 'start' } }, { ...aborted, error: { info: { code: 'ABORTED_BEFORE_DISPATCH' } } }), undefined)
+})
+
 test('health preserves all CPU windows, including zero and missing samples', async t => {
   const client = await fixture(t)
   const cpu = { logical_cores: 128, usage_percent: 0.57, usage_5s_percent: 0, usage_60s_percent: null }
@@ -155,7 +164,7 @@ test('keeps project command scope through start, preview, wait, pagination, list
     }
     if (req.method === 'GET' && req.url === collection) return json(res, { commands: [finished] })
     if (req.method === 'DELETE' && req.url === item) { res.writeHead(204); res.end(); return }
-    return json(res, { error: { code: 'not_found' } }, 404)
+    return json(res, { error: { code: 'not_found', message: 'Not found' } }, 404)
   }))
   const run = (op, params) => client.run('command', { op, params_json: JSON.stringify(params) })
   const name = 'Demo'
@@ -204,7 +213,7 @@ test('maps project, action and command endpoints, preserves task and HTTP error 
       json(res, { status: 'failed', stdout_bytes: 2, stderr_bytes: 1, ...streams }); return
     }
     if (req.method === 'POST' && req.url.endsWith('/actions')) {
-      json(res, { error: { code: 'invalid_request' }, action: { phase: 'reset', error: { code: 'reset_blocked' } } }, 400)
+      json(res, { error: { code: 'invalid_request', message: 'Invalid input' }, action: { phase: 'reset', error: { code: 'reset_blocked' } } }, 400)
       return
     }
     if (req.method === 'POST' && req.url === '/commands') { json(res, { id: 'id1', status: 'running' }, 202); return }
@@ -295,12 +304,13 @@ test('start returns terminal logs and never replaces its result with a failed or
   const client = await fixture(t)
   const seen = []
   let followup = 'matching'
-  const action = { status: 'failed', phase: 'run', commit: 'abc1234', exit_code: 7, stdout_bytes: 2, stderr_bytes: 0 }
+  const action = { action_id: 'original', status: 'failed', phase: 'run', commit: 'abc1234', exit_code: 7, stdout_bytes: 2, stderr_bytes: 0 }
   const base = await server(t, (req, res) => {
     seen.push(req.method)
     if (req.method === 'POST') { json(res, action); return }
-    if (followup === 'missing') { json(res, { error: { code: 'not_found' } }, 404); return }
-    json(res, { ...action, commit: followup === 'changed' ? 'def5678' : action.commit,
+    assert.equal(new URL(req.url, 'http://localhost').searchParams.get('include_input'), '1')
+    if (followup === 'missing') { json(res, { error: { code: 'not_found', message: 'Not found' } }, 404); return }
+    json(res, { ...action, action_id: followup === 'changed' ? 'replacement' : action.action_id,
       stdout: { data_base64: 'aGk=', next_offset: 2 }, stderr: { data_base64: '', next_offset: 0 } })
   })
   await client.configure(base)
@@ -324,6 +334,18 @@ test('start returns terminal logs and never replaces its result with a failed or
   assert.equal(only.outcome, 'failed')
   assert(!Object.hasOwn(only, 'logs_error'))
   assert.deepEqual(seen, ['POST', 'GET', 'POST', 'GET', 'POST', 'GET', 'POST'])
+})
+
+test('accepts fractional start wait times without altering the server timeout', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res, body) => {
+    seen.push([req.method, JSON.parse(body).timeout])
+    json(res, { id: '0', status: 'succeeded' })
+  }))
+  const result = await client.run('command', { op: 'start', mode: 'cmd', command: 'echo ok', wait_seconds: 0.0625 })
+  assert.equal(result.outcome, 'succeeded')
+  assert.deepEqual(seen, [['POST', 0.0625]])
 })
 
 test('wait polls only with GET and stops on completion or its own deadline', async t => {
@@ -350,6 +372,40 @@ test('wait polls only with GET and stops on completion or its own deadline', asy
   assert.deepEqual(expired.next_wait, { op: 'wait', id: '0', stdout_offset: 1, stderr_offset: 0 })
   assert.equal((await client.run('command', { ...args, wait_seconds: 0 })).error.code, 'invalid_input')
   assert(methods.length >= 3 && methods.every(method => method === 'GET'))
+})
+
+test('Action wait distinguishes separate runs of the same commit', async t => {
+  const client = await fixture(t)
+  let sameAction = false
+  let hits = 0
+  await client.configure(await server(t, (req, res) => {
+    const url = new URL(req.url, 'http://localhost')
+    assert.equal(url.pathname, '/projects/demo/actions')
+    assert.equal(url.searchParams.get('include_input'), '1')
+    const first = ++hits === 1
+    json(res, { status: first ? 'running' : 'succeeded', action_id: first || sameAction ? 'original' : 'replacement', commit: sameAction && first ? null : 'abcdef' })
+  }))
+  const args = { op: 'wait', name: 'demo', status_only: true, wait_seconds: 2 }
+  const replaced = await client.run('action', args)
+  assert.equal(replaced.error.code, 'task_changed')
+  assert.equal(replaced.next_wait, undefined)
+  sameAction = true
+  hits = 0
+  assert.equal((await client.run('action', args)).outcome, 'succeeded')
+})
+
+test('Action wait falls back to read-only polling on an older Runner', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res) => {
+    seen.push([req.method, req.url])
+    if (req.url.includes('include_input')) {
+      return json(res, { error: { code: 'invalid_request', message: 'Unexpected query parameter' } }, 400)
+    }
+    json(res, { status: 'succeeded', commit: 'abcdef' })
+  }))
+  assert.equal((await client.run('action', { op: 'wait', name: 'demo', status_only: true })).outcome, 'succeeded')
+  assert.deepEqual(seen, [['GET', '/projects/demo/actions?include_input=1'], ['GET', '/projects/demo/actions']])
 })
 
 test('wait bounds an unresponsive request and can be cancelled without mutating the task', async t => {
@@ -401,6 +457,28 @@ test('uses a UTF-8 character boundary as the next log offset', async t => {
   assert.equal((await client.run('command', { ...args, limit: 1 })).error.code, 'invalid_input')
   const tiny = (await client.run('command', { ...args, stdout_offset: first.next_offset, limit: 1, encoding: 'base64' })).stdout
   assert.equal(tiny.next_offset, first.next_offset + 1)
+})
+
+test('keeps a split UTF-8 character at live log EOF until it completes', async t => {
+  const client = await fixture(t)
+  const bytes = Buffer.from('中')
+  let size = 1
+  let status = 'running'
+  await client.configure(await server(t, (req, res) => {
+    const offset = Number(new URL(req.url, 'http://localhost').searchParams.get('stdout_offset'))
+    const page = bytes.subarray(offset, size)
+    json(res, { id: '0', status, stdout_bytes: size, stdout: { next_offset: size, data_base64: page.toString('base64') } })
+  }))
+  const args = { op: 'get', id: '0', stdout_offset: 0 }
+  const first = await client.run('command', args)
+  assert.deepEqual(first.stdout, { text: '', next_offset: 0, remaining: 'caught_up' })
+  assert.deepEqual(first.next_wait, { op: 'wait', id: '0', stdout_offset: 0 })
+  status = 'succeeded'
+  const incomplete = await client.run('command', args)
+  assert.deepEqual(incomplete.stdout, { text: '\ufffd', next_offset: 1, remaining: 'complete' })
+  size = bytes.length
+  const finished = await client.run('command', first.next_wait)
+  assert.deepEqual(finished.stdout, { text: '中', next_offset: size, remaining: 'complete' })
 })
 
 test('handles empty files, bounded byte ranges, and small directory pages', async t => {
@@ -473,9 +551,10 @@ test('uses server directory cursors and falls back to plain reads only for an au
   assert.equal((await client.run('project', { op: 'files', name: 'demo', path: 'file.txt', entry_limit: 1 })).http_status, 400)
   assert.equal((await client.run('project', { op: 'files', name: 'demo', entry_limit: 1, length: 9 })).error.code, 'invalid_input')
   assert.equal((await client.run('project', { op: 'files', name: 'demo', length: 2 })).error.code, 'invalid_input')
+  assert.equal((await client.run('project', { op: 'files', name: 'demo', path: 'now-a-directory', offset: 8 })).error.code, 'not_a_file')
   assert.deepEqual(queries, [{ entry_offset: '0', entry_limit: '2' }, { entry_offset: '1', entry_limit: '2' },
     { path: 'file.txt', entry_offset: '0', entry_limit: '100' }, { path: 'file.txt' },
-    { path: 'file.txt', entry_offset: '0', entry_limit: '1' }])
+    { path: 'file.txt', entry_offset: '0', entry_limit: '1' }, { path: 'now-a-directory' }])
 })
 
 test('passes explicit idempotency keys without automatic retry or merging snapshot logs', async t => {
@@ -512,8 +591,9 @@ test('never follows redirects or retries mutations, and respects an already canc
   const base = await server(t, (req, res) => {
     hits++
     if (req.method === 'POST' && req.url === '/projects/demo') { res.writeHead(502, { 'content-type': 'text/html', 'retry-after': '5' }); res.end('<h1>proxy only</h1>'); return }
+    if (req.method === 'POST' && req.url === '/projects/demo-json') { json(res, { message: 'proxy only' }, 502, { 'retry-after': '5' }); return }
     if (req.method === 'GET') { res.writeHead(302, { location: `${target}/unexpected` }); res.end(); return }
-    json(res, { error: { code: 'server_busy' } }, 503, { 'retry-after': '1' })
+    json(res, { error: { code: 'server_busy', message: 'Too many HTTP connections' } }, 503, { 'retry-after': '1' })
   })
   await client.configure(base)
   const redirect = await client.run('project', { op: 'health' })
@@ -525,10 +605,14 @@ test('never follows redirects or retries mutations, and respects an already canc
   assert.equal(proxy.error.code, 'invalid_response')
   assert.equal(proxy.outcome_unknown, true)
   assert(!JSON.stringify(proxy).includes('proxy only'))
+  const jsonProxy = await client.run('project', { op: 'create', name: 'demo-json', repo_url: 'https://example.invalid/repo.git' })
+  assert.deepEqual([jsonProxy.outcome, jsonProxy.http_status, jsonProxy.retry_after_seconds], ['unknown', 502, 5])
+  assert.equal(jsonProxy.error.code, 'invalid_response')
+  assert(!JSON.stringify(jsonProxy).includes('proxy only'))
   const busy = await client.run('command', { op: 'start', mode: 'cmd', command: 'echo ok' })
   assert.equal(busy.http_status, 503)
   assert.equal(busy.retry_after_seconds, 1)
   assert.equal((await client.run('project', { op: 'health' }, AbortSignal.abort())).error.code, 'cancelled')
-  assert.equal(hits, 3)
+  assert.equal(hits, 4)
   assert.equal(redirectedHits, 0)
 })

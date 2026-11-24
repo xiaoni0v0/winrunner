@@ -1,5 +1,6 @@
 """Exercise the dashboard without launching Tk or listening on a port."""
 
+import base64
 import signal
 import threading
 import unittest
@@ -129,6 +130,25 @@ class PollTests(unittest.TestCase):
             gui.Snapshot(health, projects, busy, selected=gui.ViewData(gui.View())),
         )
 
+    @patch("winrunner_gui._get")
+    def test_collapsed_view_skips_not_yet_dispatched_detail(
+        self, getter: MagicMock
+    ) -> None:
+        view = gui.View("Demo", gui.Target("Demo", "0"))
+        routes = []
+
+        def get(_port, _token, route):
+            routes.append(route)
+            if route == "/health":
+                view.superseded.set()
+                return gui.Response({"run_id": "same"})
+            return gui.Response({})
+
+        getter.side_effect = get
+        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
+        gui._poll(18080, "test-token", threading.Event(), results, view)
+        self.assertEqual(routes, ["/health", "/projects", "/commands", "/health"])
+
     def test_project_detail_is_lazy_and_uses_both_offsets(self) -> None:
         list_commands = MagicMock(return_value=gui.Response({}))
         get_task = MagicMock(return_value=gui.Response({}))
@@ -141,12 +161,12 @@ class PollTests(unittest.TestCase):
             get_task.call_args_list,
             [
                 call(gui.Target("Demo"), None),
-                call(target, {"stdout": 32768, "stderr": 65536}),
+                call(target, {"stdout": 32765, "stderr": 65533}),
             ],
         )
         self.assertEqual(
-            gui._task_route(target, view.offsets()),
-            "/projects/Demo/commands/0?include_input=1&limit=32768&stdout_offset=32768&stderr_offset=65536",
+            gui._task_route(target, get_task.call_args.args[1]),
+            "/projects/Demo/commands/0?include_input=1&limit=32774&stdout_offset=32765&stderr_offset=65533",
         )
         list_commands.reset_mock()
         get_task.reset_mock()
@@ -238,6 +258,33 @@ class IntegratedTests(unittest.TestCase):
         self.assertEqual(dashboard._view, expected)
         dashboard.detail.show.assert_called_once_with(expected, None)
 
+    def test_temporary_disconnect_preserves_selection_and_restart_clears_it(
+        self,
+    ) -> None:
+        dashboard = self.dashboard(MagicMock(), lambda: True)
+        dashboard._run_id = "old"
+        view = gui.View(None, gui.Target(None, "0"), gui.LOG_PAGE, 0, 2)
+        dashboard._view = view
+        dashboard._show(gui.Snapshot(gui.Response(error="busy")))
+        self.assertEqual(dashboard._run_id, "old")
+        self.assertIs(dashboard._view, view)
+        dashboard.commands.show_rows.assert_called_with(
+            [], "等待 Runner 连接", reset=False
+        )
+        dashboard._show(gui.Snapshot(gui.Response({"run_id": "new"})))
+        self.assertIsNone(dashboard._view.target)
+        self.assertTrue(view.superseded.is_set())
+
+    def test_repeated_next_click_does_not_skip_a_page(self) -> None:
+        dashboard = self.dashboard(MagicMock(), lambda: True)
+        dashboard._view = gui.View(None, gui.Target(None, "0"), 0, gui.LOG_PAGE, 2)
+        dashboard._detail_revision = 2
+        dashboard._page("stdout", 1)
+        dashboard._page("stdout", 1)
+        self.assertEqual(
+            dashboard._view.offsets(), {"stdout": gui.LOG_PAGE, "stderr": gui.LOG_PAGE}
+        )
+
     def test_backend_exit_closes_during_a_poll(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -303,6 +350,39 @@ class IntegratedTests(unittest.TestCase):
 
 
 class DisplayTests(unittest.TestCase):
+    def test_log_pages_preserve_utf8_at_live_and_terminal_boundaries(self) -> None:
+        for stream in gui.STREAMS:
+            for char in ("中", "🙂"):
+                prefix = b"x" * (gui.LOG_PAGE - 1)
+                complete = prefix + char.encode()
+                with self.subTest(stream=stream, char=char):
+
+                    def pages(raw, status):
+                        return tuple(
+                            gui._decode_log(
+                                {
+                                    "status": status,
+                                    stream: {
+                                        "data_base64": base64.b64encode(chunk).decode()
+                                    },
+                                },
+                                stream,
+                                offset,
+                            )
+                            for offset, chunk in (
+                                (0, raw),
+                                (gui.LOG_PAGE, raw[gui.LOG_PAGE - gui.LOG_OVERLAP :]),
+                            )
+                        )
+
+                    self.assertEqual(
+                        pages(complete[:-1], "running"), (prefix.decode(), "")
+                    )
+                    self.assertEqual(
+                        pages(complete + b"y", "succeeded"),
+                        (prefix.decode() + char, "y"),
+                    )
+
     def test_short_command_ids_stay_strings(self) -> None:
         commands = gui.Response(
             {

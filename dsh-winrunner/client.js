@@ -143,18 +143,21 @@ function responseJson(bytes) {
   throw new ClientError('invalid_response', 'WinRunner 没有返回有效的 JSON 对象。')
 }
 
-// If a page cuts a UTF-8 scalar, leave its bytes for the next page. Keep
-// tiny pages that contain only this fragment advancing rather than repeating.
+// Leave only a valid, unfinished UTF-8 scalar for the next read. An entire
+// live log chunk can be just that fragment; in that case keep its offset.
 function utf8Page(bytes) {
   let lead = bytes.length - 1
   while (lead >= 0 && bytes.length - lead < 4 && (bytes[lead] & 0xc0) === 0x80) lead--
   const byte = bytes[lead]
   const width = byte >= 0xc2 && byte <= 0xdf ? 2 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 0
-  return lead > 0 && width > bytes.length - lead ? bytes.subarray(0, lead) : bytes
+  if (lead < 0 || width <= bytes.length - lead) return bytes
+  try { new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(lead), { stream: true }) } catch { return bytes }
+  return bytes.subarray(0, lead)
 }
 
 function projectResponse(body, spec) {
   if (spec.file && Array.isArray(body.entries)) {
+    if (spec.file.explicitFile) throw new ClientError('not_a_file', '该路径现在是目录，不能继续按文件字节读取。')
     const { entryOffset: offset, entryLimit } = spec.file
     if (Object.hasOwn(body, 'next_entry_offset')) {
       const next = body.next_entry_offset
@@ -175,11 +178,12 @@ function projectResponse(body, spec) {
       if (chunk && typeof chunk.data_base64 === 'string') {
         const total = body[`${stream}_bytes`]
         const raw = Buffer.from(chunk.data_base64, 'base64')
-        const page = spec.logEncoding === 'utf8' && chunk.next_offset < total ? utf8Page(raw) : raw
+        const storedAhead = chunk.next_offset < total
+        const page = spec.logEncoding === 'utf8' && (storedAhead || !terminal) ? utf8Page(raw) : raw
         const nextOffset = chunk.next_offset - (raw.length - page.length)
         body[stream] = {
           next_offset: nextOffset,
-          remaining: nextOffset < total ? 'available' : terminal ? 'complete' : 'caught_up',
+          remaining: storedAhead ? 'available' : terminal ? 'complete' : 'caught_up',
           ...encoded(page, spec.logEncoding),
         }
       }
@@ -225,6 +229,9 @@ export async function requestRunner(spec, signal, call = {}) {
     const body = status === 204 ? {} : ok && spec.file && contentType === 'application/octet-stream'
       ? await fileResult(response, spec.file)
       : projectResponse(responseJson(await readBody(response, JSON_LIMIT)), spec)
+    if (!ok && (typeof body.error?.code !== 'string' || typeof body.error?.message !== 'string')) {
+      throw new ClientError('invalid_response', 'WinRunner 没有返回符合接口约定的错误对象。')
+    }
     const retryAfter = integerHeader(response.headers['retry-after'])
     return { ...body, ok, http_status: status, ...(retryAfter === undefined ? {} : { retry_after_seconds: retryAfter }) }
   } catch (error) {

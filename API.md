@@ -4,7 +4,7 @@
 
 ## HTTP 约定
 
-- 所有接口要求 `Authorization: Bearer <token>`，缺失或错误返回 `401`。默认最多接纳 64 个并发 HTTP 连接；满额会在鉴权前尝试返回 `503 server_busy` 和 `Retry-After: 1`。这个限制不控制后台任务并发数。
+- 所有接口要求 `Authorization: Bearer <token>`，缺失或错误返回 `401`。默认最多接纳 64 个并发 HTTP 连接；满额会在鉴权前尝试返回 `503` 和 `Retry-After: 1`；已收到方法的非 HEAD 请求附 `server_busy` JSON，尚无法识别方法时不附报文体。这个限制不控制后台任务并发数。
 - POST 用 `Content-Length` 发送 UTF-8 JSON 对象，默认上限 1 MiB。除文件下载、`204` 和无报文体的 `HEAD` 外，响应为 JSON。
 - 错误体为 `{"error":{"code":"…","message":"…"}}`。`400` 表示请求不合法，`404` 表示路由或资源不存在，`405` 表示该路由不支持此方法（附 `Allow`），`409` 表示状态冲突，`413` 表示请求体过大，`500` 表示服务端错误。
 
@@ -41,7 +41,7 @@ Action、项目命令和文件接口使用同一个工作树。不同项目的�
 
 ### 文件
 
-`GET /projects/{name}/files` 浏览或下载当前工作树。可选查询 `path` 为相对路径，省略或留空表示根目录；空格等字符按 URL 查询参数编码。允许访问 `.git`，拒绝绝对路径、越界路径及会越界的链接或目录联接。
+`GET /projects/{name}/files` 浏览或下载当前工作树。可选查询 `path` 为相对路径，省略或留空表示根目录；空格等字符按 URL 查询参数编码。允许访问 `.git`，拒绝绝对路径、父目录组件和 Windows 重解析点；即使链接或目录联接指向工作树内，也不跟随。
 
 - 目录返回 `200` 和 `{"path":"…","entries":[{"name":"…","type":"file","size_bytes":42}]}`。根目录的 `path` 为 `""`；`type` 为 `file`、`directory` 或 `other`，非普通文件的 `size_bytes` 为 `null`。
 - 目录按文件名忽略大小写排序，比较结果相同时按原名排序。查询可传 `entry_offset`（从 0 开始，默认 0）或 `entry_limit`（1 至 1000，默认 100）。传任一项即启用分页，响应附 `next_entry_offset`，`null` 表示末页。分页 JSON 以 512 KiB 为上限；目录变化时可能重复或漏掉条目。不传分页参数时返回完整列表，不附游标。
@@ -52,11 +52,11 @@ Action、项目命令和文件接口使用同一个工作树。不同项目的�
 
 | 接口 | 结果 |
 |---|---|
-| `POST /projects/{name}/actions` | 提交一轮 Action。返回 `200` / `202` 及 `Task`，另含 `commit`（解析出的完整哈希，尚未解析或解析失败为 `null`）。 |
-| `GET /projects/{name}/actions` | `200`：当前或最近一次 Action，结构同 POST，可[按偏移读取日志](<#增量日志>)。 |
+| `POST /projects/{name}/actions` | 提交一轮 Action。返回 `200` / `202` 及 `Task`，另含 `commit`（解析出的完整哈希，未解析时为 `null`）和本轮的 `action_id`。 |
+| `GET /projects/{name}/actions` | `200`：当前或最近一次 Action，默认不含 `action_id`；可[按偏移读取日志](<#增量日志>)。 |
 | `DELETE /projects/{name}/actions` | 等待进程树退出后返回 `204`。已经结束则不改动；不删除记录、日志或产物。 |
 
-GET 和 DELETE 在没有 Action 时返回 `404`，项目正在删除或删除未完成时返回 `409`。POST 在项目未就绪或同项目的 Action 仍在准备、运行或取消时返回 `409`，不覆盖现有任务。Action 没有单独的 ID。
+GET 和 DELETE 在没有 Action 时返回 `404`，项目正在删除或删除未完成时返回 `409`。POST 在项目未就绪或同项目的 Action 仍在准备、运行或取消时返回 `409`，不覆盖现有任务。Action 不通过单独的 ID 寻址；需要识别轮次时，可读取下文的 `action_id`。
 
 | POST 字段 | 含义 |
 |---|---|
@@ -66,7 +66,7 @@ GET 和 DELETE 在没有 Action 时返回 `404`，项目正在删除或删除未
 | `args`（可选） | string[]；默认 `[]`，逐项传给解释器。 |
 | `timeout`（可选） | number；见[提交与等待](<#提交与等待>)。 |
 
-- 请求一旦占槽，就替换旧 Action 记录，使旧文件不可读，并尝试重置工作树。即使随后发现 JSON 或字段不合法，这轮也会替换旧结果；POST 返回 `400 invalid_request`。如果重置也失败，`400` 响应会附 `action` 状态快照（不含日志正文）。
+- 请求一旦占槽，就替换旧 Action 记录，使旧文件不可读，并尝试重置工作树。即使在重置前取消、旧文件仍在磁盘上，也不会重新对外提供。即使随后发现 JSON 或字段不合法，这轮也会替换旧结果；POST 返回 `400 invalid_request`。如果重置也失败，`400` 响应会附 `action` 状态快照（不含日志正文）。
 - 重置完成后刷新并清理远端分支和标签引用，按目标提交干净检出，不 merge。脚本以检出后的工作树为工作目录。找不到可达提交（包括只残留在本地缓存的情况）或匹配不唯一时，分别报 `commit_not_found`、`commit_ambiguous`。
 - 工作树清理受阻时，Action 状态为 `failed`，`phase: reset`，`error.code: reset_blocked`；错误消息包含系统原因，残留文件不会当作新产物提供。若是项目命令占用了目录，暂停提交新命令，等占用目录的命令结束，或逐条 DELETE 并等到 `204`，然后重新提交 Action（如使用幂等键，换新键）。已结束的命令不用删。其他进程仍可能占用文件，停止项目命令不保证 Action 一定成功。
 

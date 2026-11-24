@@ -325,6 +325,12 @@ class CommandIntegrationTests(RunnerCase):
             with self.subTest(bad=bad):
                 self.call(400, "POST", "/commands", dict(valid, **bad))
         self.call(400, "POST", "/commands", b"{")
+        key = {"Idempotency-Key": "malformed-json"}
+        malformed = b'{"mode":"cmd","command":"echo ignored","extra":NaN}'
+        self.call(400, "POST", "/commands", malformed, headers=key)
+        self.call(400, "POST", "/commands", malformed, headers=key)
+        conflict = self.call(409, "POST", "/commands", malformed + b" ", headers=key)
+        self.assertEqual(conflict["error"]["code"], "idempotency_conflict")
         self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
         task = self.call(200, "POST", "/commands", dict(valid, timeout=8))
         self.assertEqual(task["id"], "0")
@@ -742,6 +748,14 @@ class ProjectIntegrationTests(RunnerCase):
         self.assertEqual(entries[".git"]["type"], "directory")
         self.assertIsNone(entries[".git"]["size_bytes"])
         files = project + "/files?"
+        self.assertEqual(
+            self.call(200, "GET", files + urlencode({"path": "././"})), listing
+        )
+        page = self.call(
+            200, "GET", files + urlencode({"path": "././", "entry_limit": 1})
+        )
+        self.assertEqual(page["path"], "")
+        self.assertEqual(page["entries"], listing["entries"][:1])
         head = self.call(200, "GET", files + urlencode({"path": ".git/HEAD"}))
         self.assertEqual(head.strip(), b"ref: refs/heads/fixture-main")
         file_url = files + urlencode({"path": "read me.txt"})
@@ -908,7 +922,7 @@ class ProjectIntegrationTests(RunnerCase):
         project = self.register()
         endpoint = project + "/actions"
         args = ["with spaces", "a&b", '"quoted"']
-        self.action(project, args=args)
+        accepted = self.action(project, args=args)
         expected_stdout = json.dumps(args).encode("ascii")
         running = self.poll(
             endpoint,
@@ -923,6 +937,7 @@ class ProjectIntegrationTests(RunnerCase):
             "action_id"
         ]
         self.assertTrue(original_action)
+        self.assertEqual(accepted["action_id"], original_action)
         self.assertEqual(running["output_source"], "process")
         self.assertEqual(json.loads(log_bytes(running, "stdout")), args)
         self.assertEqual(log_bytes(running, "stderr"), b"action-stderr")

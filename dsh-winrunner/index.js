@@ -14,7 +14,6 @@ const taskOptions = `start/wait 可传 wait_seconds（start 默认 0，短任务
 const startKeyHelp = 'start 可传 idempotency_key（1–128 个字母、数字或 ._~-）；新提交用新键，只有确认同一 Runner 进程后，才可用原键和原参数（包括 wait_seconds）恢复断线提交。重放仅返回原提交快照，当前状态用 get 查询。'
 const taskLogKeys = ['status_only', 'stdout_offset', 'stderr_offset', 'limit', 'encoding']
 const exampleCall = (op, params = {}) => JSON.stringify({ op, params_json: JSON.stringify(params) })
-// DSH's output schema dialect cannot express a number/null type union.
 const cpuMetric = description => ({ description: `${description} 数字百分比，或 null。` })
 const cpuOutput = {
   type: 'object',
@@ -98,23 +97,25 @@ function startOptions(args, timeout) {
   if (key !== undefined && (typeof key !== 'string' || key.length < 1 || key.length > 128 || /[^A-Za-z0-9._~-]/.test(key))) {
     invalid('idempotency_key 必须是 1–128 个字母、数字或 ._~-。')
   }
-  return { idempotencyKey: key, deadline: (timeout + 20) * 1000 }
+  return { idempotencyKey: key, deadline: Math.ceil((timeout + 20) * 1000) }
 }
 
-function getTask(path, args) {
+function getTask(path, args, identifyAction = false) {
   validateStatusOnly(args)
+  const params = new URLSearchParams()
+  if (identifyAction) params.set('include_input', 1)
   if (args.status_only) {
     if (['stdout_offset', 'stderr_offset', 'limit', 'encoding'].some(key => args[key] !== undefined)) {
       invalid('status_only 为 true 时不要传日志参数。')
     }
-    return request('GET', path)
+    return request('GET', queryPath(path, params))
   }
-  const params = new URLSearchParams()
+  const hasOffsets = args.stdout_offset !== undefined || args.stderr_offset !== undefined
   for (const key of ['stdout_offset', 'stderr_offset']) {
     if (args[key] !== undefined) params.set(key, nonnegative(args[key], key, 0, Number.MAX_SAFE_INTEGER))
   }
-  const defaultLimit = params.size ? 4096 : 2048
-  if (!params.size) {
+  const defaultLimit = hasOffsets ? 4096 : 2048
+  if (!hasOffsets) {
     params.set('stdout_offset', 0)
     params.set('stderr_offset', 0)
   }
@@ -157,7 +158,7 @@ function forProject(args) {
     const length = pageBytes(args.length, 'length', 4096, limits.file, encoding)
     const entryLimit = nonnegative(args.entry_limit === undefined ? limits.entries : args.entry_limit, 'entry_limit', 1, 1000)
     const entryOffset = nonnegative(args.entry_offset === undefined ? 0 : args.entry_offset, 'entry_offset', 0, Number.MAX_SAFE_INTEGER - entryLimit)
-    const file = { offset, length, entryOffset, entryLimit, encoding }
+    const file = { offset, length, entryOffset, entryLimit, encoding, explicitFile }
     const plain = request('GET', queryPath(`${path}/files`, params), { file })
     if (explicitFile) return plain
     params.set('entry_offset', entryOffset)
@@ -184,7 +185,7 @@ function forAction(args) {
   }
   if (args.op === 'get' || args.op === 'wait') {
     select(args, ['name', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
-    return getTask(path, args)
+    return getTask(path, args, args.op === 'wait')
   }
   select(args, ['name'])
   return request('DELETE', path, { deadline: 30000 })
@@ -258,13 +259,16 @@ async function withStartLogs(group, args, response, signal, call) {
   const target = taskTarget(group, args, response)
   if (!target) return { ...response, logs_error: { code: 'missing_task_id', message: '未收到命令 ID，无法查询日志。' } }
   try {
-    const preview = builders[group]({ op: 'get', ...target })
+    const preview = group === 'action' && typeof response.action_id === 'string'
+      ? getTask(`${projectPath(target.name)}/actions`, {}, true)
+      : builders[group]({ op: 'get', ...target })
     const logged = await requestRunner({ ...preview, deadline: 4000 }, signal, call)
     if (!logged.ok) {
       return { ...response, logs_error: { ...logged.error, http_status: logged.http_status } }
     }
     const fields = ['status', 'phase', 'commit', 'id', 'exit_code', 'output_source', 'stdout_bytes', 'stderr_bytes']
-    if (fields.some(key => logged[key] !== response[key]) ||
+    if ((typeof response.action_id === 'string' && logged.action_id !== response.action_id) ||
+        fields.some(key => logged[key] !== response[key]) ||
         logged.error?.code !== response.error?.code || logged.error?.message !== response.error?.message) {
       throw new ClientError('task_changed', '补读时当前任务已不同，没有合并日志。')
     }
@@ -283,10 +287,18 @@ async function waitForTask(spec, seconds, signal, call) {
   let last
   try {
     while (!polling.aborted) {
-      const response = await requestRunner(spec, polling, call)
+      let response = await requestRunner(spec, polling, call)
+      if (!last && response.http_status === 400 && response.error?.code === 'invalid_request' &&
+          response.error.message === 'Unexpected query parameter' && spec.path.includes('?include_input=1')) {
+        // Older Runner versions do not expose the Action identity query.
+        const path = spec.path.replace(/\?include_input=1(?:&|$)/, match => match.endsWith('&') ? '?' : '')
+        spec = { ...spec, path }
+        response = await requestRunner(spec, polling, call)
+      }
       if (!response.ok) return response
-      if (last?.commit && response.commit !== last.commit) {
-        throw new ClientError('task_changed', '等待期间项目的当前提交变了；未把新一轮当作原任务。')
+      const replaced = typeof last?.action_id === 'string' && response.action_id !== last.action_id
+      if (replaced || (last?.commit && response.commit !== last.commit)) {
+        throw new ClientError('task_changed', '等待期间项目的 Action 已被替换；未把新一轮当作原任务。')
       }
       if (!active.has(response.status)) return response
       last = response
@@ -395,6 +407,12 @@ function definition(group, { description, ops, params }) {
       render(_args, value) { return [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     },
     timeoutMs: 130000,
+    finalizeContent(exec, result) {
+      // DSH can replace execute's return value with a canonical abort after dispatch.
+      if (result.error?.info?.code === 'ABORTED' && ['start', 'create', 'delete', 'cancel'].includes(exec.args?.op)) {
+        return [...result.content, { type: 'text', text: '本地工具调用已取消，远端写操作可能已经生效。先在同一台 Runner 查询状态，不要盲目重试。' }]
+      }
+    },
     isConcurrencySafe: args => readOnly.has(args?.op),
     async execute(raw, exec) {
       let args

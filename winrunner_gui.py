@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import http.client
 import json
 import math
@@ -13,7 +14,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from queue import Empty, SimpleQueue
@@ -33,6 +34,8 @@ INTEGRATED_REFRESH_MS = 850
 REOPEN_MS = 450
 BACKEND_EXIT_MS = 850
 LOG_PAGE = 32768
+LOG_OVERLAP = 3  # Longest UTF-8 scalar minus one byte.
+LOG_READ = LOG_PAGE + 2 * LOG_OVERLAP
 STREAMS = ("stdout", "stderr")
 
 BG = "#eef3f8"
@@ -111,6 +114,9 @@ class View:
     stdout: int = 0
     stderr: int = 0
     revision: int = 0
+    superseded: threading.Event = field(
+        default_factory=threading.Event, compare=False, repr=False
+    )
 
     def offsets(self) -> dict[str, int]:
         return {"stdout": self.stdout, "stderr": self.stderr}
@@ -142,7 +148,7 @@ def _get(port: int, token: str, route: str) -> Response:
         and (
             not sep
             or re.fullmatch(
-                rf"include_input=1&limit={LOG_PAGE}&stdout_offset=[0-9]+&stderr_offset=[0-9]+",
+                rf"include_input=1&limit={LOG_READ}&stdout_offset=[0-9]+&stderr_offset=[0-9]+",
                 query,
             )
         )
@@ -219,12 +225,19 @@ def read_view(
     get_task: Callable[[Target, dict[str, int] | None], Response],
 ) -> ViewData:
     action = commands = detail = None
-    if view.project is not None:
+    if view.project is not None and not view.superseded.is_set():
         if view.target != Target(view.project):
             action = get_task(Target(view.project), None)
-        commands = list_commands(view.project)
-    if view.target is not None:
-        detail = get_task(view.target, view.offsets())
+        if not view.superseded.is_set():
+            commands = list_commands(view.project)
+    if view.target is not None and not view.superseded.is_set():
+        detail = get_task(
+            view.target,
+            {
+                stream: max(0, start - LOG_OVERLAP)
+                for stream, start in view.offsets().items()
+            },
+        )
         if view.target.command is None:
             action = detail
     return ViewData(view, action, commands, detail)
@@ -237,7 +250,7 @@ def _task_route(target: Target, offsets: dict[str, int] | None) -> str:
     query = urlencode(
         {
             "include_input": 1,
-            "limit": LOG_PAGE,
+            "limit": LOG_READ,
             **{f"{key}_offset": value for key, value in offsets.items()},
         }
     )
@@ -500,6 +513,11 @@ class StatusTable(tk.Frame):
     def show_rows(
         self, rows: list[Row], error: str = "", *, reset: bool = False
     ) -> None:
+        if error and not reset and self._rendered:
+            self.summary.configure(
+                text=f"暂不可用 · 保留上次 {len(self._rendered)} 条", fg=AMBER
+            )
+            return
         if reset or rows != self._rendered:
             old = self.tree.get_children()
             ids = {key for key, _, _ in rows}
@@ -547,18 +565,53 @@ def _find(response: Response | None, collection: str, key: str) -> JsonObject:
     return {}
 
 
-def _decode_log(data: JsonObject, stream: str) -> str:
+def _utf8_boundary(raw: bytes, point: int, *, live: bool) -> int:
+    """Assign a character spanning two pages to the page where it begins."""
+    for lead in range(point - 1, max(-1, point - LOG_OVERLAP - 1), -1):
+        byte = raw[lead]
+        if byte & 0xC0 == 0x80:
+            continue
+        width = (
+            2
+            if 0xC2 <= byte <= 0xDF
+            else 3 if 0xE0 <= byte <= 0xEF else 4 if 0xF0 <= byte <= 0xF4 else 0
+        )
+        end = lead + width
+        if point < end and (end <= len(raw) or live):
+            try:
+                codecs.getincrementaldecoder("utf-8")().decode(
+                    raw[lead:end], final=not live
+                )
+            except UnicodeDecodeError:
+                break
+            return min(end, len(raw))
+        break
+    return point
+
+
+def _decode_log(data: JsonObject, stream: str, start: int = 0) -> str:
     encoded = _text(_object(data.get(stream)).get("data_base64"), "")
     try:
         raw = base64.b64decode(encoded, validate=True)
     except ValueError:
         return "[日志数据无效]"
+    prefix = min(start, LOG_OVERLAP, len(raw))
+    page_end = min(len(raw), prefix + LOG_PAGE)
+    live = data.get("status") in ("preparing", "running", "cancelling")
+    page = raw[
+        _utf8_boundary(raw, prefix, live=live) : _utf8_boundary(
+            raw, page_end, live=live
+        )
+    ]
     try:
-        return raw.decode("utf-8")
+        return codecs.getincrementaldecoder("utf-8")().decode(page, final=not live)
     except UnicodeDecodeError:
         # CMD and Windows native tools may use the console OEM code page.
-        encoding = "oem" if data.get("mode") == "cmd" else "utf-8"
-        return raw.decode(encoding, errors="replace")
+        if data.get("mode") == "cmd":
+            return raw[prefix:page_end].decode("oem", errors="replace")
+        return codecs.getincrementaldecoder("utf-8")(errors="replace").decode(
+            page, final=not live
+        )
 
 
 class ReadOnlyText(tk.Frame):
@@ -694,10 +747,9 @@ class TaskDetail(tk.Frame):
         self.diagnostics.show("\n\n".join(diag) or ("暂无诊断" if data else ""))
         for stream, start in view.offsets().items():
             total = data.get(f"{stream}_bytes")
-            end = _object(data.get(stream)).get("next_offset")
             total = total if type(total) is int else 0
-            end = end if type(end) is int else start
-            self.outputs[stream].show(_decode_log(data, stream))
+            end = max(start, min(total, start + LOG_PAGE))
+            self.outputs[stream].show(_decode_log(data, stream, start))
             self.tabs.tab(
                 self.outputs[stream].master,
                 text=f"{stream}  {_size(data.get(f'{stream}_bytes'))}",
@@ -731,6 +783,7 @@ class Dashboard:
         self._is_running = is_running
         self._view = View()
         self._action_id: str | None = None
+        self._detail_revision: int | None = None
         self._snapshot = Snapshot(Response())
 
         if snapshot is None:
@@ -926,6 +979,7 @@ class Dashboard:
         old = self._view
         if (old.project, old.target) == (project, target):
             return
+        old.superseded.set()
         self._view = View(project, target, revision=old.revision + 1)
         self._action_id = None
         if target is None:
@@ -940,10 +994,11 @@ class Dashboard:
 
     def _page(self, stream: str, direction: int) -> None:
         view = self._view
-        if view.target is None:
+        if view.target is None or self._detail_revision != view.revision:
             return
         offsets = view.offsets()
         offsets[stream] = max(0, offsets[stream] + direction * LOG_PAGE)
+        view.superseded.set()
         self._view = View(
             view.project,
             view.target,
@@ -1044,7 +1099,8 @@ class Dashboard:
                 _rows(data.commands, "commands")
                 if data
                 else ([], "正在读取项目…" if name else "选择项目后显示")
-            )
+            ),
+            reset=data is None,
         )
 
     def _show(self, snapshot: Snapshot) -> None:
@@ -1075,11 +1131,12 @@ class Dashboard:
                 text=snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
             )
         self.run.configure(text=f"只读  ·  Runner ID  {run_id}")
-        reset = self._run_id != run_id
+        reset = run_id != DASH and self._run_id != run_id
         if reset and self._run_id != DASH:
             self._collapse()
             self._set_view(None, None)
-        self._run_id = run_id
+        if run_id != DASH:
+            self._run_id = run_id
         self.projects.show_rows(*_rows(snapshot.projects, "projects"), reset=reset)
         self.commands.show_rows(*_rows(snapshot.commands, "commands"), reset=reset)
         view = self._view
@@ -1106,7 +1163,10 @@ class Dashboard:
                     self.detail.show(self._view, None)
                 else:
                     self.detail.show(view, result)
-        elif not health or reset:
+                    self._detail_revision = (
+                        view.revision if result and result.data else None
+                    )
+        elif reset:
             self._update_project(None)
 
     def close(self) -> None:

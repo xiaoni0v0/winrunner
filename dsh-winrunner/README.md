@@ -37,7 +37,7 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 
 Action 和命令的 `start` 可选 `idempotency_key`（1–128 个字母、数字或 `._~-`）。新提交用新键。确认地址未变、Runner 未重启，且项目命令所属的项目未删除重建后，才用原键和原参数（包括 `wait_seconds`）重试；客户端不会自动重提。键只在本次 Runner 进程内有效，服务端最多记录 4096 个键。带键的响应是首次提交快照，可能不是当前状态；客户端不把当前日志合并进旧快照，另用返回的 `next_get` 或 `next_wait` 查询。同键正在处理时稍后用原键重试；已明确收到失败结果后若要发起新提交，应换新键。
 
-长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 只按项目名查询当前轮次，日志读完前不要对同一项目再次 `start`。客户端补读时会拒绝明显不同的快照，但无法区分状态、提交和输出长度都相同的两次运行；不会在每次轮询时另外调用 `health`。
+长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 只按项目名查询当前轮次，日志读完前不要对同一项目再次 `start`。同一次 Action `wait` 会检查轮次标记，避免把同一提交的新一轮误认为旧任务。`start` 的附带日志预览也会核对回执中的轮次标记；旧版 Runner 不提供该标记时，只能比较可见快照。跨工具调用仍由调用方核对目标，不会在每次轮询时另外调用 `health`。项目和命令列表不分页；超过客户端 512 KiB JSON 上限时，插件会返回 `response_too_large`，需要直接调用 HTTP API 或清理不再需要的历史命令。
 
 例如 `start` 返回 `{"outcome":"pending","next_wait":{"op":"wait","params_json":"{\"name\":\"demo\"}"}}`，直接用同一个工具执行 `next_wait`。脚本退出码非零时，`outcome` 为 `failed`，即使 `http_status` 为 200。PowerShell 命令传原文，不用额外加一层引号或自行 Base64；CMD 语法与变量展开仍由 CMD 解释。
 

@@ -5,6 +5,7 @@ import http.client
 import io
 from pathlib import Path
 import json
+import signal
 import socket
 import struct
 import sys
@@ -168,7 +169,7 @@ class HTTPRegressionTests(unittest.TestCase):
                 runner.get_command.assert_called_once_with(
                     "0",
                     {"stdout": 0, "stderr": 0},
-                    32768,
+                    32774,
                     name="demo",
                     include_input=True,
                 )
@@ -189,6 +190,26 @@ class HTTPRegressionTests(unittest.TestCase):
                 serve_with_gui(server)
             gui.assert_called_once()
             self.assertFalse(self.backend_is_running())
+
+    def test_ctrl_c_during_integrated_http_start_stops_worker(self):
+        with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
+            server.runner = Mock()
+            started = threading.Thread.start
+            workers = []
+
+            def start_then_interrupt(worker):
+                started(worker)
+                workers.append(worker)
+                signal.raise_signal(signal.SIGINT)
+
+            with (
+                patch.object(threading.Thread, "start", start_then_interrupt),
+                patch("winrunner_gui.run_integrated") as gui,
+            ):
+                serve_with_gui(server)
+            gui.assert_not_called()
+            self.assertEqual(len(workers), 1)
+            self.assertFalse(workers[0].is_alive())
 
     def test_project_creation_uses_path_name_and_logs_only_repository_host(self):
         self.start_server(reported_peer="203.0.113.42")
@@ -293,10 +314,14 @@ class HTTPRegressionTests(unittest.TestCase):
             self.assertTrue(self.server.worker_started.wait(3))
             status, body, headers = self.request("GET", "/projects")
             self.assertEqual(status, 503)
-            self.assertEqual(body["error"]["code"], "server_busy")
+            # GET may arrive after the bounded overload read on Windows.
+            if body:
+                self.assertEqual(body["error"]["code"], "server_busy")
+                self.assertEqual(headers.get_content_type(), "application/json")
+            else:
+                self.assertEqual(headers["Content-Length"], "0")
             self.assertEqual(headers["Retry-After"], "1")
             self.assertEqual(headers["Connection"], "close")
-            self.assertEqual(headers.get_content_type(), "application/json")
             with socket.create_connection(
                 ("127.0.0.1", self.port), timeout=3
             ) as waiting:
@@ -304,9 +329,14 @@ class HTTPRegressionTests(unittest.TestCase):
                 with http.client.HTTPResponse(waiting) as response:
                     response.begin()
                     self.assertEqual(response.status, 503)
-                    self.assertEqual(
-                        json.loads(response.read())["error"]["code"], "server_busy"
-                    )
+                    self.assertEqual(response.getheader("Retry-After"), "1")
+                    self.assertEqual(response.read(), b"")
+            with socket.create_connection(("127.0.0.1", self.port), timeout=3) as head:
+                head.sendall(b"HEAD /projects HTTP/1.1\r\nHost: local\r\n\r\n")
+                with head.makefile("rb") as response:
+                    headers, body = response.read().split(b"\r\n\r\n", 1)
+                self.assertIn(b"503 Service Unavailable", headers)
+                self.assertEqual(body, b"")
             self.assertEqual(self.server.worker_count, 1)
             self.assertEqual(self.runner.mock_calls, [])
         self.assertTrue(self.server.worker_done.wait(3))
