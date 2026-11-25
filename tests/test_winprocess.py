@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 if os.name == "nt":
+    import winprocess
     from winprocess import (
         CpuSampler,
         Job,
@@ -246,6 +247,194 @@ class WinProcessTests(unittest.TestCase):
             )
         self.assertEqual(started, [])
         self.assertEqual(self.run_python("pass"), 0)
+
+    def test_second_reader_start_failure_never_runs_child(self):
+        marker = self.cwd / "ran"
+        started = []
+        readers = []
+        original_start = threading.Thread.start
+        failure = RuntimeError("could not start stderr reader")
+
+        def start(thread):
+            if thread.name == "winprocess-pipe":
+                readers.append(thread)
+                if len(readers) == 2:
+                    raise failure
+            original_start(thread)
+
+        with (
+            patch.object(threading.Thread, "start", start),
+            patch("winprocess._ResumeThread", wraps=winprocess._ResumeThread) as resume,
+        ):
+            worker = self.start_worker(
+                lambda: self.run_python(
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
+                    str(marker),
+                    on_started=lambda: started.append(True),
+                )
+            )
+            self.assertIs(self.finish(worker), failure)
+            resume.assert_not_called()
+        self.assertFalse(marker.exists())
+        self.assertEqual(started, [])
+        self.assertEqual(len(readers), 2)
+        self.assertFalse(any(reader.is_alive() for reader in readers))
+        self.assertEqual(self.run_python("pass"), 0)
+
+    def test_resume_failure_reaps_suspended_child(self):
+        def fail_resume(_thread):
+            winprocess.C.set_last_error(5)
+            return 0xFFFFFFFF
+
+        started = threading.Event()
+        with patch("winprocess._ResumeThread", side_effect=fail_resume):
+            worker = self.start_worker(
+                lambda: self.run_python("print('must not run')", on_started=started.set)
+            )
+            result = self.finish(worker)
+        self.assertIsInstance(result, OSError)
+        self.assertEqual(result.winerror, 5)
+        self.assertFalse(started.is_set())
+        self.assertEqual(self.out, b"")
+        self.assertEqual(self.run_python("pass"), 0)
+
+    def test_cancel_while_starting_readers_never_resumes_child(self):
+        starting, release, started = (threading.Event() for _ in range(3))
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "winprocess-pipe" and not starting.is_set():
+                starting.set()
+                if not release.wait(8):
+                    raise TimeoutError("test did not release reader setup")
+            original_start(thread)
+
+        with (
+            patch.object(threading.Thread, "start", start),
+            patch("winprocess._ResumeThread", wraps=winprocess._ResumeThread) as resume,
+        ):
+            worker = self.start_worker(
+                lambda: self.run_python("print('must not run')", on_started=started.set)
+            )
+            try:
+                self.assertTrue(starting.wait(8))
+                with self.assertRaisesRegex(RuntimeError, "Overlapping runs"):
+                    self.run_python("pass")
+                self.job.cancel()
+            finally:
+                release.set()
+            result = self.finish(worker)
+            resume.assert_not_called()
+        self.assertIsInstance(result, JobCancelled)
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(started.is_set())
+        self.assertEqual(self.out, b"")
+
+    def test_monitor_failure_keeps_primary_error_and_drains_logs(self):
+        for failed_operation, expected_log in (
+            ("_QueryInformationJobObject", "Could not query the failed job"),
+            ("_TerminateJobObject", "trying kill-on-close"),
+        ):
+            with self.subTest(failed_operation=failed_operation):
+                self.job = self.new_job()
+                self.out.clear()
+                self.err.clear()
+                stdout_seen, stderr_seen, release_reads = (
+                    threading.Event() for _ in range(3)
+                )
+                failure = RuntimeError("on_started failed")
+                gate = self.cwd / f"write-tail-{failed_operation}"
+                written = self.cwd / f"written-{failed_operation}"
+
+                def capture(buffer, seen):
+                    def collect(data):
+                        buffer.extend(data)
+                        seen.set()
+                        if not release_reads.wait(8):
+                            raise TimeoutError("test did not release output reader")
+
+                    return collect
+
+                def started():
+                    self.assertTrue(stdout_seen.wait(8))
+                    self.assertTrue(stderr_seen.wait(8))
+                    gate.touch()
+                    deadline = time.monotonic() + 8
+                    while not written.exists():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "child did not write the remaining output"
+                            )
+                        time.sleep(0.01)
+                    self.assertEqual((self.out, self.err), (b"out", b"\xfferr"))
+                    raise failure
+
+                def cleanup_failed(*_args):
+                    release_reads.set()
+                    winprocess.C.set_last_error(5)
+                    return 0
+
+                with (
+                    patch(f"winprocess.{failed_operation}", side_effect=cleanup_failed),
+                    self.assertLogs("winprocess", level="ERROR") as diagnostics,
+                ):
+                    worker = self.start_worker(
+                        lambda: self.run_python(
+                            "import os, pathlib, sys, time\n"
+                            "os.write(1, b'out'); os.write(2, b'\\xfferr')\n"
+                            "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(.01)\n"
+                            "os.write(1, b'-tail'); os.write(2, b'-tail')\n"
+                            "pathlib.Path(sys.argv[2]).touch(); time.sleep(60)\n",
+                            str(gate),
+                            str(written),
+                            stdout=capture(self.out, stdout_seen),
+                            stderr=capture(self.err, stderr_seen),
+                            on_started=started,
+                        )
+                    )
+                    try:
+                        self.assertIs(self.finish(worker), failure)
+                    finally:
+                        release_reads.set()
+                self.assertTrue(
+                    any(expected_log in line for line in diagnostics.output)
+                )
+                self.assertEqual((self.out, self.err), (b"out-tail", b"\xfferr-tail"))
+                if failed_operation == "_TerminateJobObject":
+                    with self.assertRaises(JobCancelled):
+                        self.run_python("pass")
+                else:
+                    self.assertEqual(self.run_python("pass"), 0)
+
+    def test_double_cleanup_failure_does_not_wait_for_live_pipes(self):
+        failure = RuntimeError("could not resume")
+        close_handle = winprocess._CloseHandle
+        job_handle = self.job._handle
+
+        def fail_to_close_job(handle):
+            if handle == job_handle:
+                winprocess.C.set_last_error(5)
+                return 0
+            return close_handle(handle)
+
+        with (
+            patch("winprocess._ResumeThread", side_effect=failure),
+            patch("winprocess._TerminateJobObject", return_value=0),
+            patch("winprocess._CloseHandle", side_effect=fail_to_close_job),
+            self.assertLogs("winprocess", level="ERROR") as diagnostics,
+        ):
+            worker = self.start_worker(lambda: self.run_python("pass"))
+            self.assertIs(self.finish(worker, timeout=3), failure)
+        self.assertTrue(
+            any("trying kill-on-close" in line for line in diagnostics.output)
+        )
+        self.assertTrue(
+            any("Could not stop the failed job" in line for line in diagnostics.output)
+        )
+        # Real close still has the handle and can terminate the suspended child.
+        self.job.close()
+        with self.assertRaises(JobCancelled):
+            self.run_python("pass")
 
     def test_concurrent_jobs_have_independent_streams(self):
         gate = self.cwd / "release"

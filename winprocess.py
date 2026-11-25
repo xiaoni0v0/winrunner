@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections import deque
 import ctypes as C
 from ctypes import wintypes as W
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, suppress
 import errno
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import subprocess
 import threading
 import time
 from typing import Callable, cast
+
+LOG = logging.getLogger(__name__)
 
 
 class JobCancelled(Exception):
@@ -165,6 +168,7 @@ _CreateProcess = _native(
     _P(_ProcessInformation),
 )
 _ReadFile = _native("ReadFile", _B, _H, _PTR, _D, _P(_D), _PTR)
+_ResumeThread = _native("ResumeThread", _D, _H)
 _WaitForSingleObject = _native("WaitForSingleObject", _D, _H, _D)
 _GetExitCodeProcess = _native("GetExitCodeProcess", _B, _H, _P(_D))
 _GetSystemTimes = _native("GetSystemTimes", _B, *([_P(W.FILETIME)] * 3))
@@ -179,6 +183,7 @@ _JOB_LIST = 0x0002000D
 _HANDLE_LIST = 0x00020002
 _STARTF_USESTDHANDLES = 0x100
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_CREATE_SUSPENDED = 0x4
 _CREATE_UNICODE_ENVIRONMENT = 0x400
 _CREATE_NO_WINDOW = 0x08000000
 _DUPLICATE_SAME_ACCESS = 2
@@ -187,6 +192,7 @@ _ERROR_INSUFFICIENT_BUFFER = 122
 _ERROR_BROKEN_PIPE = 109
 _ERROR_HANDLE_EOF = 38
 _ERROR_NO_DATA = 232
+_WAIT_TIMEOUT = 258
 _INFINITE = 0xFFFFFFFF
 _CANCEL_EXIT_CODE = 1
 
@@ -217,14 +223,39 @@ def _inheritable(handle: int, temporary: ExitStack) -> int:
     return duplicate_handle
 
 
-def _output_pipe(resources: ExitStack, temporary: ExitStack) -> tuple[int, int]:
+class _PipeReader:
+    """Transfer ownership to the reader when it begins execution."""
+
+    def __init__(self, handle: int):
+        self._handle: int | None = handle
+        self._lock = threading.Lock()
+
+    def take(self) -> int | None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+            return handle
+
+    def close(self):
+        # CloseHandle can block behind a synchronous ReadFile. Once a reader
+        # takes the pipe, only that thread may close it, even if we abandon it.
+        handle = self.take()
+        if handle is not None:
+            _CloseHandle(handle)
+
+
+def _output_pipe(resources: ExitStack, temporary: ExitStack) -> tuple[_PipeReader, int]:
     reader, writer = _H(), _H()
     _check(_CreatePipe(C.byref(reader), C.byref(writer), None, 0))
     # The successful call fills both output handles.
     read_handle, write_handle = cast(int, reader.value), cast(int, writer.value)
-    resources.callback(_CloseHandle, read_handle)
     try:
-        return read_handle, _inheritable(write_handle, temporary)
+        try:
+            pipe = _PipeReader(read_handle)
+            resources.callback(pipe.close)
+        except BaseException:
+            _CloseHandle(read_handle)
+            raise
+        return pipe, _inheritable(write_handle, temporary)
     finally:
         _CloseHandle(write_handle)
 
@@ -292,7 +323,8 @@ def _launch(job, resources, command, environment, directory, executable):
         startup.StartupInfo.hStdError = err_write
         startup.lpAttributeList = C.addressof(attributes)
         process = _ProcessInformation()
-        # The kernel attaches the job during creation, before user code executes.
+        # The kernel attaches the job during creation. Keep it suspended until
+        # both pipe readers are started so a setup failure cannot run user code.
         _check(
             _CreateProcess(
                 executable,
@@ -301,6 +333,7 @@ def _launch(job, resources, command, environment, directory, executable):
                 None,
                 True,
                 _EXTENDED_STARTUPINFO_PRESENT
+                | _CREATE_SUSPENDED
                 | _CREATE_UNICODE_ENVIRONMENT
                 | _CREATE_NO_WINDOW,
                 environment,
@@ -310,24 +343,28 @@ def _launch(job, resources, command, environment, directory, executable):
             )
         )
         resources.callback(_CloseHandle, process.hProcess)
-        _CloseHandle(process.hThread)
-        return process.hProcess, out_read, err_read
+        resources.callback(_CloseHandle, process.hThread)
+        return process.hProcess, process.hThread, out_read, err_read
 
 
-def _drain(handle, callback, failures):
+def _drain(pipe, callback, failures, buffer, count, abandoned):
+    handle = pipe.take()
+    if handle is None:
+        return
     try:
-        buffer = C.create_string_buffer(65536)
-        count = _D()
-        while True:
+        while not abandoned.is_set():
             if not _ReadFile(handle, buffer, len(buffer), C.byref(count), None):
                 error = C.get_last_error()
                 if error in (_ERROR_BROKEN_PIPE, _ERROR_HANDLE_EOF, _ERROR_NO_DATA):
                     return
                 raise C.WinError(error)
-            if count.value:
+            if count.value and not abandoned.is_set():
                 callback(buffer[: count.value])
     except BaseException as error:
         failures.put(error)
+    finally:
+        with _cleanup_step("Could not close a job output pipe"):
+            _check(_CloseHandle(handle))
 
 
 def _raise_reader_failure(failures):
@@ -359,17 +396,42 @@ def _wait_empty(job, failures=None):
         time.sleep(0.015)
 
 
-def _monitor(job, process, out_read, err_read, stdout, stderr, on_started):
-    failures: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
-    readers = []
+@contextmanager
+def _cleanup_step(message):
     try:
+        yield
+    except BaseException:
+        # Neither cleanup nor a faulty logging handler may replace the error.
+        with suppress(BaseException):
+            LOG.exception(message)
+
+
+def _monitor(
+    job, process, out_read, err_read, stdout, stderr, resume, abort, on_started
+):
+    readers: list[threading.Thread] = []
+    abandoned = None
+    try:
+        failures: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+        abandoned = threading.Event()
         for handle, callback in ((out_read, stdout), (err_read, stderr)):
             reader = threading.Thread(
-                target=_drain, args=(handle, callback, failures), name="winprocess-pipe"
+                target=_drain,
+                args=(
+                    handle,
+                    callback,
+                    failures,
+                    C.create_string_buffer(65536),
+                    _D(),
+                    abandoned,
+                ),
+                name="winprocess-pipe",
+                daemon=True,
             )
-            reader.start()
             readers.append(reader)
-        if on_started is not None:
+            reader.start()
+        _raise_reader_failure(failures)
+        if resume() and on_started is not None:
             on_started()
         _wait_empty(job, failures)
         for reader in readers:
@@ -381,12 +443,27 @@ def _monitor(job, process, out_read, err_read, stdout, stderr, on_started):
         _check(_GetExitCodeProcess(process, C.byref(code)))
         return code.value
     except BaseException:
-        # Failure in caller code or during monitoring must not leave work in
-        # this job, including children which no longer share the output pipes.
-        _check(_TerminateJobObject(job, _CANCEL_EXIT_CODE))
-        _wait_empty(job)
+        # Stop the writers before joining readers. Even if accounting fails,
+        # drain the buffers through the original log callbacks before raising.
+        accounting = None
+        with _cleanup_step("Could not stop the failed job"):
+            accounting = abort()
+        if accounting:
+            with _cleanup_step("Could not query the failed job during cleanup"):
+                _wait_empty(job)
+        stopped = accounting is not None
+        if not stopped and abandoned is not None:
+            # Both termination and kill-on-close failed. A writer may still
+            # hold the pipe open; don't wait indefinitely or publish more logs.
+            abandoned.set()
         for reader in readers:
-            reader.join()
+            with _cleanup_step("Could not join a job output reader"):
+                if reader.ident is not None:
+                    reader.join(timeout=None if stopped else 0.1)
+        with _cleanup_step("Could not reap the failed job's process"):
+            status = _WaitForSingleObject(process, _INFINITE if stopped else 100)
+            if status not in (0, _WAIT_TIMEOUT):
+                raise C.WinError(C.get_last_error())
         raise
 
 
@@ -425,20 +502,43 @@ class Job:
 
     def _close_handle(self):
         if self._handle is not None:
-            _CloseHandle(self._handle)
+            _check(_CloseHandle(self._handle))
             self._handle = None
+
+    def _resume(self, thread) -> bool:
+        with self._lock:
+            if self._cancelled:
+                # cancel/close may have arrived during reader setup. Do not
+                # resume the child, even if the earlier termination failed.
+                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+                return False
+            if _ResumeThread(thread) == _INFINITE:
+                raise C.WinError(C.get_last_error())
+            return True
+
+    def _abort(self) -> bool:
+        with self._lock:
+            with _cleanup_step(
+                "Could not terminate the failed job; trying kill-on-close"
+            ):
+                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+                return True  # The handle is still available for accounting.
+            # Fall back to kill-on-close. This Job cannot be reused afterward.
+            self._closed = True
+            self._close_handle()
+            return False
 
     def cancel(self) -> None:
         with self._lock:
             self._cancelled = True
-            if self._active:
+            if self._active and self._handle is not None:
                 _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
             self._cancelled = True
-            if self._active:
+            if self._active and self._handle is not None:
                 # The worker still needs this handle for accounting. Its final
                 # critical section will close it after this termination request.
                 _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
@@ -463,20 +563,31 @@ class Job:
             with self._lock:
                 self._check_available()
                 job = self._handle
-                process, out_read, err_read = _launch(
+                process, thread, out_read, err_read = _launch(
                     job, resources, command, environment, directory, executable
                 )
                 self._active = True
             try:
                 code = _monitor(
-                    job, process, out_read, err_read, stdout, stderr, on_started
+                    job,
+                    process,
+                    out_read,
+                    err_read,
+                    stdout,
+                    stderr,
+                    lambda: self._resume(thread),
+                    self._abort,
+                    on_started,
                 )
             finally:
                 with self._lock:
                     self._active = False
                     cancelled = self._cancelled
                     if self._closed:
-                        self._close_handle()
+                        with _cleanup_step(
+                            "Could not close the job during final cleanup"
+                        ):
+                            self._close_handle()
             if cancelled:
                 raise JobCancelled("Job was cancelled", exit_code=code)
             return code
