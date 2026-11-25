@@ -820,10 +820,12 @@ class ProjectIntegrationTests(RunnerCase):
         self.call(404, "POST", "/projects/missing/commands", payload, headers=key)
         self.call(404, "GET", "/projects/missing/commands")
         self.assertEqual(self.call(200, "GET", commands), {"commands": []})
-        self.call(400, "POST", commands, {"mode": "unknown", "command": "cd"})
+        invalid = self.call(400, "POST", commands, {"mode": "unknown", "command": "cd"})
+        self.assertEqual(invalid["command"]["id"], "0")
+        self.assertEqual(self.call(200, "GET", commands + "/0"), invalid["command"])
 
         first = self.call(200, "POST", commands, payload, headers=key)
-        self.assertEqual(first["id"], "0")
+        self.assertEqual(first["id"], "1")
         self.assertEqual(
             self.call(200, "POST", commands.lower(), payload, headers=key), first
         )
@@ -831,7 +833,7 @@ class ProjectIntegrationTests(RunnerCase):
         other_task = self.call(200, "POST", other, payload, headers=key)
         self.assertEqual((global_task["id"], other_task["id"]), ("0", "0"))
         for endpoint, cwd in (
-            (commands + "/0", self.data / "projects" / "Fixture"),
+            (commands + "/1", self.data / "projects" / "Fixture"),
             (other + "/0", self.data / "projects" / "Other"),
             ("/commands/0", Path.home()),
         ):
@@ -845,9 +847,9 @@ class ProjectIntegrationTests(RunnerCase):
             )
         self.assertNotIn("command", first)
         self.assertNotIn("command", self.call(200, "GET", commands)["commands"][0])
-        self.call(400, "GET", commands + "/0?include_input=0")
-        self.call(204, "DELETE", commands + "/0")
-        self.call(404, "GET", commands + "/0")
+        self.call(400, "GET", commands + "/1?include_input=0")
+        self.call(204, "DELETE", commands + "/1")
+        self.call(404, "GET", commands + "/1")
         self.assertEqual(self.call(200, "POST", commands, payload, headers=key), first)
         self.call(200, "GET", other + "/0")
         self.call(200, "GET", "/commands/0")
@@ -857,9 +859,9 @@ class ProjectIntegrationTests(RunnerCase):
         rebuilt = self.register("fIXTURE") + "/commands"
         self.assertEqual(self.call(200, "GET", rebuilt), {"commands": []})
         second = self.call(200, "POST", rebuilt, payload, headers=key)
-        self.assertEqual(second["id"], "1")
+        self.assertEqual(second["id"], "2")
         self.call(404, "DELETE", rebuilt + "/0")
-        self.call(200, "GET", rebuilt + "/1")
+        self.call(200, "GET", rebuilt + "/2")
 
     def test_project_commands_share_worktree_and_can_run_alongside_action(self):
         project = self.register()
