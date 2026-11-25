@@ -3,6 +3,7 @@
 from contextlib import nullcontext, redirect_stdout
 import http.client
 import io
+import logging
 from pathlib import Path
 import json
 import signal
@@ -226,6 +227,24 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertIn('project="Demo"', text)
         self.assertIn('repo_host="git.example.invalid"', text)
         self.assertNotIn("private-path", text)
+
+    def test_process_cleanup_diagnostics_use_service_logging(self):
+        logger = logging.getLogger("winprocess")
+        original = (logger.level, logger.propagate, logger.handlers[:])
+        console = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            logfile = Path(folder) / "winrunner.log"
+            with redirect_stdout(console), service_logging(logfile, TOKEN):
+                try:
+                    raise OSError("native cleanup failed")
+                except OSError:
+                    logger.exception("Job cleanup diagnostic %s", TOKEN)
+            disk = logfile.read_text(encoding="utf-8")
+        self.assertEqual(console.getvalue(), disk)
+        self.assertIn("Job cleanup diagnostic [redacted]", disk)
+        self.assertIn("OSError", disk)
+        self.assertNotIn(TOKEN, disk)
+        self.assertEqual((logger.level, logger.propagate, logger.handlers), original)
 
     def test_request_metadata_is_bounded_redacted_and_appended(self):
         self.start_server(reported_peer="203.0.113.42")

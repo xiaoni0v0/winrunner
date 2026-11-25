@@ -106,7 +106,7 @@ class ServiceFileHandler(logging.FileHandler):
 
 @contextmanager
 def service_logging(path: Path, token: str):
-    channels = (LOG, logging.getLogger("runner"))
+    channels = (LOG, logging.getLogger("runner"), logging.getLogger("winprocess"))
     previous = [(channel, channel.level, channel.propagate) for channel in channels]
     formatter = ServiceFormatter(token)
     console = logging.StreamHandler(sys.stdout)
