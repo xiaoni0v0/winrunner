@@ -79,7 +79,7 @@ class GitReferences(unittest.TestCase):
     def push(self, *refspecs):
         self.git("-C", self.source, "push", "--force", self.remote, *refspecs)
 
-    def test_create_uses_single_clone_snapshot_when_remote_advances(self):
+    def test_create_uses_single_clone_snapshot_when_remote_renames_default(self):
         old = self.make_commit("original default branch")
         new = self.make_commit("advanced default branch", parent=old)
         self.push(f"{old}:refs/heads/main")
@@ -88,7 +88,9 @@ class GitReferences(unittest.TestCase):
         def advance_after_clone(*args, **kwargs):
             result = git(*args, **kwargs)
             if args[:2] == ("clone", "--bare"):
-                self.push(f"{new}:refs/heads/main")
+                self.push(f"{new}:refs/heads/trunk")
+                self.git("-C", self.remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+                self.push(":refs/heads/main")
             return result
 
         with patch.object(self.repo, "git", side_effect=advance_after_clone) as call:
