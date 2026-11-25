@@ -394,6 +394,38 @@ test('Action wait distinguishes separate runs of the same commit', async t => {
   assert.equal((await client.run('action', args)).outcome, 'succeeded')
 })
 
+test('Action wait diagnoses offset errors without reading a replacement log', async t => {
+  const client = await fixture(t)
+  let hits = 0
+  let replacement = true
+  await client.configure(await server(t, (req, res) => {
+    const params = new URL(req.url, 'http://localhost').searchParams
+    assert.equal(req.method, 'GET')
+    assert.equal(params.get('include_input'), '1')
+    switch (++hits) {
+      case 1:
+        assert.equal(params.get('stdout_offset'), '4')
+        return json(res, { status: 'running', action_id: 'original' })
+      case 2:
+        assert.equal(params.get('stdout_offset'), '4')
+        return json(res, { error: { code: 'invalid_offset', message: 'Offset exceeds log length' } }, 400)
+      case 3:
+        assert.deepEqual([...params.keys()], ['include_input'])
+        return json(res, { status: 'running', action_id: replacement ? 'new' : 'original' })
+      default: assert.fail('unexpected request')
+    }
+  }))
+  const args = { op: 'wait', name: 'demo', stdout_offset: 4, wait_seconds: 3 }
+  const replaced = await client.run('action', args)
+  assert.equal(replaced.error.code, 'task_changed')
+  assert.equal(replaced.next_wait, undefined)
+  assert.equal(hits, 3)
+  hits = 0
+  replacement = false
+  assert.equal((await client.run('action', args)).error.code, 'invalid_offset')
+  assert.equal(hits, 3)
+})
+
 test('Action wait falls back to read-only polling on an older Runner', async t => {
   const client = await fixture(t)
   const seen = []

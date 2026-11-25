@@ -295,7 +295,22 @@ async function waitForTask(spec, seconds, signal, call) {
         spec = { ...spec, path }
         response = await requestRunner(spec, polling, call)
       }
-      if (!response.ok) return response
+      if (!response.ok) {
+        if (typeof last?.action_id === 'string' && response.error?.code === 'invalid_offset') {
+          try {
+            const path = spec.path.split('?', 1)[0] + '?include_input=1'
+            const current = await requestRunner({ ...spec, path, logEncoding: undefined }, polling, call)
+            if (current.ok && typeof current.action_id === 'string' && current.action_id !== last.action_id) {
+              throw new ClientError('task_changed', '等待期间项目的 Action 已被替换；未把新一轮当作原任务。')
+            }
+          } catch (error) {
+            if (!(error instanceof ClientError) || signal?.aborted ||
+                ['task_changed', 'runner_changed'].includes(error.code)) throw error
+            // A failed diagnostic probe must not hide the original offset error.
+          }
+        }
+        return response
+      }
       const replaced = typeof last?.action_id === 'string' && response.action_id !== last.action_id
       if (replaced || (last?.commit && response.commit !== last.commit)) {
         throw new ClientError('task_changed', '等待期间项目的 Action 已被替换；未把新一轮当作原任务。')
