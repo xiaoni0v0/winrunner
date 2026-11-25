@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 if sys.platform == "win32":
-    from gitrepo import CommitError, Repository
+    from gitrepo import CommitError, GitFailure, Repository
     from winprocess import Job
 
     class LocalRepository(Repository):
@@ -157,6 +157,130 @@ class GitReferences(unittest.TestCase):
         with self.assertRaises(CommitError) as exc:
             self.repo.resolve(old)
         self.assertEqual(exc.exception.code, "commit_not_found")
+
+    def set_remote_packed_refs(self, refs):
+        # Loose files cannot represent both spellings on standard NTFS. Model
+        # what a case-sensitive server advertises using a sorted packed file.
+        (self.remote / "packed-refs").write_bytes(
+            b"# pack-refs with: sorted \n"
+            + b"".join(f"{oid} {ref}\n".encode() for ref, oid in sorted(refs.items()))
+        )
+
+    def test_fetch_preserves_case_distinct_refs_and_prunes_removed_refs(self):
+        main = self.make_commit("main")
+        upper = self.make_commit("case variant")
+        tagged = self.make_commit("tag only")
+        replaced = self.make_commit("not reachable from branches or tags")
+        self.push(
+            f"{main}:refs/heads/main",
+            f"{upper}:refs/other/upper",
+            f"{tagged}:refs/other/tagged",
+            f"{replaced}:refs/other/replaced",
+        )
+        self.git("-C", self.remote, "pack-refs", "--all")
+        self.repo.create()
+        self.set_remote_packed_refs(
+            {
+                "refs/heads/main": main,
+                "refs/heads/Release": main,
+                "refs/heads/release": upper,
+                "refs/tags/Label": main,
+                "refs/tags/label": tagged,
+                f"refs/replace/{main}": replaced,
+            }
+        )
+
+        self.repo.fetch()
+        self.assertEqual(self.repo.resolve(upper), upper)
+        self.assertEqual(self.repo.resolve(tagged), tagged)
+        self.assertEqual(
+            self.git("-C", self.cache, "rev-parse", "refs/heads/Release"), main
+        )
+        self.assertEqual(
+            self.git("-C", self.cache, "rev-parse", "refs/heads/release"), upper
+        )
+        self.assertEqual(self.git("-C", self.cache, "for-each-ref", "refs/replace"), "")
+
+        # Change only one spelling of the branch; remove the lower-case tag.
+        self.set_remote_packed_refs(
+            {
+                "refs/heads/main": main,
+                "refs/heads/Release": main,
+                "refs/heads/release": tagged,
+                "refs/tags/Label": main,
+            }
+        )
+        self.repo.fetch()
+        self.assertEqual(self.repo.resolve(tagged[:7]), tagged)
+        self.assertEqual(
+            self.git("-C", self.cache, "rev-parse", "refs/heads/Release"), main
+        )
+        self.assertEqual(
+            self.git(
+                "-C", self.cache, "for-each-ref", "--format=%(refname)", "refs/tags"
+            ),
+            "refs/tags/Label",
+        )
+        with self.assertRaises(CommitError) as exc:
+            self.repo.resolve(upper)
+        self.assertEqual(exc.exception.code, "commit_not_found")
+
+    def test_fetch_keeps_tag_when_only_its_case_variant_is_added(self):
+        main = self.make_commit("main")
+        tagged = self.make_commit("second spelling")
+        self.push(
+            f"{main}:refs/heads/main",
+            f"{main}:refs/tags/Label",
+            f"{tagged}:refs/other/tagged",
+        )
+        self.git("-C", self.remote, "pack-refs", "--all")
+        self.repo.create()
+        self.set_remote_packed_refs(
+            {
+                "refs/heads/main": main,
+                "refs/tags/Label": main,
+                "refs/tags/label": tagged,
+            }
+        )
+
+        self.repo.fetch()
+        self.assertEqual(self.repo.resolve(tagged), tagged)
+        self.assertEqual(
+            self.git(
+                "-C", self.cache, "rev-parse", "refs/tags/Label", "refs/tags/label"
+            ),
+            f"{main}\n{tagged}",
+        )
+
+    def test_fetch_only_retries_ref_lock_conflicts_and_keeps_cache_on_clone_failure(
+        self,
+    ):
+        main = self.make_commit("main")
+        self.push(f"{main}:refs/heads/main")
+        self.repo.create()
+        failure = GitFailure(
+            "original error",
+            stderr=b"error: cannot lock ref 'refs/heads/main': Permission denied",
+        )
+        with patch.object(self.repo, "git", side_effect=failure) as git:
+            with self.assertRaises(GitFailure) as exc:
+                self.repo.fetch()
+            self.assertIs(exc.exception, failure)
+            self.assertEqual([call.args[0] for call in git.call_args_list], ["fetch"])
+
+        lock = GitFailure(
+            "lock conflict",
+            stderr=b"error: cannot lock ref 'refs/heads/main': Unable to create 'repo/refs/heads/main.lock': File exists.",
+        )
+        with patch.object(self.repo, "git", side_effect=[lock, failure]) as git:
+            with self.assertRaises(GitFailure) as exc:
+                self.repo.fetch()
+            self.assertIs(exc.exception, failure)
+            self.assertEqual(
+                [call.args[0] for call in git.call_args_list], ["fetch", "clone"]
+            )
+        self.assertEqual(self.repo.resolve(main), main)
+        self.assertEqual(list(self.root.glob(".fetch-*")), [])
 
     def test_prefix_below_git_minimum_can_be_unique_or_ambiguous(self):
         seen: dict[str, str] = {}

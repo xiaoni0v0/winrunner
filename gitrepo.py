@@ -2,8 +2,18 @@
 
 import os
 from pathlib import Path
+import re
+import shutil
+import tempfile
 
 import config
+
+_REF_PATH_CONFLICT = re.compile(
+    rb"cannot lock ref 'refs/(?:heads|tags)/[^\r\n]+': "
+    rb"Unable to create '[^\r\n]+\.lock': File exists"
+    rb"|cannot process '(refs/(?:heads|tags)/[^\r\n]+)' and '\1/[^\r\n]+' "
+    rb"at the same time"
+)
 
 
 class GitFailure(Exception):
@@ -43,6 +53,7 @@ class Repository:
             GIT_TERMINAL_PROMPT="0",
             GIT_ALLOW_PROTOCOL="file" if local else "https",
             GIT_LFS_SKIP_SMUDGE="1",
+            GIT_NO_REPLACE_OBJECTS="1",
             GIT_OPTIONAL_LOCKS="0",
             LC_ALL="C",
         )
@@ -130,18 +141,92 @@ class Repository:
         self.git("remote", "set-url", "origin", self.url, path=self.worktree)
 
     def fetch(self):
-        self.git(
-            "fetch",
-            "--atomic",
-            "--prune",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--",
-            self.url,
-            "+refs/heads/*:refs/heads/*",
-            "+refs/tags/*:refs/tags/*",
-            path=self.cache,
-        )
+        try:
+            self.git(
+                "fetch",
+                "--atomic",
+                "--prune",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--",
+                self.url,
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+                path=self.cache,
+            )
+        except GitFailure as exc:
+            # Older Git only reports the conflicting .lock file. An orphaned
+            # lock can cause this too; retry at most once, in a fresh cache.
+            if not _REF_PATH_CONFLICT.search(exc.stderr):
+                raise
+            self._refresh_packed_cache()
+            return
+
+        # A successful fetch can put one spelling in a loose ref, shadowing a
+        # packed ref with a different case. Use FETCH_HEAD's names from this
+        # snapshot, since the filesystem may already have aliased the refs.
+        seen: set[tuple[bytes, str]] = set()
+        directories: set[tuple[bytes, str]] = set()
+        for line in (self.cache / "FETCH_HEAD").read_bytes().split(b"\n"):
+            fields = line.split(b"\t", 2)
+            if len(fields) != 3:
+                continue
+            kind, _, description = fields[2].partition(b" '")
+            if kind not in (b"branch", b"tag"):
+                continue
+            # Git ref names cannot contain spaces, but can contain quotes.
+            name = description.split(b"' of ", 1)[0]
+            key = kind, name.decode("utf-8", errors="surrogateescape").upper()
+            parents = set()
+            parent = key[1]
+            while "/" in parent:
+                parent = parent.rsplit("/", 1)[0]
+                parents.add((kind, parent))
+            if key in seen or key in directories or parents & seen:
+                self._refresh_packed_cache()
+                return
+            seen.add(key)
+            directories.update(parents)
+
+    def _refresh_packed_cache(self):
+        # Bare clone writes packed refs without taking a lock at each ref path.
+        # Keep its normal heads/tags mapping: a mirror could import refs/replace.
+        # The previous worktree was reset before fetch. Reference the old object
+        # store for negotiation, then dissociate before swapping caches.
+        scratch = Path(tempfile.mkdtemp(prefix=".fetch-", dir=self.cache.parent))
+        fresh, old = scratch / "fresh", scratch / "old"
+        preserve_backup = False
+        try:
+            self.git(
+                "clone",
+                "--bare",
+                "--reference",
+                self.cache,
+                "--dissociate",
+                "--no-recurse-submodules",
+                "--template=",
+                "--",
+                self.url,
+                fresh,
+            )
+            self.cache.rename(old)
+            try:
+                fresh.rename(self.cache)
+            except OSError as swap_error:
+                try:
+                    old.rename(self.cache)
+                except OSError as restore_error:
+                    preserve_backup = True
+                    raise GitFailure(
+                        f"Could not replace cache ({swap_error}) or restore it "
+                        f"({restore_error}); previous cache is at {old}"
+                    ) from restore_error
+                raise
+        except OSError as exc:
+            raise GitFailure(f"Could not replace cache: {exc}") from exc
+        finally:
+            if not preserve_backup:
+                shutil.rmtree(scratch, ignore_errors=True)
 
     def resolve(self, prefix):
         prefix = prefix.lower()
