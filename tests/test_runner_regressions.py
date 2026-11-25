@@ -119,6 +119,49 @@ class RunnerRegressions(unittest.TestCase):
         self.assertTrue(task.done.wait(WAIT), "action never signalled completion")
         return self.model.get_action(project.name, OFFSETS)
 
+    def test_invalid_drain_timeout_does_not_latch_deletion(self):
+        project = self.create()
+        for timeout in ("5", True, -1, float("inf"), float("nan"), 10**100):
+            with self.subTest(timeout=timeout):
+                with patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", timeout):
+                    self.assert_api_error(
+                        500, "invalid_config", self.model.delete_project, project.name
+                    )
+                self.assertTrue(project.delete_done.is_set())
+                self.assertFalse(project.delete_in_progress)
+                self.assertTrue(project.visible)
+        with patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", "5"):
+            task = self.wait_action(project, self.start_action(project))
+        self.assertEqual(task["error"]["code"], "invalid_config")
+        self.model.delete_project(project.name)
+        self.background(self.model.close).result(timeout=WAIT)
+
+    def test_validation_exception_finishes_accepted_action_and_command(self):
+        project = self.create()
+        with (
+            patch.object(runner.config, "INTERPRETERS", None),
+            self.assertLogs("runner", level="ERROR"),
+        ):
+            self.assert_api_error(500, "validation_failed", self.start_action, project)
+        self.assertFalse(project.worktree.exists())
+        action = self.wait_action(project, project.task)
+        self.assertEqual((action["status"], action["phase"]), ("failed", "validate"))
+        self.assertEqual(action["error"]["code"], "validation_failed")
+        with (
+            patch.object(runner, "command_body", side_effect=RuntimeError("validator")),
+            self.assertLogs("runner", level="ERROR"),
+        ):
+            self.assert_api_error(
+                500,
+                "validation_failed",
+                self.model.start_command,
+                COMMAND,
+                time.monotonic(),
+            )
+        self.assertEqual(self.model.get_command("0")["status"], "failed")
+        self.wait_action(project, self.start_action(project))
+        self.background(self.model.close).result(timeout=WAIT)
+
     def test_shutdown_waits_for_project_deletion_before_releasing_lease(self):
         project = self.create()
         deleting, resume, draining = (threading.Event() for _ in range(3))
@@ -537,9 +580,40 @@ class RunnerRegressions(unittest.TestCase):
             )
 
         self.assertTrue(cancelled.is_set())
-        self.assertEqual(project.commands["0"].snapshot()["exit_code"], 23)
+        self.assertEqual(project.commands, {})
         self.assertFalse(project.worktree.exists())
         self.assert_api_error(404, "not_found", self.model.list_commands, name="sample")
+
+    def test_failed_clone_discards_commands_after_delete_times_out(self):
+        cloning, release = threading.Event(), threading.Event()
+
+        def clone(repo):
+            repo.worktree.mkdir()
+            cloning.set()
+            self.assertTrue(release.wait(2 * WAIT))
+            raise runner.GitFailure("clone failed")
+
+        with patch.object(LocalRepository, "create", clone):
+            creation = self.background(self.create)
+            try:
+                self.assertTrue(cloning.wait(WAIT))
+                project = self.model.command_project("sample")
+                self.model.start_command(COMMAND, time.monotonic(), project=project)
+                with patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", 0):
+                    self.assert_api_error(
+                        409, "project_busy", self.model.delete_project, "sample"
+                    )
+            finally:
+                release.set()
+            self.assert_api_error(
+                502, "git_clone_failed", creation.result, timeout=WAIT
+            )
+        self.assertEqual(self.model.get_project("sample")["status"], "delete_failed")
+        self.assertEqual(self.model.list_commands(name="sample"), [])
+        self.assert_api_error(
+            404, "not_found", self.model.get_command, "0", name="sample"
+        )
+        self.model.delete_project("sample")
 
     def test_delete_drain_deadline_survives_slow_native_cancel(self):
         project = self.create()

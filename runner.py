@@ -117,6 +117,17 @@ def timeout_value(body):
     raise invalid("timeout must be a finite non-negative number of seconds")
 
 
+def project_drain_timeout() -> float:
+    value = config.PROJECT_DRAIN_TIMEOUT
+    if type(value) not in (int, float) or not 0 <= value <= threading.TIMEOUT_MAX:
+        raise APIError(
+            500,
+            "invalid_config",
+            "PROJECT_DRAIN_TIMEOUT must be a finite non-negative number within the thread wait limit",
+        )
+    return float(value)
+
+
 def project_body(name, raw):
     if (
         not isinstance(name, str)
@@ -607,11 +618,14 @@ class Runner:
                         self.pending_cleanup[key] = tuple(failed_paths)
                     else:
                         self.pending_cleanup.pop(key, None)
-                    if not success and project.lifecycle == "cloning":
-                        self.projects.pop(key, None)
+                    if not success:
+                        project.commands.clear()
+                        if project.lifecycle == "cloning":
+                            self.projects.pop(key, None)
                     project.cloned.set()
 
     def delete_project(self, name):
+        timeout = project_drain_timeout()
         with self.lock:
             self._available()
             project = self._project(name)
@@ -622,10 +636,10 @@ class Runner:
             project.lifecycle = "deleting"
             project.visible = False
             tasks = project.tasks()
-        deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
         success = False
         key = project.name.lower()
         try:
+            deadline = time.monotonic() + timeout
             self._interrupt_readers(project)
             for task in tasks:
                 self._request_task_stop(task)
@@ -725,7 +739,7 @@ class Runner:
             )
 
     def _reset_action(self, project, task):
-        deadline = time.monotonic() + config.PROJECT_DRAIN_TIMEOUT
+        deadline = time.monotonic() + project_drain_timeout()
         self._interrupt_readers(project)
         self._wait_readers(project, deadline, task.cancelled)
         try:
@@ -749,6 +763,11 @@ class Runner:
             values, error = action_body(raw), None
         except APIError as exc:
             values, error = None, exc
+        except Exception:
+            LOG.exception("Could not validate Action for %s", project.name)
+            values, error = None, APIError(
+                500, "validation_failed", "Could not validate Action"
+            )
         try:
             self._start_thread(self._run_action, task, project, values, error)
         except Exception as exc:
@@ -928,10 +947,15 @@ class Runner:
             commands[command_id] = task
         try:
             mode, command, timeout = command_body(raw)
-        except APIError as exc:
-            task.finish(**_failure(exc, "runner"))
+        except Exception as exc:
+            if isinstance(exc, APIError):
+                error = exc
+            else:
+                LOG.exception("Could not validate command %s", command_id)
+                error = APIError(500, "validation_failed", "Could not validate command")
+            task.finish(**_failure(error, "runner"))
             raise APIError(
-                exc.status, exc.code, str(exc), command=task.snapshot()
+                error.status, error.code, str(error), command=task.snapshot()
             ) from exc
         with task.lock:
             task.mode, task.command, task.phase = mode, command, "launch"
