@@ -136,7 +136,7 @@ PowerShell 不加载用户配置，默认关闭进度提示，并以 UTF-8（无
 | 字段 | 含义 |
 |---|---|
 | `status` | `preparing`、`running`、`cancelling`、`succeeded`、`failed`、`cancelled`；后三项为终态。 |
-| `phase` | Action：`reset`、`validate`、`fetch`、`resolve`、`checkout`、`launch`、`run`；命令：`launch`、`run`。终态保留最后阶段。 |
+| `phase` | Action：`reset`、`validate`、`fetch`、`resolve`、`checkout`、`launch`、`run`；命令：`validate`、`launch`、`run`。终态保留最后阶段。 |
 | `output_source` | `null`（尚无来源）、`runner`（Runner 诊断）、`git`（Git 失败）、`launch`（启动失败）、`process`（进程输出，包括解释器报错）。成功的 Git 准备输出不混入脚本日志。 |
 | `exit_code` | 主进程退出码（integer），未取得时为 `null`。 |
 | `error` | 失败或取消时的诊断 `{"code":"…","message":"…"}`，没有则为 `null`。 |
