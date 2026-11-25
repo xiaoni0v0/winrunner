@@ -919,6 +919,8 @@ class Runner:
                     raise not_found("Project not found")
                 if project.delete_in_progress:
                     raise conflict("Project deletion is already in progress")
+                if project.lifecycle == "delete_failed" and not project.cloned.is_set():
+                    raise conflict("Project creation is still rolling back")
                 commands, cwd = project.commands, project.worktree
             number = self.next_command_numbers.get(key, 0)
             command_id = short_command_id(number)

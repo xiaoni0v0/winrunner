@@ -312,7 +312,7 @@ class CommandIntegrationTests(RunnerCase):
 
     def test_cmd_and_request_validation(self):
         valid = {"mode": "cmd", "command": "echo runner-cmd-marker"}
-        bad_requests = (
+        bad_requests: tuple[dict[str, object], ...] = (
             {"mode": "bad"},
             {"command": ["echo nope"]},
             {"timeout": True},

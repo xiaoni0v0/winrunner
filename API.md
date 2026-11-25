@@ -37,7 +37,7 @@ Action、项目命令和文件接口使用同一个工作树。不同项目的�
 
 创建时先占用名字并清理同名残留目录，不复用残留。清理受阻返回 `409 project_cleanup_blocked`，释放占用后可重试创建。删除项目时，默认最多等 5 秒让任务和下载退出，超时返回 `409 project_busy`；磁盘清理受阻返回 `409 project_cleanup_blocked`。这两种删除失败都可重试 DELETE。项目不存在时 DELETE 返回 `404`。
 
-`Project` 含 `name`、`repo_url` 和 `status`。`cloning` / `deleting` 表示正在创建或删除；`delete_failed` 表示删除未完成，此时不能提交 Action 或读取文件，但仍可提交项目命令。`idle` 表示项目已创建且没有 Action；其他值是当前或最近一次 Action 的 [任务状态](<#任务响应与日志>)。项目命令不改变 `Project.status`。
+`Project` 含 `name`、`repo_url` 和 `status`。`cloning` / `deleting` 表示正在创建或删除；`delete_failed` 表示删除未完成，此时不能提交 Action 或读取文件，但创建回滚完成后仍可提交项目命令。`idle` 表示项目已创建且没有 Action；其他值是当前或最近一次 Action 的 [任务状态](<#任务响应与日志>)。项目命令不改变 `Project.status`。
 
 ### 文件
 
