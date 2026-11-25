@@ -352,6 +352,10 @@ function toolResult(group, args, response) {
       body.next_get = { op: 'get', name: args.name }
       body.note = '此次提交可能已经替换了 Action 槽；先查看当前状态，再考虑重试。'
     }
+    if (group === 'command' && args.op === 'start' && body.command) {
+      const target = taskTarget(group, args, body.command)
+      if (target) body.next_get = { op: 'get', ...target }
+    }
     return { outcome: 'request_error', ...body }
   }
   if (group === 'project') {

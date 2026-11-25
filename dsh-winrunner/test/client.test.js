@@ -394,6 +394,17 @@ test('Action wait distinguishes separate runs of the same commit', async t => {
   assert.equal((await client.run('action', args)).outcome, 'succeeded')
 })
 
+test('a rejected command with an allocated ID provides a scoped lookup', async t => {
+  const client = await fixture(t)
+  await client.configure(await server(t, (req, res) => {
+    assert.equal(req.url, '/projects/demo/commands')
+    json(res, { error: { code: 'invalid_request', message: 'Invalid command' }, command: { id: 'a', status: 'failed' } }, 400)
+  }))
+  const result = await client.run('command', { op: 'start', name: 'demo', mode: 'cmd', command: 'echo ok' })
+  assert.equal(result.outcome, 'request_error')
+  assert.deepEqual(result.next_get, { op: 'get', name: 'demo', id: 'a' })
+})
+
 test('Action wait diagnoses offset errors without reading a replacement log', async t => {
   const client = await fixture(t)
   let hits = 0
