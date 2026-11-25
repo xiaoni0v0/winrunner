@@ -658,7 +658,6 @@ class Runner:
             with self.lock:
                 if success:
                     self.pending_cleanup.pop(key, None)
-                if success:
                     self.projects.pop(key, None)
                 else:
                     project.delete_in_progress = False
