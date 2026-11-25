@@ -85,17 +85,16 @@ class Repository:
         return code, bytes(stdout)
 
     def create(self):
+        # Keep HEAD, branches, and tags from the same remote snapshot.
         self.git(
             "clone",
             "--bare",
-            "--no-tags",
             "--no-recurse-submodules",
             "--template=",
             "--",
             self.url,
             self.cache,
         )
-        self.fetch()
         code, head = self.git(
             "rev-parse", "--verify", "HEAD^{commit}", path=self.cache, check=False
         )

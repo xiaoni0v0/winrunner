@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 if sys.platform == "win32":
     from gitrepo import CommitError, Repository
@@ -51,7 +52,7 @@ class GitReferences(unittest.TestCase):
         self.git("init", "--initial-branch=main", self.source)
         self.git("init", "--bare", "--initial-branch=main", self.remote)
         self.repo = LocalRepository(
-            self.cache, self.checkout, str(self.remote), self.job, self.root
+            self.cache, self.checkout, self.remote.as_uri(), self.job, self.root
         )
         self.tree = self.git("-C", self.source, "mktree", input=b"")
 
@@ -77,6 +78,63 @@ class GitReferences(unittest.TestCase):
 
     def push(self, *refspecs):
         self.git("-C", self.source, "push", "--force", self.remote, *refspecs)
+
+    def test_create_uses_single_clone_snapshot_when_remote_advances(self):
+        old = self.make_commit("original default branch")
+        new = self.make_commit("advanced default branch", parent=old)
+        self.push(f"{old}:refs/heads/main")
+        git = self.repo.git
+
+        def advance_after_clone(*args, **kwargs):
+            result = git(*args, **kwargs)
+            if args[:2] == ("clone", "--bare"):
+                self.push(f"{new}:refs/heads/main")
+            return result
+
+        with patch.object(self.repo, "git", side_effect=advance_after_clone) as call:
+            self.repo.create()
+            remote_commands = [
+                args[0]
+                for args, _ in call.call_args_list
+                if self.repo.url in args and args[0] in ("clone", "fetch", "ls-remote")
+            ]
+        self.assertEqual(remote_commands, ["clone"])
+        self.assertEqual(self.git("-C", self.remote, "rev-parse", "HEAD"), new)
+        self.assertEqual(self.git("-C", self.cache, "rev-parse", "HEAD"), old)
+        self.assertEqual(self.git("-C", self.checkout, "rev-parse", "HEAD"), old)
+        self.assertEqual(
+            self.git("-C", self.checkout, "symbolic-ref", "HEAD"), "refs/heads/main"
+        )
+        self.assertEqual(
+            self.git("-C", self.checkout, "remote", "get-url", "origin"), self.repo.url
+        )
+        self.repo.fetch()
+        self.assertEqual(self.repo.resolve(new), new)
+
+    def test_create_keeps_tags_not_reachable_from_a_branch(self):
+        main = self.make_commit("default branch")
+        tagged = self.make_commit("reachable only from a tag")
+        self.git("-C", self.source, "tag", "-a", "release", tagged, "-m", "release")
+        self.push(f"{main}:refs/heads/main", "refs/tags/release")
+
+        self.repo.create()
+
+        self.assertEqual(self.repo.resolve(tagged), tagged)
+        self.assertEqual(
+            self.git("-C", self.checkout, "rev-parse", "refs/tags/release^{commit}"),
+            tagged,
+        )
+
+    def test_create_accepts_empty_remote(self):
+        self.repo.create()
+
+        self.assertEqual(
+            self.git("-C", self.checkout, "symbolic-ref", "HEAD"), "refs/heads/main"
+        )
+        self.assertEqual(self.git("-C", self.checkout, "for-each-ref"), "")
+        self.assertEqual(
+            self.git("-C", self.checkout, "remote", "get-url", "origin"), self.repo.url
+        )
 
     def test_force_push_and_deleted_refs_leave_unusable_cached_objects(self):
         old = self.make_commit("old")
