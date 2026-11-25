@@ -51,11 +51,12 @@ def encode_ps_command(command):
 
 
 class APIError(Exception):
-    def __init__(self, status, code, message, *, action=None):
+    def __init__(self, status, code, message, *, action=None, command=None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.action = action
+        self.command = command
 
     def payload(self):
         return {"code": self.code, "message": str(self)}
@@ -64,6 +65,8 @@ class APIError(Exception):
         response = {"error": self.payload()}
         if self.action is not None:
             response["action"] = self.action
+        if self.command is not None:
+            response["command"] = self.command
         return response
 
 
@@ -501,7 +504,9 @@ class Runner:
 
     def _project(self, name):
         project = self.projects.get(name.lower())
-        if project is None or project.create_failed:
+        if project is None or (
+            project.create_failed and project.lifecycle == "cloning"
+        ):
             raise not_found("Project not found")
         return project
 
@@ -527,7 +532,7 @@ class Runner:
             return [
                 project.snapshot()
                 for project in self.projects.values()
-                if not project.create_failed
+                if not project.create_failed or project.lifecycle != "cloning"
             ]
 
     def get_project(self, name):
@@ -602,7 +607,7 @@ class Runner:
                         self.pending_cleanup[key] = tuple(failed_paths)
                     else:
                         self.pending_cleanup.pop(key, None)
-                    if not success and not project.delete_in_progress:
+                    if not success and project.lifecycle == "cloning":
                         self.projects.pop(key, None)
                     project.cloned.set()
 
@@ -653,12 +658,11 @@ class Runner:
             with self.lock:
                 if success:
                     self.pending_cleanup.pop(key, None)
-                if success or (project.create_failed and project.cloned.is_set()):
+                if success:
                     self.projects.pop(key, None)
                 else:
                     project.delete_in_progress = False
-                    if not project.create_failed:
-                        project.lifecycle = "delete_failed"
+                    project.lifecycle = "delete_failed"
                 project.delete_done.set()
 
     @contextmanager
@@ -904,7 +908,6 @@ class Runner:
         task.done.wait()
 
     def start_command(self, raw, accepted_at, *, project: Project | None = None):
-        mode, command, timeout = command_body(raw)
         with self.lock:
             self._available()
             if project is None:
@@ -920,8 +923,17 @@ class Runner:
             number = self.next_command_numbers.get(key, 0)
             command_id = short_command_id(number)
             self.next_command_numbers[key] = number + 1
-            task = Task("launch", command_id=command_id, mode=mode, command=command)
+            task = Task("validate", command_id=command_id)
             commands[command_id] = task
+        try:
+            mode, command, timeout = command_body(raw)
+        except APIError as exc:
+            task.finish(**_failure(exc, "runner"))
+            raise APIError(
+                exc.status, exc.code, str(exc), command=task.snapshot()
+            ) from exc
+        with task.lock:
+            task.mode, task.command, task.phase = mode, command, "launch"
         try:
             self._start_thread(self._run_command, task, command, cwd)
         except Exception as exc:
@@ -929,7 +941,9 @@ class Runner:
             task.finish(
                 error=error, source="runner", stderr=str(exc).encode("utf-8", "replace")
             )
-            raise error from exc
+            raise APIError(
+                error.status, error.code, str(error), command=task.snapshot()
+            ) from exc
         return task.response(timeout, accepted_at)
 
     @staticmethod

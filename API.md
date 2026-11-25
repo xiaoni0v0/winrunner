@@ -123,6 +123,8 @@ Action、项目命令和全局命令的 POST 都可传 `timeout`：非负有限�
 | `command` | string；一段 shell 命令，不接受数组。`ps` 支持多行，JSON 中用 `\n` 传输换行。 |
 | `timeout`（可选） | number；见[提交与等待](<#提交与等待>)。 |
 
+命令提交被接收后先分配 ID，再校验正文。正文校验失败时仍返回 `400 invalid_request`，并附 `command` 状态快照（`phase: validate`，`mode: null`）；可按其中的 `id` 查询或删除该记录。幂等重放不会分配新 ID。
+
 `Command` 是 `Task` 加 `id` 和 `mode`。`id` 为小写 36 进制字符串（`0` 至 `z`，然后 `10` 等）。两种命令均非交互运行，可以自行 `cd`；一次命令改变的当前目录不会传给下一次。
 
 全局和项目的单条命令 GET 都可加 `include_input=1`，额外返回 `command`（提交时的完整字符串，含原有换行）。单条 Action GET 加同一参数时额外返回 `action_id`，可用来识别 Action 是否被替换。该参数可与日志偏移一起使用，只接受值 `1`。默认响应、列表和服务日志不包含命令原文；原文可能含敏感信息，按需读取。

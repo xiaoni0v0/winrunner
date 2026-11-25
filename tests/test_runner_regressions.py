@@ -426,6 +426,43 @@ class RunnerRegressions(unittest.TestCase):
         self.assert_api_error(404, "not_found", self.model.get_project, project.name)
         self.assertFalse(project.worktree.exists())
 
+    def test_failed_delete_of_cloning_project_keeps_name_for_retry(self):
+        cloning, cancelled = threading.Event(), threading.Event()
+
+        def clone(repo):
+            repo.worktree.mkdir()
+            cloning.set()
+            self.assertTrue(cancelled.wait(WAIT))
+            raise runner.JobCancelled()
+
+        remove_tree = runner._remove_tree
+
+        def remove(path):
+            if cancelled.is_set() and path == self.model.projects["sample"].worktree:
+                raise PermissionError("worktree busy")
+            remove_tree(path)
+
+        with (
+            patch.object(runner.Repository, "create", clone),
+            patch.object(runner.DeferredJob, "request_stop", side_effect=cancelled.set),
+            patch.object(runner, "_remove_tree", side_effect=remove),
+        ):
+            creation = self.background(self.model.create, "sample", PROJECT_BODY)
+            try:
+                self.assertTrue(cloning.wait(WAIT))
+                self.assert_api_error(
+                    409, "project_cleanup_blocked", self.model.delete_project, "sample"
+                )
+                self.assert_api_error(409, "conflict", creation.result, timeout=WAIT)
+            finally:
+                cancelled.set()
+        self.assertEqual(self.model.get_project("sample")["status"], "delete_failed")
+        self.assert_api_error(
+            409, "conflict", self.model.create, "sample", PROJECT_BODY
+        )
+        self.model.delete_project("sample")
+        self.assert_api_error(404, "not_found", self.model.get_project, "sample")
+
     def test_project_commands_reject_submits_only_during_active_deletion(self):
         project = self.create()
         entered, release = threading.Event(), threading.Event()

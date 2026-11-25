@@ -312,7 +312,7 @@ class CommandIntegrationTests(RunnerCase):
 
     def test_cmd_and_request_validation(self):
         valid = {"mode": "cmd", "command": "echo runner-cmd-marker"}
-        for bad in (
+        bad_requests = (
             {"mode": "bad"},
             {"command": ["echo nope"]},
             {"timeout": True},
@@ -321,19 +321,29 @@ class CommandIntegrationTests(RunnerCase):
             {"timeout": None},
             {"timeout": float("inf")},
             {"timeout": float("nan")},
-        ):
+        )
+        for index, bad in enumerate(bad_requests):
             with self.subTest(bad=bad):
-                self.call(400, "POST", "/commands", dict(valid, **bad))
+                response = self.call(400, "POST", "/commands", dict(valid, **bad))
+                snapshot = response["command"]
+                self.assertEqual(snapshot["id"], str(index))
+                self.assertEqual(snapshot["status"], "failed")
+                self.assertEqual(snapshot["phase"], "validate")
+                self.assertEqual(self.call(200, "GET", f"/commands/{index}"), snapshot)
         self.call(400, "POST", "/commands", b"{")
         key = {"Idempotency-Key": "malformed-json"}
         malformed = b'{"mode":"cmd","command":"echo ignored","extra":NaN}'
-        self.call(400, "POST", "/commands", malformed, headers=key)
-        self.call(400, "POST", "/commands", malformed, headers=key)
+        first = self.call(400, "POST", "/commands", malformed, headers=key)
+        self.assertEqual(
+            self.call(400, "POST", "/commands", malformed, headers=key), first
+        )
         conflict = self.call(409, "POST", "/commands", malformed + b" ", headers=key)
         self.assertEqual(conflict["error"]["code"], "idempotency_conflict")
-        self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
+        commands = self.call(200, "GET", "/commands")["commands"]
+        self.assertEqual(len(commands), 10)
+        self.assertEqual(commands[-1], first["command"])
         task = self.call(200, "POST", "/commands", dict(valid, timeout=8))
-        self.assertEqual(task["id"], "0")
+        self.assertEqual(task["id"], "a")
         self.assertEqual(task["mode"], "cmd")
         endpoint = "/commands/" + task["id"]
         snapshot = self.call(200, "GET", endpoint)
@@ -352,7 +362,7 @@ class CommandIntegrationTests(RunnerCase):
             "/commands",
             {"mode": "cmd", "command": "exit /b 7", "timeout": 8},
         )
-        self.assertEqual(failed["id"], "1")
+        self.assertEqual(failed["id"], "b")
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["exit_code"], 7)
         self.call(404, "GET", endpoint)
