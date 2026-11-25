@@ -129,7 +129,7 @@ Action、项目命令和全局命令的 POST 都可传 `timeout`：非负有限�
 
 全局和项目的单条命令 GET 都可加 `include_input=1`，额外返回 `command`（提交时的完整字符串，含原有换行）。单条 Action GET 加同一参数时额外返回 `action_id`，可用来识别 Action 是否被替换。该参数可与日志偏移一起使用，只接受值 `1`。默认响应、列表和服务日志不包含命令原文；原文可能含敏感信息，按需读取。
 
-PowerShell 不加载用户配置，默认关闭进度提示，并以 UTF-8（无 BOM）向管道写入文本。可用 `$ProgressPreference = 'Continue'` 恢复进度。原生子程序可能使用其他编码；Runner 不转码、不剥除 CLIXML。若执行策略禁止加载本地模块，在 [config.py](<config.py>) 中把 `PS_SUPPRESS_PROGRESS` 设为 `False` 可跳过这两项默认设置，无需放宽系统策略。
+PowerShell 不加载用户配置，默认关闭进度提示，并以 UTF-8（无 BOM）向管道写入文本。可用 `$ProgressPreference = 'Continue'` 恢复进度。PowerShell 向原生程序传递管道文本时也使用 UTF-8；原生子程序自己的输出可能使用其他编码，Runner 不转码、不剥除 CLIXML。若执行策略禁止加载本地模块，在 [config.py](<config.py>) 中把 `PS_SUPPRESS_PROGRESS` 设为 `False` 可跳过这些默认设置，无需放宽系统策略。内联命令受 Windows 命令行长度限制；PowerShell 按编码后的命令行计，超过上限时报告 `The command line is too long.`。
 
 ### Task 字段
 

@@ -968,6 +968,10 @@ class Runner:
                     "-EncodedCommand",
                     encoded,
                 ]
+                # CreateProcessW allows at most 32,767 UTF-16 code units,
+                # including the terminating NUL and the encoded command.
+                if len(subprocess.list2cmdline(argv).encode("utf-16-le")) >= 65534:
+                    raise OSError("The command line is too long.")
             else:
                 executable = str(config.CMD)
                 argv = (

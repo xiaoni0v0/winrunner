@@ -422,6 +422,23 @@ class CommandIntegrationTests(RunnerCase):
         task = self.finished("/commands/" + task["id"])
         self.assertEqual(log_bytes(task, "stdout"), b"\xff\x80\x00")
 
+    def test_powershell_pipes_utf8_to_native_program(self):
+        exe = sys.executable.replace("'", "''")
+        command = (
+            f"[string][char]0x4e2d | & '{exe}' "
+            "-c 'import sys; print(sys.stdin.buffer.read().hex())'"
+        )
+        task = self.call(200, "POST", "/commands", {"mode": "ps", "command": command})
+        task = self.finished("/commands/" + task["id"])
+        native_input = bytes.fromhex(log_bytes(task, "stdout").decode("ascii"))
+        self.assertEqual(native_input.decode("utf-8-sig").strip(), "中")
+
+    def test_oversized_powershell_command_reports_command_line_limit(self):
+        command = "#" + "a" * 12300 + "\nWrite-Output ok"
+        task = self.call(200, "POST", "/commands", {"mode": "ps", "command": command})
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["error"]["message"], "The command line is too long.")
+
     def test_zero_timeout_multiline_powershell_and_concurrent_incremental_logs(self):
         def launch(label):
             gate = self.work / (label + " release")
