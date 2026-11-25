@@ -164,7 +164,9 @@ class HTTPRegressionTests(unittest.TestCase):
             def window(snapshot, is_running):
                 self.assertIs(threading.current_thread(), threading.main_thread())
                 self.assertTrue(is_running())
-                state = snapshot(View("demo", Target("demo", "0")))
+                with patch("http.client.HTTPConnection") as connection:
+                    state = snapshot(View("demo", Target("demo", "0")))
+                connection.assert_not_called()
                 self.assertEqual(state.selected.detail.data, {"command": "echo exact"})
                 runner.get_command.assert_called_once_with(
                     "0",

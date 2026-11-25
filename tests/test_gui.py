@@ -10,145 +10,7 @@ from unittest.mock import MagicMock, call, patch
 import winrunner_gui as gui
 
 
-class HttpClientTests(unittest.TestCase):
-    @patch("winrunner_gui.http.client.HTTPConnection")
-    def test_only_gets_allowlisted_routes_on_loopback(self, factory: MagicMock) -> None:
-        conn = factory.return_value
-        reply = conn.getresponse.return_value.__enter__.return_value
-        reply.status = 200
-        reply.read.return_value = b'{"run_id":"test-run"}'
-        response = gui._get(18080, "test-token", "/health")
-        self.assertEqual(response.data, {"run_id": "test-run"})
-        factory.assert_called_once_with("127.0.0.1", 18080, timeout=gui.REQUEST_SECONDS)
-        conn.request.assert_called_once_with(
-            "GET",
-            "/health",
-            headers={
-                "Authorization": "Bearer test-token",
-                "Accept": "application/json",
-                "Connection": "close",
-            },
-        )
-        with self.assertRaises(ValueError):
-            gui._get(18080, "test-token", "http://example.test/health")
-        self.assertEqual(factory.call_count, 1)
-        conn.close.assert_called_once()
-
-    @patch("winrunner_gui.http.client.HTTPConnection")
-    def test_rejects_redirect_without_following_or_reading(
-        self, factory: MagicMock
-    ) -> None:
-        conn = factory.return_value
-        reply = conn.getresponse.return_value.__enter__.return_value
-        reply.status = 302
-        response = gui._get(18080, "test-token", "/health")
-        self.assertIsNone(response.data)
-        self.assertIn("HTTP 302", response.error)
-        self.assertEqual(conn.request.call_count, 1)
-        reply.read.assert_not_called()
-        reply.getheader.assert_not_called()
-        conn.close.assert_called_once()
-
-    @patch("winrunner_gui.http.client.HTTPConnection")
-    def test_does_not_print_transport_error_details(self, factory: MagicMock) -> None:
-        factory.return_value.connect.side_effect = OSError("test-token")
-        response = gui._get(18080, "test-token", "/health")
-        self.assertIsNone(response.data)
-        self.assertTrue(response.error)
-        self.assertNotIn("test-token", response.error)
-        factory.return_value.close.assert_called_once()
-
-
-class PollTests(unittest.TestCase):
-    @patch("winrunner_gui._get")
-    def test_offline_skips_all_further_requests(self, getter: MagicMock) -> None:
-        offline = gui.Response(error="offline")
-        getter.return_value = offline
-        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
-        gui._poll(18080, "test-token", threading.Event(), results)
-        self.assertEqual(results.get_nowait(), gui.Snapshot(offline))
-        getter.assert_called_once_with(18080, "test-token", "/health")
-
-    @patch("winrunner_gui._get")
-    def test_stop_during_request_suppresses_results(self, getter: MagicMock) -> None:
-        stop = threading.Event()
-
-        def get(_port: int, _token: str, _route: str) -> gui.Response:
-            stop.set()
-            return gui.Response({"run_id": "old"})
-
-        getter.side_effect = get
-        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
-        gui._poll(18080, "test-token", stop, results)
-        self.assertTrue(results.empty())
-        getter.assert_called_once()
-
-    @patch("winrunner_gui._get")
-    def test_runner_restart_discards_lists_from_mixed_generation(
-        self, getter: MagicMock
-    ) -> None:
-        first = gui.Response({"run_id": "old"})
-        latest = gui.Response({"run_id": "new"})
-        getter.side_effect = [
-            first,
-            gui.Response({"projects": []}),
-            gui.Response({"commands": [{"id": "z"}]}),
-            latest,
-        ]
-        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
-        gui._poll(18080, "test-token", threading.Event(), results)
-        snapshot = results.get_nowait()
-        self.assertEqual(snapshot.health, latest)
-        self.assertTrue(snapshot.note)
-        self.assertEqual(gui._rows(snapshot.projects, "projects"), ([], snapshot.note))
-        self.assertEqual(gui._rows(snapshot.commands, "commands"), ([], snapshot.note))
-        self.assertEqual(
-            getter.call_args_list,
-            [
-                call(18080, "test-token", route)
-                for route in (
-                    "/health",
-                    "/projects",
-                    "/commands",
-                    "/health",
-                )
-            ],
-        )
-
-    @patch("winrunner_gui._get")
-    def test_same_generation_keeps_healthy_section_and_partial_error(
-        self, getter: MagicMock
-    ) -> None:
-        health = gui.Response({"run_id": "same", "uptime_seconds": 20})
-        projects = gui.Response({"projects": []})
-        busy = gui.Response(error="busy")
-        getter.side_effect = [health, projects, busy, gui.Response({"run_id": "same"})]
-        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
-        gui._poll(18080, "test-token", threading.Event(), results)
-        self.assertEqual(
-            results.get_nowait(),
-            gui.Snapshot(health, projects, busy, selected=gui.ViewData(gui.View())),
-        )
-
-    @patch("winrunner_gui._get")
-    def test_collapsed_view_skips_not_yet_dispatched_detail(
-        self, getter: MagicMock
-    ) -> None:
-        view = gui.View("Demo", gui.Target("Demo", "0"))
-        routes = []
-
-        def get(_port, _token, route):
-            routes.append(route)
-            if route == "/health":
-                view.superseded.set()
-                return gui.Response({"run_id": "same"})
-            return gui.Response({})
-
-        getter.side_effect = get
-        results: SimpleQueue[gui.Snapshot] = SimpleQueue()
-        gui._poll(18080, "test-token", threading.Event(), results, view)
-        self.assertEqual(routes, ["/health", "/projects", "/commands", "/health"])
-
+class ViewTests(unittest.TestCase):
     def test_project_detail_is_lazy_and_uses_both_offsets(self) -> None:
         list_commands = MagicMock(return_value=gui.Response({}))
         get_task = MagicMock(return_value=gui.Response({}))
@@ -163,10 +25,6 @@ class PollTests(unittest.TestCase):
                 call(gui.Target("Demo"), None),
                 call(target, {"stdout": 32765, "stderr": 65533}),
             ],
-        )
-        self.assertEqual(
-            gui._task_route(target, get_task.call_args.args[1]),
-            "/projects/Demo/commands/0?include_input=1&limit=32774&stdout_offset=32765&stderr_offset=65533",
         )
         list_commands.reset_mock()
         get_task.reset_mock()
@@ -192,7 +50,7 @@ class IntegratedTests(unittest.TestCase):
             dashboard = gui.Dashboard(root, snapshot=snapshot, is_running=is_running)
         return dashboard
 
-    @patch.object(gui, "_get")
+    @patch("http.client.HTTPConnection")
     def test_integrated_poll_uses_worker_and_queue(self, getter: MagicMock) -> None:
         sample = gui.Snapshot(gui.Response({"run_id": "integrated"}))
         worker_threads = []
@@ -269,7 +127,7 @@ class IntegratedTests(unittest.TestCase):
         self.assertEqual(dashboard._run_id, "old")
         self.assertIs(dashboard._view, view)
         dashboard.commands.show_rows.assert_called_with(
-            [], "等待 Runner 连接", reset=False
+            [], "等待 Runner 状态", reset=False
         )
         dashboard._show(gui.Snapshot(gui.Response({"run_id": "new"})))
         self.assertIsNone(dashboard._view.target)

@@ -4,32 +4,19 @@ from __future__ import annotations
 
 import base64
 import codecs
-import http.client
-import json
 import math
 import re
 import signal
-import sys
 import threading
-import time
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from queue import Empty, SimpleQueue
-from socket import SHUT_RDWR
 from tkinter import ttk
 from typing import Literal
-from urllib.parse import urlencode
 
-HOST = "127.0.0.1"
-ROUTES = ("/health", "/projects", "/commands")
-PROJECT_ROUTE = r"/projects/[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
-TASK_ROUTE = rf"(?:{PROJECT_ROUTE}/actions|(?:{PROJECT_ROUTE})?/commands/[0-9a-z]+)"
-REQUEST_SECONDS = 2.0
-MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-REFRESH_MS = 3000
 INTEGRATED_REFRESH_MS = 850
 REOPEN_MS = 450
 BACKEND_EXIT_MS = 850
@@ -98,14 +85,6 @@ class Target:
     project: str | None
     command: str | None = None  # None refers to the project's Action.
 
-    def route(self) -> str:
-        prefix = f"/projects/{self.project}" if self.project is not None else ""
-        return (
-            f"{prefix}/actions"
-            if self.command is None
-            else f"{prefix}/commands/{self.command}"
-        )
-
 
 @dataclass(frozen=True)
 class View:
@@ -139,86 +118,6 @@ class Snapshot:
     selected: ViewData | None = None
 
 
-def _get(port: int, token: str, route: str) -> Response:
-    path, sep, query = route.partition("?")
-    valid = (
-        not sep
-        and (path in ROUTES or re.fullmatch(rf"{PROJECT_ROUTE}/commands", path))
-        or re.fullmatch(TASK_ROUTE, path)
-        and (
-            not sep
-            or re.fullmatch(
-                rf"include_input=1&limit={LOG_READ}&stdout_offset=[0-9]+&stderr_offset=[0-9]+",
-                query,
-            )
-        )
-    )
-    if not valid:
-        raise ValueError("Not a dashboard route")
-    # No URL opener, proxy discovery, or redirect handling. Each request gets its
-    # own connection; a socket deadline also bounds a response that trickles in.
-    conn = http.client.HTTPConnection(HOST, port, timeout=REQUEST_SECONDS)
-    deadline = time.monotonic() + REQUEST_SECONDS
-    timer: threading.Timer | None = None
-    try:
-        conn.connect()
-        sock = conn.sock
-        if sock is None:
-            return Response(error="无法连接本机 Runner")
-
-        def expire() -> None:
-            try:
-                # Hold the socket even if HTTPConnection has handed it to the response.
-                sock.shutdown(SHUT_RDWR)
-            except OSError:
-                pass
-
-        timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
-        timer.daemon = True
-        timer.start()
-        conn.request(
-            "GET",
-            route,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Connection": "close",
-            },
-        )
-        with conn.getresponse() as reply:
-            if reply.status == 401:
-                return Response(error="认证失败，请检查本地配置", status=401)
-            if reply.status == 503:
-                return Response(error="Runner 忙或正在退出，请稍后重试", status=503)
-            if reply.status != 200:
-                return Response(
-                    error=f"请求未成功（HTTP {reply.status}）", status=reply.status
-                )
-            body = reply.read(MAX_RESPONSE_BYTES + 1)
-        if time.monotonic() >= deadline:
-            return Response(error="本机 Runner 响应超时")
-        if len(body) > MAX_RESPONSE_BYTES:
-            return Response(error="Runner 响应过大")
-        data = json.loads(body)
-        if isinstance(data, dict):
-            return Response(data=data)
-        return Response(error="Runner 返回了无效数据")
-    except ConnectionRefusedError:
-        return Response(error="无法连接本机 Runner")
-    except TimeoutError:
-        return Response(error="本机 Runner 响应超时")
-    except (http.client.HTTPException, OSError):
-        if time.monotonic() >= deadline:
-            return Response(error="本机 Runner 响应超时")
-        return Response(error="与本机 Runner 通信失败")
-    except (ValueError, RecursionError):
-        return Response(error="Runner 返回了无效数据，或本地配置无效")
-    finally:
-        if timer is not None:
-            timer.cancel()
-        conn.close()
-
-
 def read_view(
     view: View,
     list_commands: Callable[[str], Response],
@@ -241,64 +140,6 @@ def read_view(
         if view.target.command is None:
             action = detail
     return ViewData(view, action, commands, detail)
-
-
-def _task_route(target: Target, offsets: dict[str, int] | None) -> str:
-    route = target.route()
-    if offsets is None:
-        return route
-    query = urlencode(
-        {
-            "include_input": 1,
-            "limit": LOG_READ,
-            **{f"{key}_offset": value for key, value in offsets.items()},
-        }
-    )
-    return f"{route}?{query}"
-
-
-def _poll(
-    port: int,
-    token: str,
-    stop: threading.Event,
-    results: SimpleQueue[Snapshot],
-    view: View = View(),
-) -> None:
-    health = _get(port, token, "/health")
-    if stop.is_set():
-        return
-    if health.data is None:
-        results.put(Snapshot(health))
-        return
-    projects = _get(port, token, "/projects")
-    if stop.is_set():
-        return
-    commands = _get(port, token, "/commands")
-    if stop.is_set():
-        return
-
-    def get(route: str) -> Response:
-        return Response() if stop.is_set() else _get(port, token, route)
-
-    selected = read_view(
-        view,
-        lambda name: get(f"/projects/{name}/commands"),
-        lambda target, offsets: get(_task_route(target, offsets)),
-    )
-    if stop.is_set():
-        return
-    # Confirm all sections came from the same Runner generation. A restart can
-    # reuse command IDs, so never show lists that straddle it.
-    confirmed = _get(port, token, "/health")
-    if stop.is_set():
-        return
-    if confirmed.data is None:
-        results.put(Snapshot(confirmed))
-    elif health.data.get("run_id") != confirmed.data.get("run_id"):
-        unavailable = Response(error="Runner 已重启，等待刷新")
-        results.put(Snapshot(confirmed, unavailable, unavailable, unavailable.error))
-    else:
-        results.put(Snapshot(health, projects, commands, selected=selected))
 
 
 def _poll_snapshot(
@@ -382,7 +223,7 @@ def _cpu_usage(data: JsonObject) -> tuple[str, str, float]:
 
 def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
     if response is None:
-        return [], "等待 Runner 连接"
+        return [], "等待 Runner 状态"
     if response.data is None:
         return [], response.error
     records = response.data.get(collection)
@@ -766,11 +607,9 @@ class Dashboard:
     def __init__(
         self,
         root: tk.Tk,
-        port: int | None = None,
-        token: str | None = None,
         *,
-        snapshot: Callable[[View], Snapshot] | None = None,
-        is_running: Callable[[], bool] | None = None,
+        snapshot: Callable[[View], Snapshot],
+        is_running: Callable[[], bool],
     ) -> None:
         self.root = root
         self._stop = threading.Event()
@@ -786,23 +625,12 @@ class Dashboard:
         self._detail_revision: int | None = None
         self._snapshot = Snapshot(Response())
 
-        if snapshot is None:
-            if port is None or token is None:
-                raise TypeError("Standalone dashboard requires a port and token")
-            self._poll: Callable[[View], None] = partial(
-                _poll, port, token, self._stop, self._results
-            )
-            self._refresh_ms = REFRESH_MS
-            subtitle = f"独立监控  ·  {HOST}:{port}"
-        else:
-            stop, results = self._stop, self._results
+        stop, results = self._stop, self._results
 
-            def poll(view: View) -> None:
-                _poll_snapshot(partial(snapshot, view), stop, results)
+        def poll(view: View) -> None:
+            _poll_snapshot(partial(snapshot, view), stop, results)
 
-            self._poll = poll
-            self._refresh_ms = INTEGRATED_REFRESH_MS
-            subtitle = "内置监控  ·  在控制台按 Ctrl+C 停止服务"
+        self._poll = poll
 
         root.title("WinRunner · 本机监控")
         root.geometry("1120x780")
@@ -855,8 +683,14 @@ class Dashboard:
         _label(heading, "WinRunner", bg=NAVY, fg=WHITE, size=18, bold=True).pack(
             fill="x"
         )
-        _label(heading, subtitle, bg=NAVY, fg="#a9c0da", size=9).pack(fill="x")
-        self.connection = _label(hero, "● 正在连接", bg=NAVY, fg="#e7c07b", bold=True)
+        _label(
+            heading,
+            "内置监控  ·  在控制台按 Ctrl+C 停止服务",
+            bg=NAVY,
+            fg="#a9c0da",
+            size=9,
+        ).pack(fill="x")
+        self.connection = _label(hero, "● 正在读取", bg=NAVY, fg="#e7c07b", bold=True)
         self.connection.pack(side="right")
 
         cards = tk.Frame(root, bg=BG)
@@ -1009,7 +843,7 @@ class Dashboard:
         self._schedule(0)
 
     def _window_close(self) -> None:
-        if self._is_running is None or not self._is_running():
+        if not self._is_running():
             self.close()
         elif self._reopen_id is None:
             self.root.withdraw()
@@ -1023,7 +857,7 @@ class Dashboard:
     def _check_backend(self) -> bool:
         if self._backend_exited:
             return False
-        if self._is_running is None or self._is_running():
+        if self._is_running():
             return True
         self._backend_exited = True
         if self._after_id is not None:
@@ -1065,7 +899,7 @@ class Dashboard:
         self._show(snapshot)
         self._busy = False
         self._schedule(
-            self._refresh_ms if self._poll_revision == self._view.revision else 0
+            INTEGRATED_REFRESH_MS if self._poll_revision == self._view.revision else 0
         )
 
     def _update_project(self, data: ViewData | None) -> None:
@@ -1107,11 +941,11 @@ class Dashboard:
         self._snapshot = snapshot
         health = snapshot.health.data
         if health is None:
-            self.connection.configure(text="● 未连接", fg="#f5c386")
+            self.connection.configure(text="● 状态不可用", fg="#f5c386")
             self.notice.configure(text=snapshot.health.error)
             self.cpu.update_value(*_cpu_usage({}))
             for metric in (self.memory, self.disk, self.uptime):
-                metric.update_value(DASH, "等待 Runner 连接")
+                metric.update_value(DASH, "等待 Runner 状态")
             run_id = DASH
         else:
             cpu = _object(health.get("cpu"))
@@ -1126,7 +960,7 @@ class Dashboard:
                 _uptime(health.get("uptime_seconds")), "当前服务进程"
             )
             run_id = _text(health.get("run_id"))
-            self.connection.configure(text="● 已连接", fg="#82e0b9")
+            self.connection.configure(text="● 服务运行中", fg="#82e0b9")
             self.notice.configure(
                 text=snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
             )
@@ -1213,18 +1047,7 @@ def run_integrated(
         signal.signal(signal.SIGINT, previous)
 
 
-def main() -> None:
-    # Import the adjacent settings without generating a new config bytecode file.
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        from config import PORT, TOKEN
-    finally:
-        sys.dont_write_bytecode = previous
-    root = tk.Tk()
-    Dashboard(root, PORT, TOKEN)
-    root.mainloop()
-
-
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "Start local monitoring with: python winrunner.py (without --nogui)"
+    )
