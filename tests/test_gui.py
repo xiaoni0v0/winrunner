@@ -261,6 +261,87 @@ class TkLayoutTests(unittest.TestCase):
         finally:
             dashboard.close()
 
+    def test_project_commands_show_multiple_full_rows_with_detail_open(self) -> None:
+        for scale in (1.33, 2.0):
+            with self.subTest(scale=scale):
+                try:
+                    root = gui.tk.Tk()
+                except gui.tk.TclError as exc:
+                    self.skipTest(f"Tk display unavailable: {exc}")
+                root.tk.call("tk", "scaling", scale)
+                dashboard = gui.Dashboard(
+                    root,
+                    snapshot=MagicMock(),
+                    is_running=lambda: True,
+                    desktop=MagicMock(),
+                )
+                try:
+                    if dashboard._after_id is not None:
+                        root.after_cancel(dashboard._after_id)
+                        dashboard._after_id = None
+                    with patch.object(dashboard, "_schedule"):
+                        root.update()
+                        initial_size = (root.winfo_width(), root.winfo_height())
+                        dashboard.projects.tree.insert("", "end", iid="Demo")
+                        dashboard.projects.tree.selection_set("Demo")
+                        root.update()
+                        commands = gui.Response(
+                            {
+                                "commands": [
+                                    {"id": str(i), "mode": "ps", "status": "succeeded"}
+                                    for i in range(9)
+                                ]
+                            }
+                        )
+                        dashboard._update_project(
+                            gui.ViewData(dashboard._view, commands=commands)
+                        )
+                        tree = dashboard.project_commands.tree
+                        tree.selection_set("8")
+                        root.update()
+                        self.assertEqual(
+                            dashboard._view.target, gui.Target("Demo", "8")
+                        )
+                        self.assertEqual(
+                            (root.winfo_width(), root.winfo_height()), initial_size
+                        )
+                        width, height = root.minsize()
+                        for minimum in (False, True):
+                            with self.subTest(minimum=minimum):
+                                if minimum:
+                                    root.geometry(f"{width}x{height}")
+                                dashboard.detail.tabs.select(
+                                    dashboard.detail.outputs["stdout"].master
+                                )
+                                root.update()
+                                bottom = min(
+                                    tree.winfo_rooty() + tree.winfo_height(),
+                                    dashboard.project_commands.winfo_rooty()
+                                    + dashboard.project_commands.winfo_height(),
+                                    dashboard.tabs.winfo_rooty()
+                                    + dashboard.tabs.winfo_height(),
+                                )
+                                boxes = (tree.bbox(key) for key in tree.get_children())
+                                self.assertGreaterEqual(
+                                    sum(
+                                        bool(
+                                            box
+                                            and tree.winfo_rooty() + box[1] + box[3]
+                                            <= bottom
+                                        )
+                                        for box in boxes
+                                    ),
+                                    3,
+                                )
+                                self.assertGreater(
+                                    dashboard.detail.outputs[
+                                        "stdout"
+                                    ].text.winfo_height(),
+                                    25,
+                                )
+                finally:
+                    dashboard.close()
+
     def test_long_content_at_minimum_size_and_larger_scaling(self) -> None:
         for scale in (1.33, 2.0):
             with self.subTest(scale=scale):

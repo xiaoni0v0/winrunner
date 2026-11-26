@@ -33,7 +33,6 @@ class _Entry:
 class _Page:
     path: str
     entries: tuple[_Entry, ...]
-    is_directory: bool
     next_offset: int | None = None
 
 
@@ -58,16 +57,14 @@ def _load_page(
     data = browse(project, path, offset, cancel)
     relative = data["path"]
     if "entries" not in data:
-        return _Page(
-            relative,
-            (_Entry(relative.rpartition("/")[2], "file", data["size_bytes"]),),
-            False,
+        raise APIError(
+            400, "not_a_directory", "这是文件。请转到所在目录，选中文件后下载。"
         )
     entries = tuple(
         _Entry(item["name"], item["type"], item["size_bytes"])
         for item in data["entries"]
     )
-    return _Page(relative, entries, True, data.get("next_entry_offset"))
+    return _Page(relative, entries, data.get("next_entry_offset"))
 
 
 def _run_job(job: _Job, results: SimpleQueue[_Result]) -> None:
@@ -162,9 +159,7 @@ class FileBrowser(tk.Toplevel):
         self._refresh_button = ttk.Button(
             navigation, text="刷新", command=self._refresh
         )
-        self._open_button = ttk.Button(
-            navigation, text="打开选中项", command=self._open
-        )
+        self._open_button = ttk.Button(navigation, text="进入目录", command=self._open)
         for button in (
             self._root_button,
             self._up_button,
@@ -176,7 +171,7 @@ class FileBrowser(tk.Toplevel):
         path_bar = tk.Frame(panel, bg=gui.PANEL)
         path_bar.grid(row=2, column=0, sticky="ew", pady=(0, 9))
         path_bar.columnconfigure(1, weight=1)
-        gui._label(path_bar, "项目相对路径（留空为根目录）", fg=gui.MUTED).grid(
+        gui._label(path_bar, "项目相对目录（留空为根目录）", fg=gui.MUTED).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 3)
         )
         self._path_entry = self._entry(path_bar)
@@ -269,7 +264,6 @@ class FileBrowser(tk.Toplevel):
         idle = not self._busy()
         page = self._page
         selected = self._selected()
-        directory = page is not None and page.is_directory
         file_selected = idle and selected is not None and selected.kind == "file"
         go = not self._picking_destination and (
             self._running is None or bool(self._running.offsets)
@@ -280,18 +274,12 @@ class FileBrowser(tk.Toplevel):
             (self._refresh_button, idle),
             (
                 self._open_button,
-                idle
-                and directory
-                and selected is not None
-                and selected.kind != "other",
+                idle and selected is not None and selected.kind == "directory",
             ),
-            (self._previous_button, idle and directory and len(self._offsets) > 1),
+            (self._previous_button, idle and len(self._offsets) > 1),
             (
                 self._next_button,
-                idle
-                and page is not None
-                and directory
-                and page.next_offset is not None,
+                idle and page is not None and page.next_offset is not None,
             ),
             (self._download_button, file_selected),
             (self._range_button, file_selected),
@@ -328,23 +316,22 @@ class FileBrowser(tk.Toplevel):
 
     def _entry_path(self, entry: _Entry) -> str:
         assert self._page is not None
-        if not self._page.is_directory:
-            return self._page.path
         return "/".join(part for part in (self._page.path, entry.name) if part)
 
-    def _open(self, _event: tk.Event | None = None) -> None:
-        if self._busy() or self._page is None or not self._page.is_directory:
-            return
-        entry = self._selected()
-        if entry is not None and entry.kind in ("directory", "file"):
-            self._browse_to(self._entry_path(entry))
-
-    def _open_clicked(self, event: tk.Event) -> None:
+    def _open(self, _event: tk.Event | None = None) -> str:
         if not self._busy():
+            entry = self._selected()
+            if entry is not None and entry.kind == "directory":
+                self._browse_to(self._entry_path(entry))
+        return "break"
+
+    def _open_clicked(self, event: tk.Event) -> str:
+        if not self._busy() and self._tree.identify_region(event.x, event.y) == "cell":
             row = self._tree.identify_row(event.y)
             if row:
                 self._tree.selection_set(row)
                 self._open()
+        return "break"
 
     def _previous(self) -> None:
         if not self._busy() and self._page is not None and len(self._offsets) > 1:
@@ -459,7 +446,7 @@ class FileBrowser(tk.Toplevel):
 
     def _show_page(self, page: _Page, job: _Job) -> None:
         self._page = page
-        self._offsets = job.offsets if page.is_directory else (0,)
+        self._offsets = job.offsets
         if self._path_entry.get() == job.path_input:
             self._path_entry.delete(0, tk.END)
             self._path_entry.insert(0, _display(page.path))
@@ -480,17 +467,12 @@ class FileBrowser(tk.Toplevel):
             )
             self._rows[row] = entry
         self._tree.yview_moveto(0)
-        if page.is_directory:
-            self._page_label.configure(
-                text=f"第 {len(self._offsets)} 页 · 本页 {len(page.entries)} 项"
-            )
-            self._set_status(
-                "双击目录进入，选中文件后可下载。" if page.entries else "没有条目。"
-            )
-        else:
-            self._tree.selection_set(tuple(self._rows))
-            self._page_label.configure(text="文件")
-            self._set_status("请选择下载全部或下载范围。")
+        self._page_label.configure(
+            text=f"第 {len(self._offsets)} 页 · 本页 {len(page.entries)} 项"
+        )
+        self._set_status(
+            "双击目录进入，选中文件后可下载。" if page.entries else "没有条目。"
+        )
 
     def _stop(self) -> None:
         self._closed = True

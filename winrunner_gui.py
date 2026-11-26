@@ -378,21 +378,25 @@ class Metric(tk.Frame):
             parent, bg=PANEL, highlightbackground=BORDER, highlightthickness=1
         )
         tk.Frame(self, bg=accent, height=2).pack(fill="x")
-        body = tk.Frame(self, bg=PANEL, padx=12, pady=7)
+        body = tk.Frame(self, bg=PANEL, padx=10, pady=5)
         body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
         self.title = FitLabel(body, title, fg=MUTED, size=9, bold=True)
-        self.title.pack(fill="x")
-        self.value = FitLabel(
-            body, DASH, size=20 if bar else 15, bold=True, family=MONO
-        )
-        self.value.pack(fill="x", pady=(3, 1))
+        self.title.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.value = FitLabel(body, DASH, size=12, bold=True, family=MONO)
         self.detail = FitLabel(body, DASH, fg=MUTED, size=8)
-        self.detail.pack(fill="x", pady=(0, 7))
+        if bar:
+            self.value.configure(anchor="e", width=7)
+            self.value.grid(row=0, column=1, sticky="ew")
+            self.detail.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(1, 4))
+        else:
+            self.title.grid_configure(columnspan=2)
+            self.value.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(1, 0))
         self.bar = ttk.Progressbar(
             body, style=f"{accent}.Horizontal.TProgressbar", maximum=100
         )
         if bar:
-            self.bar.pack(fill="x")
+            self.bar.grid(row=2, column=0, columnspan=2, sticky="ew")
 
     def update_value(self, value: str, detail: str, percent: float = 0) -> None:
         self.value.set_text(value)
@@ -404,15 +408,15 @@ class StatusTable(tk.Frame):
     def __init__(
         self, parent: tk.Misc, title: str, columns: tuple[Column, ...]
     ) -> None:
-        super().__init__(parent, bg=PANEL, padx=12, pady=9)
-        header = tk.Frame(self, bg=PANEL)
-        header.pack(fill="x", pady=(0, 7))
+        super().__init__(parent, bg=PANEL, padx=10, pady=6)
+        header = self.header = tk.Frame(self, bg=PANEL)
+        header.pack(fill="x", pady=(0, 4))
         header.columnconfigure(1, weight=1)
         _label(header, title, size=10, bold=True).grid(row=0, column=0, sticky="w")
         self.summary = FitLabel(header, "等待刷新…", fg=MUTED, size=8)
         self.summary.configure(anchor="e")
         self.summary.grid(row=0, column=1, padx=(6, 0), sticky="ew")
-        body = self.body = tk.Frame(self, bg=PANEL)
+        body = tk.Frame(self, bg=PANEL)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
@@ -923,7 +927,7 @@ class Dashboard:
 
         _apply_theme(root)
 
-        hero = tk.Frame(root, bg=HEADER, padx=18, pady=11)
+        hero = tk.Frame(root, bg=HEADER, padx=16, pady=6)
         hero.grid(row=0, column=0, sticky="ew")
         hero.columnconfigure(1, weight=1)
         mark = tk.Label(
@@ -939,8 +943,10 @@ class Dashboard:
         mark.grid(row=0, column=0, padx=(0, 11))
         heading = tk.Frame(hero, bg=HEADER)
         heading.grid(row=0, column=1, sticky="w")
-        _label(heading, "WinRunner", bg=HEADER, size=16, bold=True).pack(fill="x")
-        _label(heading, "本机控制台", bg=HEADER, fg=MUTED, size=8).pack(fill="x")
+        _label(heading, "WinRunner", bg=HEADER, size=16, bold=True).pack(side="left")
+        _label(heading, "本机控制台", bg=HEADER, fg=MUTED, size=9).pack(
+            side="left", padx=(10, 0)
+        )
         self.connection = _label(
             hero, "● 正在读取", bg=RAISED, fg=AMBER, size=9, bold=True
         )
@@ -948,7 +954,7 @@ class Dashboard:
         self.connection.grid(row=0, column=2)
 
         cards = tk.Frame(root, bg=BG)
-        cards.grid(row=1, column=0, sticky="ew", padx=14, pady=9)
+        cards.grid(row=1, column=0, sticky="ew", padx=14, pady=6)
         names = ("CPU 使用率", "物理内存", "工作区磁盘", "Runner 运行时长")
         metrics = [
             Metric(cards, name, accent, bar=i < 3)
@@ -964,7 +970,9 @@ class Dashboard:
         workspace = tk.Frame(root, bg=BG)
         workspace.grid(row=2, column=0, sticky="nsew", padx=14)
         workspace.columnconfigure(0, weight=1)
-        workspace.rowconfigure(0, weight=3)
+        # Share the actual space with the detail, not just the extra space
+        # left over after each widget's requested height.
+        workspace.rowconfigure(0, weight=3, uniform="workspace")
         self.tabs = ttk.Notebook(workspace)
         self.tabs.grid(row=0, column=0, sticky="nsew")
         projects = tk.Frame(self.tabs, bg=BG)
@@ -989,16 +997,17 @@ class Dashboard:
             )
 
         project = tk.Frame(projects, bg=PANEL)
-        project.grid(row=0, column=1, sticky="nsew")
+        project.grid(row=0, column=1, rowspan=2, sticky="nsew")
         project.columnconfigure(0, weight=1)
         project.rowconfigure(2, weight=1)
         intro = tk.Frame(project, bg=PANEL, padx=12, pady=6)
         intro.grid(row=0, column=0, sticky="ew")
+        intro.columnconfigure(0, weight=1)
         self.project_title = FitLabel(intro, "选择左侧项目", bold=True, size=11)
-        self.project_title.pack(fill="x")
+        self.project_title.grid(row=0, column=0, sticky="ew")
         self.repo = FitLabel(intro, "", fg=MUTED, size=9)
-        self.repo.pack(fill="x")
-        action = tk.Frame(project, bg=INSET, padx=8, pady=4)
+        self.repo.grid(row=1, column=0, sticky="ew")
+        action = tk.Frame(project, bg=INSET, padx=8, pady=3)
         action.grid(row=1, column=0, padx=12, sticky="ew")
         action.columnconfigure(0, weight=1)
         self.action_button = ttk.Button(
@@ -1014,20 +1023,25 @@ class Dashboard:
         self.tabs.add(self.commands, text="全局命令")
         if desktop is not None:
             project_tools = tk.Frame(intro, bg=PANEL)
-            project_tools.pack(anchor="w", pady=(5, 0))
+            project_tools.grid(row=0, column=1, rowspan=2, sticky="e", padx=(6, 0))
             self._buttons(
                 project_tools,
-                ("run_action", "运行 Action", self._start_action),
-                ("cancel_action", "取消 Action", self._cancel_action),
                 ("files", "项目文件", self._browse_files),
                 ("copy_repo", "复制仓库地址", self._copy_repo),
+            )
+            action_tools = tk.Frame(action, bg=INSET)
+            action_tools.grid(row=0, column=2)
+            self._buttons(
+                action_tools,
+                ("run_action", "运行 Action", self._start_action),
+                ("cancel_action", "取消 Action", self._cancel_action),
             )
             for scope, table in (
                 ("project", self.project_commands),
                 ("global", self.commands),
             ):
-                command_tools = tk.Frame(table, bg=PANEL)
-                command_tools.pack(fill="x", before=table.body, pady=(0, 5))
+                command_tools = tk.Frame(table.header, bg=PANEL)
+                command_tools.grid(row=0, column=2, padx=(8, 0))
                 self._buttons(
                     command_tools,
                     (f"{scope}_submit", "提交命令", self._start_command),
@@ -1545,11 +1559,11 @@ class Dashboard:
         if target is None:
             self.detail.show(View(), None)
             self.detail.grid_remove()
-            self.workspace.rowconfigure(1, weight=0)
+            self.workspace.rowconfigure(1, weight=0, uniform="")
         else:
             self.detail.open(target, keep_tab=old.target is not None)
             self.detail.grid()
-            self.workspace.rowconfigure(1, weight=2)
+            self.workspace.rowconfigure(1, weight=2, uniform="workspace")
         self._schedule(0)
 
     def _page(self, stream: str, direction: int) -> None:

@@ -149,12 +149,16 @@ class FileBrowserTests(unittest.TestCase):
         )
         self.assertTrue(all(worker != threading.get_ident() for *_, worker in calls))
 
-    def test_direct_file_full_and_range_downloads_and_api_errors(self) -> None:
+    def test_file_selection_stays_in_directory_and_allows_download(self) -> None:
         saves: list[tuple[str, str, Path, str | None, int]] = []
+        paths: list[str] = []
 
         def browse(project, path, offset, cancel):
+            paths.append(path)
             if path == "":
-                return listing("")
+                return listing("", ("sub", "directory", None))
+            if path == "sub":
+                return listing("sub", ("log.txt", "file", 536), ("keep.txt", "file", 1))
             if path == r"sub\log.txt":
                 return {"path": "sub/log.txt", "size_bytes": 536}
             raise APIError(404, "not_found", "No such project file")
@@ -171,14 +175,36 @@ class FileBrowserTests(unittest.TestCase):
 
         browser = self.browser(browse, save)
         self.ready(browser)
+        self.select(browser, "sub")
+        browser._open_button.invoke()
+        self.ready(browser)
+        self.select(browser, "log.txt")
+        tree = browser._tree
+        row = tree.selection()[0]
+        self.assertEqual(tree.set(row, "size"), "536 B")
+        self.assertTrue(browser._open_button.instate(["disabled"]))
+        browser._open_button.invoke()
+        tree.focus_force()
+        tree.event_generate("<Return>")
+        box = tree.bbox(row)
+        assert box
+        x, y, _, height = box
+        for _ in range(2):
+            tree.event_generate("<ButtonPress-1>", x=x + 5, y=y + height // 2)
+            tree.event_generate("<ButtonRelease-1>", x=x + 5, y=y + height // 2)
+        self.root.update()
+        self.assertEqual(paths, ["", "sub"])
+        self.assertEqual(tree.selection(), (row,))
+        self.assertEqual(browser._location.cget("text"), "当前路径：sub")
+        self.assertTrue(browser._download_button.instate(["!disabled"]))
+
         set_entry(browser._path_entry, r"sub\log.txt")
         browser._go_button.invoke()
         self.ready(browser)
-        self.assertEqual(browser._path_entry.get(), "sub/log.txt")
-        self.assertEqual(
-            browser._tree.set(browser._tree.selection()[0], "size"), "536 B"
-        )
-        self.assertTrue(browser._download_button.instate(["!disabled"]))
+        self.assertIn("not_a_directory", browser._status.cget("text"))
+        self.assertEqual(browser._location.cget("text"), "当前路径：sub")
+        self.assertEqual(tree.selection(), (row,))
+        self.assertEqual(len(tree.get_children()), 2)
 
         dest = Path("chosen log.txt")
         with patch(
@@ -224,7 +250,7 @@ class FileBrowserTests(unittest.TestCase):
         self.ready(browser)
         self.assertIn("404 not_found", browser._status.cget("text"))
         self.assertIn("No such project file", browser._status.cget("text"))
-        self.assertIn("sub/log.txt", browser._location.cget("text"))
+        self.assertEqual(browser._location.cget("text"), "当前路径：sub")
         self.assertTrue(browser._download_button.instate(["!disabled"]))
 
     def test_superseded_result_is_ignored_and_only_latest_path_runs(self) -> None:
@@ -352,8 +378,9 @@ class FileBrowserTests(unittest.TestCase):
             self.unexpected_save = True
             return 0
 
-        browser = self.browser(lambda *_: {"path": "direct.txt", "size_bytes": 1}, save)
+        browser = self.browser(lambda *_: listing("", ("file.txt", "file", 1)), save)
         self.ready(browser)
+        self.select(browser, "file.txt")
 
         def close_during_picker(**kwargs):
             browser.close()
