@@ -213,6 +213,54 @@ class IntegratedTests(unittest.TestCase):
 
 
 class TkLayoutTests(unittest.TestCase):
+    def test_switching_command_keeps_detail_tab_until_collapsed(self) -> None:
+        try:
+            root = gui.tk.Tk()
+        except gui.tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        dashboard = gui.Dashboard(
+            root,
+            snapshot=lambda view: gui.Snapshot(gui.Response()),
+            is_running=lambda: True,
+        )
+        try:
+            if dashboard._after_id is not None:
+                root.after_cancel(dashboard._after_id)
+                dashboard._after_id = None
+            with patch.object(dashboard, "_schedule"):
+                dashboard.tabs.select(dashboard.commands)
+                tree = dashboard.commands.tree
+                for command_id in ("0", "1"):
+                    tree.insert("", "end", iid=command_id)
+                tree.selection_set("0")
+                root.update()
+                detail = dashboard.detail
+                self.assertEqual(detail.tabs.select(), str(detail.input))
+                for tab in (
+                    detail.outputs["stdout"].master,
+                    detail.outputs["stderr"].master,
+                    detail.diagnostics,
+                ):
+                    with self.subTest(tab=tab):
+                        detail.tabs.select(tab)
+                        current = tree.selection()[0]
+                        next_id = "1" if current == "0" else "0"
+                        tree.selection_set(next_id)
+                        root.update()
+                        self.assertEqual(
+                            dashboard._view.target, gui.Target(None, next_id)
+                        )
+                        self.assertEqual(detail.tabs.select(), str(tab))
+                dashboard._collapse()
+                root.update()
+                self.assertFalse(detail.winfo_ismapped())
+                tree.selection_set("0")
+                root.update()
+                self.assertTrue(detail.winfo_ismapped())
+                self.assertEqual(detail.tabs.select(), str(detail.input))
+        finally:
+            dashboard.close()
+
     def test_long_content_at_minimum_size_and_larger_scaling(self) -> None:
         for scale in (1.33, 2.0):
             with self.subTest(scale=scale):

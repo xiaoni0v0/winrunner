@@ -658,7 +658,7 @@ class TaskDetail(tk.Frame):
         self.diagnostics = ReadOnlyText(self.tabs, wrap="word")
         self.tabs.add(self.diagnostics, text="诊断")
 
-    def open(self, target: Target) -> None:
+    def open(self, target: Target, *, keep_tab: bool = False) -> None:
         scope = target.project or "全局"
         title = (
             f"{scope}  /  Action"
@@ -671,7 +671,8 @@ class TaskDetail(tk.Frame):
             self.tabs.select(self.outputs["stdout"].master)
         else:
             self.tabs.add(self.input, text="命令原文")
-            self.tabs.select(self.input)
+            if not keep_tab:
+                self.tabs.select(self.input)
         self.show(View(), None)
 
     def show(self, view: View, result: Response | None) -> None:
@@ -1018,7 +1019,7 @@ class Dashboard:
             self.detail.grid_remove()
             self.workspace.rowconfigure(1, weight=0)
         else:
-            self.detail.open(target)
+            self.detail.open(target, keep_tab=old.target is not None)
             self.detail.grid()
             self.workspace.rowconfigure(1, weight=2)
         self._schedule(0)
