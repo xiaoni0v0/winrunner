@@ -26,8 +26,8 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 import config
 from runner import APIError, Runner, invalid, json_value, not_found
-from winfiles import normalized_relative
 from winprocess import CpuSampler, health
+from winrunner_files import directory_listing, range_bounds
 
 
 def health_snapshot(runner: Runner, sampler: CpuSampler) -> dict:
@@ -38,7 +38,6 @@ def health_snapshot(runner: Runner, sampler: CpuSampler) -> dict:
 
 
 DECIMAL = re.compile(r"[0-9]+\Z")
-BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
 LOG = logging.getLogger("winrunner")
 LOG_FILE = Path(__file__).resolve().with_name("winrunner.log")
 
@@ -169,25 +168,6 @@ def task_query(query):
     return log_params(query), {"include_input": True} if include_input else {}
 
 
-def range_bounds(header, size):
-    if header is None:
-        return 0, size
-    match = BYTE_RANGE.fullmatch(header.strip())
-    if match and size:
-        a, b = match.groups()
-        try:
-            if a:
-                start = int(a)
-                end = min(int(b) + 1, size) if b else size
-                if 0 <= start < end:
-                    return start, end
-            elif b and int(b):
-                return max(0, size - int(b)), size
-        except ValueError:
-            pass
-    raise APIError(416, "range_not_satisfiable", "Expected one satisfiable byte range")
-
-
 @dataclass
 class StartRecord:
     fingerprint: bytes
@@ -207,6 +187,7 @@ class StartReplay:
         start: Callable[[], tuple[int, dict]],
         *,
         log_errors: bool,
+        validate_new: Callable[[], None] | None = None,
     ) -> tuple[int, dict]:
         try:
             canonical = json.dumps(
@@ -232,6 +213,10 @@ class StartReplay:
                         "Original submit is still processing; retry the same key",
                     )
                 return record.response
+            # Desktop preflight is local-only: do not use a replay slot for
+            # form errors. Existing records always retain HTTP replay semantics.
+            if validate_new is not None:
+                validate_new()
             if len(self.records) >= 4096:
                 raise APIError(
                     503,
@@ -243,10 +228,14 @@ class StartReplay:
             500,
             {"error": {"code": "internal_error", "message": "Internal runner error"}},
         )
+        stale_desktop_selection = False
         try:
             response = start()
         except APIError as exc:
             response = (exc.status, exc.response_payload())
+            stale_desktop_selection = (
+                validate_new is not None and exc.code == "project_changed"
+            )
         except Exception:
             # The task may have started before this failure. Give the original
             # caller and replays the same generic 500, without starting again.
@@ -255,7 +244,11 @@ class StartReplay:
         finally:
             # Record the result before the caller attempts the HTTP write.
             with self.lock:
-                record.response = response
+                if stale_desktop_selection:
+                    # Stale desktop selections never reached a new project.
+                    del self.records[slot]
+                else:
+                    record.response = response
         return response
 
 
@@ -747,47 +740,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
             limit = uint(query.get("entry_limit", "100"), "entry_limit")
             if not 1 <= limit <= 1000:
                 raise invalid("entry_limit must be between 1 and 1000")
-
-        items = sorted(
-            entry.list_entries(),
-            key=lambda item: (item["name"].casefold(), item["name"]),
-        )
-        result: dict[str, object] = {
-            "path": normalized_relative(relative),
-            "entries": items,
-        }
-        if paged:
-            page: list[dict] = []
-            result["entries"] = page
-            result["next_entry_offset"] = None
-            # Match reply() so escaping, commas, and the cursor count on the wire.
-            body_limit = 512 * 1024
-            body_bytes = len(
-                json.dumps(result, separators=(",", ":"), ensure_ascii=True)
-            )
-            if body_bytes > body_limit:
-                raise APIError(
-                    413,
-                    "response_too_large",
-                    "Directory path exceeds the page size limit",
-                )
-            for index, item in enumerate(items[offset : offset + limit], offset + 1):
-                item_bytes = len(
-                    json.dumps(item, separators=(",", ":"), ensure_ascii=True)
-                ) + (1 if page else 0)
-                cursor = index if index < len(items) else None
-                cursor_delta = len(json.dumps(cursor)) - len("null")
-                if body_bytes + item_bytes + cursor_delta > body_limit:
-                    if not page:
-                        raise APIError(
-                            413,
-                            "response_too_large",
-                            "Directory entry exceeds the page size limit",
-                        )
-                    break
-                page.append(item)
-                body_bytes += item_bytes
-                result["next_entry_offset"] = cursor
+            result = directory_listing(entry, relative, offset=offset, limit=limit)
+        else:
+            result = directory_listing(entry, relative)
         self.reply(200, result)
 
     def download(self, entry):
@@ -890,6 +845,7 @@ def serve(token: str, *, nogui: bool) -> None:
 def serve_with_gui(server: HTTPServer) -> None:
     import tkinter
 
+    from winrunner_desktop import DesktopRunner
     from winrunner_gui import (
         LOG_READ,
         Response,
@@ -913,7 +869,9 @@ def serve_with_gui(server: HTTPServer) -> None:
             options = {"include_input": True} if offsets is not None else {}
             if target.command is None:
                 return Response(
-                    runner.get_action(target.project, offsets, LOG_READ, **options)
+                    runner.get_action(
+                        target.project, offsets, LOG_READ, include_input=True
+                    )
                 )
             return Response(
                 runner.get_command(
@@ -924,12 +882,16 @@ def serve_with_gui(server: HTTPServer) -> None:
             return Response(error=str(exc), status=exc.status)
 
     def snapshot(view: View) -> Snapshot:
-        return Snapshot(
-            Response(health_snapshot(runner, server.cpu_sampler)),
-            Response({"projects": runner.list_projects()}),
-            Response({"commands": runner.list_commands()}),
-            selected=read_view(view, list_commands, get_task),
-        )
+        health = Response(health_snapshot(runner, server.cpu_sampler))
+        # The selected task and its project identity must refer to the same
+        # generation; HTTP may delete and recreate a project at any time.
+        with runner.lock:
+            return Snapshot(
+                health,
+                Response({"projects": runner.list_projects(include_scope=True)}),
+                Response({"commands": runner.list_commands()}),
+                selected=read_view(view, list_commands, get_task),
+            )
 
     errors: list[Exception] = []
 
@@ -950,7 +912,11 @@ def serve_with_gui(server: HTTPServer) -> None:
     try:
         worker.start()
         if not stopping:
-            run_integrated(snapshot, lambda: not stopping and worker.is_alive())
+            run_integrated(
+                snapshot,
+                lambda: not stopping and worker.is_alive(),
+                desktop=DesktopRunner(runner, server.start_replay),
+            )
     except tkinter.TclError as exc:
         LOG.error("Cannot open Tkinter window; use --nogui on headless hosts")
         raise RuntimeError("Tkinter window failed") from exc

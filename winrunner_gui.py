@@ -1,4 +1,4 @@
-"""Read-only local WinRunner dashboard. Run beside config.py with Python 3.10+."""
+"""Local WinRunner desktop console. Run beside config.py with Python 3.10+."""
 
 from __future__ import annotations
 
@@ -8,14 +8,23 @@ import math
 import re
 import signal
 import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
+from pathlib import Path
 from queue import Empty, SimpleQueue
-from tkinter import font as tkfont, ttk
-from typing import Literal
+from tkinter import filedialog, font as tkfont, messagebox, ttk
+from typing import TYPE_CHECKING, Literal
+
+from runner import APIError
+from winrunner_desktop import DesktopRunner, ProjectSelection, Submission
+
+if TYPE_CHECKING:
+    from winrunner_gui_files import FileBrowser
+    from winrunner_gui_forms import FormKind, SubmitForm
 
 INTEGRATED_REFRESH_MS = 850
 REOPEN_MS = 450
@@ -286,6 +295,7 @@ def _label(
     fg: str = INK,
     size: int = 10,
     bold: bool = False,
+    wraplength: int = 0,
 ) -> tk.Label:
     return tk.Label(
         parent,
@@ -293,6 +303,7 @@ def _label(
         bg=bg,
         fg=fg,
         anchor="w",
+        wraplength=wraplength,
         font=(FONT, size, "bold" if bold else "normal"),
     )
 
@@ -401,7 +412,7 @@ class StatusTable(tk.Frame):
         self.summary = FitLabel(header, "等待刷新…", fg=MUTED, size=8)
         self.summary.configure(anchor="e")
         self.summary.grid(row=0, column=1, padx=(6, 0), sticky="ew")
-        body = tk.Frame(self, bg=PANEL)
+        body = self.body = tk.Frame(self, bg=PANEL)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
@@ -621,6 +632,7 @@ class TaskDetail(tk.Frame):
         parent: tk.Misc,
         close: Callable[[], None],
         page: Callable[[str, int], None],
+        save: Callable[[str], None] | None = None,
     ):
         super().__init__(parent, bg=PANEL, padx=14, pady=10)
         self.columnconfigure(0, weight=1)
@@ -640,6 +652,7 @@ class TaskDetail(tk.Frame):
         self.outputs: dict[str, ReadOnlyText] = {}
         self.ranges: dict[str, FitLabel] = {}
         self.buttons: dict[str, tuple[ttk.Button, ttk.Button]] = {}
+        self.save_buttons: dict[str, ttk.Button] = {}
         for stream in STREAMS:
             tab = tk.Frame(self.tabs, bg=PANEL, padx=6, pady=5)
             self.tabs.add(tab, text=stream)
@@ -653,6 +666,12 @@ class TaskDetail(tk.Frame):
             prev.grid(row=0, column=1, padx=(0, 4))
             nxt.grid(row=0, column=2)
             self.buttons[stream] = (prev, nxt)
+            if save is not None:
+                button = ttk.Button(
+                    nav, text="保存原始日志…", command=partial(save, stream)
+                )
+                button.grid(row=0, column=3, padx=(4, 0))
+                self.save_buttons[stream] = button
             self.outputs[stream] = ReadOnlyText(tab)
             self.outputs[stream].pack(fill="both", expand=True)
         self.diagnostics = ReadOnlyText(self.tabs, wrap="word")
@@ -695,6 +714,8 @@ class TaskDetail(tk.Frame):
             diag.append(f"{_text(error.get('code'))}\n{_text(error.get('message'))}")
         if data.get("commit"):
             diag.append(f"提交：{data['commit']}")
+        if data.get("action_id"):
+            diag.append(f"Action ID：{data['action_id']}")
         if data.get("output_source"):
             diag.append(f"输出来源：{data['output_source']}")
         self.diagnostics.show("\n\n".join(diag) or ("暂无诊断" if data else ""))
@@ -713,6 +734,8 @@ class TaskDetail(tk.Frame):
             prev, nxt = self.buttons[stream]
             prev.state(["!disabled" if data and start else "disabled"])
             nxt.state(["!disabled" if end < total else "disabled"])
+            if stream in self.save_buttons:
+                self.save_buttons[stream].state(["!disabled" if data else "disabled"])
 
 
 def _apply_theme(root: tk.Tk) -> None:
@@ -805,6 +828,38 @@ def _apply_theme(root: tk.Tk) -> None:
         )
 
 
+@dataclass(frozen=True)
+class OperationResult:
+    key: tuple[str, ...]
+    value: object = None
+    error: str = ""
+
+
+def _run_operation(
+    work: Callable[[], object],
+    key: tuple[str, ...],
+    results: SimpleQueue[OperationResult],
+    stop: threading.Event,
+) -> None:
+    if stop.is_set():
+        return
+    try:
+        result = OperationResult(key, work())
+    except APIError as exc:
+        result = OperationResult(key, error=f"{exc.code}\n{exc}")
+    except ValueError as exc:  # Path or form validation.
+        result = OperationResult(key, error=str(exc))
+    except OSError as exc:
+        result = OperationResult(key, error=str(exc))
+    except Exception:
+        import logging
+
+        logging.getLogger("winrunner").exception("Desktop operation failed: %s", key[0])
+        result = OperationResult(key, error="内部错误，请查看服务日志。")
+    if not stop.is_set():
+        results.put(result)
+
+
 class Dashboard:
     def __init__(
         self,
@@ -812,8 +867,23 @@ class Dashboard:
         *,
         snapshot: Callable[[View], Snapshot],
         is_running: Callable[[], bool],
+        desktop: DesktopRunner | None = None,
     ) -> None:
         self.root = root
+        self.desktop = desktop
+        self._operation_results: SimpleQueue[OperationResult] = SimpleQueue()
+        self._operations: dict[tuple[str, ...], Callable[[OperationResult], None]] = {}
+        self._operation_after: str | None = None
+        self._exports: dict[tuple[str, ...], threading.Thread] = {}
+        self._forms: dict[tuple[str, ...], SubmitForm] = {}
+        self._browsers: dict[str, FileBrowser] = {}
+        self._action_summary: JsonObject = {}
+        self._selected_scope: str | None = None
+        self._pending_selection: (
+            tuple[View, str | None, str | None, str | None] | None
+        ) = None
+        self._refresh_requested = False
+        self._flash: tuple[str, float] = ("", 0)
         self._stop = threading.Event()
         self._results: SimpleQueue[Snapshot] = SimpleQueue()
         self._after_id: str | None = None
@@ -834,7 +904,7 @@ class Dashboard:
 
         self._poll = poll
 
-        root.title("WinRunner · 本机监控")
+        root.title("WinRunner · 控制台")
         # Heights set in pixels need extra room when Tk renders larger fonts.
         scale = float(root.tk.call("tk", "scaling"))
         available_width = max(1, root.winfo_screenwidth() - 24)
@@ -870,9 +940,7 @@ class Dashboard:
         heading = tk.Frame(hero, bg=HEADER)
         heading.grid(row=0, column=1, sticky="w")
         _label(heading, "WinRunner", bg=HEADER, size=16, bold=True).pack(fill="x")
-        _label(heading, "本机监控  /  LOCAL MONITOR", bg=HEADER, fg=MUTED, size=8).pack(
-            fill="x"
-        )
+        _label(heading, "本机控制台", bg=HEADER, fg=MUTED, size=8).pack(fill="x")
         self.connection = _label(
             hero, "● 正在读取", bg=RAISED, fg=AMBER, size=9, bold=True
         )
@@ -910,6 +978,15 @@ class Dashboard:
         projects.rowconfigure(0, weight=1)
         self.projects.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         self.projects.tree.bind("<<TreeviewSelect>>", self._select_project)
+        self.controls: dict[str, ttk.Button] = {}
+        if desktop is not None:
+            project_tools = tk.Frame(projects, bg=PANEL, padx=8, pady=5)
+            project_tools.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+            self._buttons(
+                project_tools,
+                ("create", "创建项目", self._create_project),
+                ("delete_project", "删除项目", self._delete_project),
+            )
 
         project = tk.Frame(projects, bg=PANEL)
         project.grid(row=0, column=1, sticky="nsew")
@@ -935,10 +1012,36 @@ class Dashboard:
 
         self.commands = StatusTable(self.tabs, "全局命令", COMMAND_COLUMNS)
         self.tabs.add(self.commands, text="全局命令")
+        if desktop is not None:
+            project_tools = tk.Frame(intro, bg=PANEL)
+            project_tools.pack(anchor="w", pady=(5, 0))
+            self._buttons(
+                project_tools,
+                ("run_action", "运行 Action", self._start_action),
+                ("cancel_action", "取消 Action", self._cancel_action),
+                ("files", "项目文件", self._browse_files),
+                ("copy_repo", "复制仓库地址", self._copy_repo),
+            )
+            for scope, table in (
+                ("project", self.project_commands),
+                ("global", self.commands),
+            ):
+                command_tools = tk.Frame(table, bg=PANEL)
+                command_tools.pack(fill="x", before=table.body, pady=(0, 5))
+                self._buttons(
+                    command_tools,
+                    (f"{scope}_submit", "提交命令", self._start_command),
+                    (f"{scope}_delete", "删除命令", self._delete_command),
+                )
         self.project_commands.tree.bind("<<TreeviewSelect>>", self._select_command)
         self.commands.tree.bind("<<TreeviewSelect>>", self._select_command)
         self.tabs.bind("<<NotebookTabChanged>>", self._switch_tab)
-        self.detail = TaskDetail(workspace, self._collapse, self._page)
+        self.detail = TaskDetail(
+            workspace,
+            self._collapse,
+            self._page,
+            self._save_log if desktop is not None else None,
+        )
         self.detail.grid(row=1, column=0, sticky="nsew", pady=(7, 0))
         self.detail.grid_remove()
         self.workspace = workspace
@@ -949,7 +1052,7 @@ class Dashboard:
         footer.columnconfigure(0, weight=1)
         self.notice = FitLabel(footer, "正在读取状态…", bg=BG, fg=MUTED, size=8)
         self.notice.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        _label(footer, "只读  /  Ctrl+C 停止服务", bg=BG, fg=MUTED, size=8).grid(
+        _label(footer, "Ctrl+C 停止服务", bg=BG, fg=MUTED, size=8).grid(
             row=0, column=1, padx=(0, 12)
         )
         self.run = FitLabel(footer, "", bg=BG, fg=MUTED, size=8, family=MONO)
@@ -957,6 +1060,424 @@ class Dashboard:
         footer.columnconfigure(2, weight=1)
         self.run.grid(row=0, column=2, sticky="ew")
         self._after_id = root.after_idle(self.refresh)
+
+    def _buttons(
+        self, parent: tk.Frame, *items: tuple[str, str, Callable[[], None]]
+    ) -> None:
+        for key, label, callback in items:
+            button = self.controls[key] = ttk.Button(
+                parent, text=label, command=callback
+            )
+            button.pack(side="left", padx=(0, 5))
+
+    def _project_selection(self) -> ProjectSelection | None:
+        name = self._view.project
+        if name is None or self._global() or self._selected(self.projects) != name:
+            return None
+        return (
+            ProjectSelection(name, self._selected_scope)
+            if self._selected_scope
+            else None
+        )
+
+    def _update_controls(self) -> None:
+        if not self.controls:
+            return
+        project = self._project_selection()
+        name = project.name if project else ""
+        status = _find(self._snapshot.projects, "projects", name).get("status")
+        action_status = self._action_summary.get("status")
+        project_id = self._selected(self.project_commands)
+        global_id = self._selected(self.commands)
+        enabled = {
+            "create": True,
+            "delete_project": project is not None
+            and status != "deleting"
+            and ("delete_project", name) not in self._operations,
+            "run_action": project is not None
+            and status not in ("cloning", "deleting", "delete_failed"),
+            "cancel_action": project is not None
+            and action_status in ("preparing", "running")
+            and bool(self._action_summary.get("action_id"))
+            and ("cancel_action", name) not in self._operations,
+            "files": project is not None
+            and status not in ("cloning", "deleting", "delete_failed"),
+            "copy_repo": project is not None,
+            "project_submit": project is not None and status != "deleting",
+            "project_delete": project is not None
+            and project_id is not None
+            and ("delete_command", name, project_id) not in self._operations,
+            "global_submit": True,
+            "global_delete": global_id is not None
+            and ("delete_command", "", global_id) not in self._operations,
+        }
+        for key, button in self.controls.items():
+            button.state(
+                [
+                    (
+                        "!disabled"
+                        if enabled[key] and not self._backend_exited
+                        else "disabled"
+                    )
+                ]
+            )
+
+    def _operate(
+        self,
+        key: tuple[str, ...],
+        work: Callable[[], object],
+        done: Callable[[OperationResult], None],
+    ) -> bool:
+        if key in self._operations or self._stop.is_set() or not self._check_backend():
+            return False
+        self._operations[key] = done
+        worker = threading.Thread(
+            target=_run_operation,
+            args=(work, key, self._operation_results, self._stop),
+            daemon=True,
+            name=f"winrunner-desktop-{key[0]}",
+        )
+        try:
+            worker.start()
+        except RuntimeError:
+            self._operations.pop(key)
+            messagebox.showerror("操作未启动", "无法启动后台操作。", parent=self.root)
+            return False
+        if key[0] == "save_log":
+            self._exports[key] = worker
+        if self._operation_after is None:
+            self._operation_after = self.root.after(50, self._receive_operations)
+        self._update_controls()
+        return True
+
+    def _receive_operations(self) -> None:
+        self._operation_after = None
+        if self._stop.is_set() or not self._check_backend():
+            return
+        while True:
+            try:
+                result = self._operation_results.get_nowait()
+            except Empty:
+                break
+            done = self._operations.pop(result.key)
+            self._exports.pop(result.key, None)
+            self._refresh_requested = True
+            self._schedule(0)
+            self._update_controls()
+            try:
+                done(result)
+            except Exception as exc:
+                self.root.report_callback_exception(type(exc), exc, exc.__traceback__)
+            if self._stop.is_set():
+                return
+        if self._operations and self._operation_after is None:
+            self._operation_after = self.root.after(50, self._receive_operations)
+
+    def _report(self, message: str) -> None:
+        self._flash = (message, time.monotonic() + 8)
+        self.notice.set_text(message)
+
+    def _complete(self, result: OperationResult, success: str) -> None:
+        if result.error:
+            messagebox.showerror("操作未完成", result.error, parent=self.root)
+        else:
+            self._report(success)
+
+    def _form(
+        self,
+        key: tuple[str, ...],
+        kind: FormKind,
+        title: str,
+        description: str,
+        work: Callable[[JsonObject, str], Callable[[], object]],
+        success: Callable[[object], None],
+        confirm: str = "",
+    ) -> None:
+        from winrunner_gui_forms import SubmitForm
+
+        previous = self._forms.get(key)
+        if previous is not None and previous.winfo_exists():
+            previous.lift()
+            return
+
+        def receive(result: OperationResult) -> None:
+            value = result.value
+            error = result.error
+            if isinstance(value, Submission) and value.status >= 400:
+                info = _object(value.data.get("error"))
+                error = f"{_text(info.get('code'))}\n{_text(info.get('message'))}"
+            shown = bool(dialog.winfo_exists())
+            if error:
+                if shown:
+                    dialog.working(False)
+                messagebox.showerror(
+                    "操作未完成", error, parent=dialog if shown else self.root
+                )
+            else:
+                if shown:
+                    dialog.destroy()
+                success(value)
+
+        def submit(values: JsonObject, replay_key: str) -> None:
+            if confirm and not messagebox.askyesno(
+                title, confirm, icon="warning", default="no", parent=dialog
+            ):
+                return
+            # A closed form can be reopened for another request while the old
+            # one still waits. Keep the two completions bound to their forms.
+            operation = (*key, str(dialog))
+            if self._operate(operation, work(values, replay_key), receive):
+                dialog.working(True, "后台处理中；关闭此窗不会取消任务。")
+
+        dialog = self._forms[key] = SubmitForm(
+            self.root, kind, title, description, submit
+        )
+
+        def forget(event: tk.Event) -> None:
+            if event.widget is dialog and self._forms.get(key) is dialog:
+                del self._forms[key]
+
+        dialog.bind("<Destroy>", forget, add="+")
+
+    def _create_project(self) -> None:
+        desktop = self.desktop
+        if desktop is None:
+            return
+        origin = self._view
+
+        def work(values: JsonObject, _key: str) -> Callable[[], object]:
+            return partial(
+                desktop.create, str(values["name"]), {"repo_url": values["repo_url"]}
+            )
+
+        def created(value: object) -> None:
+            name = _text(_object(value).get("name"))
+            self._report(f"项目 {name} 已创建")
+            if self._view is origin and not self._global():
+                scope = _text(_object(value).get("scope"), "")
+                if scope:
+                    self._pending_selection = (origin, name, None, scope)
+
+        self._form(
+            ("create",),
+            "project",
+            "创建项目",
+            "从公开 HTTPS Git 仓库克隆并检出默认分支。",
+            work,
+            created,
+        )
+
+    def _delete_project(self) -> None:
+        desktop, project = self.desktop, self._project_selection()
+        if desktop is None or project is None:
+            return
+        if messagebox.askyesno(
+            "删除项目",
+            f"删除项目 {project.name}？\n\n这会停止该项目的克隆、Action 和命令，"
+            "中断下载，并删除工作树、Git 缓存、记录和日志。",
+            icon="warning",
+            default="no",
+            parent=self.root,
+        ):
+            self._operate(
+                ("delete_project", project.name),
+                partial(desktop.delete_project, project),
+                lambda result: self._complete(result, f"项目 {project.name} 已删除"),
+            )
+
+    def _submitted(
+        self,
+        value: object,
+        project: str | None,
+        *,
+        action: bool,
+        origin: View,
+    ) -> None:
+        if not isinstance(value, Submission):
+            return
+        identifier = _text(value.data.get("id"), "")
+        title = (
+            f"{project} / Action"
+            if action
+            else f"{project or '全局'} / 命令 #{identifier}"
+        )
+        self._report(f"{title} · {_status(value.data)}")
+        if self._view is origin and self._global() == (project is None):
+            action_id = _text(value.data.get("action_id"), "") if action else None
+            self._pending_selection = (
+                origin,
+                project,
+                "" if action else identifier,
+                action_id,
+            )
+
+    def _start_action(self) -> None:
+        desktop, project = self.desktop, self._project_selection()
+        if desktop is None or project is None:
+            return
+        origin = self._view
+        self._form(
+            ("start_action", project.scope),
+            "action",
+            f"运行 Action · {project.name}",
+            "从远端可达的指定提交检出工作树，再用白名单中的解释器运行脚本。",
+            lambda values, key: partial(desktop.start_action, project, values, key),
+            partial(self._submitted, project=project.name, action=True, origin=origin),
+            "新一轮 Action 会替换上一轮日志和记录并重置工作树；旧文件和下载将不可用。"
+            "正在运行的项目命令不会被停止。继续吗？",
+        )
+
+    def _cancel_action(self) -> None:
+        desktop, project = self.desktop, self._project_selection()
+        action_id = self._action_summary.get("action_id")
+        if desktop is None or project is None or not isinstance(action_id, str):
+            return
+        if messagebox.askyesno(
+            "取消 Action",
+            f"停止 {project.name} 的当前 Action？\n已保留的日志和可用文件不会被删除。",
+            icon="warning",
+            default="no",
+            parent=self.root,
+        ):
+            self._operate(
+                ("cancel_action", project.name),
+                partial(desktop.cancel_action, project, action_id),
+                lambda result: self._complete(
+                    result, f"{project.name} 的 Action 已停止"
+                ),
+            )
+
+    def _start_command(self) -> None:
+        desktop, project = self.desktop, self._project_selection()
+        if desktop is None or (not self._global() and project is None):
+            return
+        name = project.name if project else None
+        origin = self._view
+        self._form(
+            ("start_command", project.scope if project else ""),
+            "command",
+            f"提交命令 · {name or '全局'}",
+            "在当前项目工作树中运行。" if project else "从 Runner 账号的用户目录运行。",
+            lambda values, key: partial(desktop.start_command, project, values, key),
+            partial(self._submitted, project=name, action=False, origin=origin),
+        )
+
+    def _delete_command(self) -> None:
+        desktop = self.desktop
+        global_tab = self._global()
+        project = self._project_selection()
+        command = self._selected(self.commands if global_tab else self.project_commands)
+        if desktop is None or command is None or (not global_tab and project is None):
+            return
+        name = project.name if project else None
+        if messagebox.askyesno(
+            "删除命令",
+            f"删除 {name or '全局'}的命令 #{command}？\n\n"
+            "这会停止仍在运行的进程，删除该命令的记录和日志，不撤销它对文件的改动。",
+            icon="warning",
+            default="no",
+            parent=self.root,
+        ):
+            self._operate(
+                ("delete_command", name or "", command),
+                partial(desktop.delete_command, name, command),
+                lambda result: self._complete(
+                    result, f"{name or '全局'} / 命令 #{command} 已删除"
+                ),
+            )
+
+    def _copy_repo(self) -> None:
+        project = self._project_selection()
+        if project is not None:
+            url = _find(self._snapshot.projects, "projects", project.name).get(
+                "repo_url"
+            )
+            if isinstance(url, str) and url:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(url)
+                self._report("已复制仓库地址")
+
+    def _browse_files(self) -> None:
+        from winrunner_gui_files import FileBrowser
+
+        desktop, project = self.desktop, self._project_selection()
+        if desktop is None or project is None:
+            return
+        previous = self._browsers.get(project.scope)
+        if previous is not None and previous.winfo_exists():
+            previous.lift()
+            previous.focus_set()
+            return
+        browser = self._browsers[project.scope] = FileBrowser(
+            self.root,
+            project.name,
+            lambda _name, relative, offset, cancel: desktop.browse(
+                project, relative, offset, cancel
+            ),
+            lambda _name, relative, path, bounds, cancel: desktop.save_file(
+                project, relative, path, bounds, cancel
+            ),
+        )
+
+        def forget(event: tk.Event) -> None:
+            if event.widget is browser and self._browsers.get(project.scope) is browser:
+                del self._browsers[project.scope]
+
+        browser.bind("<Destroy>", forget, add="+")
+
+    def _save_log(self, stream: str) -> None:
+        desktop, target, project = (
+            self.desktop,
+            self._view.target,
+            self._project_selection(),
+        )
+        if (
+            desktop is None
+            or target is None
+            or self._detail_revision != self._view.revision
+        ):
+            return
+        action_id = self._action_id if target.command is None else None
+        if target.project and (not project or project.name != target.project):
+            return
+        if target.command is None and action_id is None:
+            return
+        key = (
+            "save_log",
+            target.project or "",
+            target.command or action_id or "",
+            stream,
+        )
+        if key in self._operations:
+            return
+        try:
+            destination = filedialog.asksaveasfilename(
+                parent=self.root,
+                title=f"保存原始 {stream}",
+                initialfile=f"{target.project or 'global'}-{target.command or 'action'}-{stream}.log",
+            )
+        except tk.TclError:
+            if not self._stop.is_set():
+                messagebox.showerror(
+                    "无法保存日志", "无法打开文件保存窗口。", parent=self.root
+                )
+            return
+        if destination and self._operate(
+            key,
+            partial(
+                desktop.save_log,
+                project,
+                target.command,
+                action_id,
+                stream,
+                Path(destination),
+                self._stop,
+            ),
+            lambda result: self._complete(
+                result, f"已保存 {stream} · {_size(result.value)}"
+            ),
+        ):
+            self._report(f"正在保存 {stream}…")
 
     @staticmethod
     def _selected(table: StatusTable) -> str | None:
@@ -981,6 +1502,7 @@ class Dashboard:
             and (self._view.target.project is None) != self._global()
         ):
             self._collapse()
+        self._update_controls()
 
     def _select_action(self) -> None:
         if self._view.project is not None:
@@ -996,6 +1518,7 @@ class Dashboard:
             self._set_view(self._view.project, Target(self._view.project, key))
         elif self._view.target is not None and self._view.target.command is not None:
             self._collapse()
+        self._update_controls()
 
     def _clear_command_selection(self) -> None:
         for table in (self.commands, self.project_commands):
@@ -1013,6 +1536,11 @@ class Dashboard:
             return
         old.superseded.set()
         self._view = View(project, target, revision=old.revision + 1)
+        if project != old.project:
+            record = (
+                _find(self._snapshot.projects, "projects", project) if project else {}
+            )
+            self._selected_scope = _text(record.get("scope"), "") or None
         self._action_id = None
         if target is None:
             self.detail.show(View(), None)
@@ -1076,6 +1604,7 @@ class Dashboard:
         if self._stop.is_set() or not self._check_backend() or self._busy:
             return
         self._busy = True
+        self._refresh_requested = False
         self._poll_revision = self._view.revision
         threading.Thread(
             target=self._poll,
@@ -1094,11 +1623,15 @@ class Dashboard:
         except Empty:
             self._after_id = self.root.after(50, self._receive)
             return
-        self._show(snapshot)
-        self._busy = False
-        self._schedule(
-            INTEGRATED_REFRESH_MS if self._poll_revision == self._view.revision else 0
-        )
+        try:
+            self._show(snapshot)
+        finally:
+            self._busy = False
+            self._schedule(
+                0
+                if self._refresh_requested or self._poll_revision != self._view.revision
+                else INTEGRATED_REFRESH_MS
+            )
 
     def _update_project(self, data: ViewData | None) -> None:
         name = self._view.project
@@ -1109,6 +1642,7 @@ class Dashboard:
         self.repo.set_text(_text(project.get("repo_url"), ""))
         action = data.action if data else None
         task = action.data if action and action.data else {}
+        self._action_summary = task
         if task:
             message = f"{_status(task)}  ·  {_phase(task)}"
             code = _object(task.get("error")).get("code")
@@ -1138,6 +1672,20 @@ class Dashboard:
         )
 
     def _show(self, snapshot: Snapshot) -> None:
+        name = self._view.project
+        if (
+            name
+            and self._selected_scope
+            and snapshot.projects
+            and snapshot.projects.data is not None
+        ):
+            new_scope = _find(snapshot.projects, "projects", name).get("scope")
+            if self._selected_scope != new_scope:
+                # A same-name replacement must not inherit the old selection.
+                self.projects.tree.selection_remove(name)
+                self._clear_command_selection()
+                self._set_view(None, None)
+                self._update_project(None)
         self._snapshot = snapshot
         health = snapshot.health.data
         if health is None:
@@ -1162,7 +1710,9 @@ class Dashboard:
             run_id = _text(health.get("run_id"))
             self.connection.configure(text="● 服务运行中", fg=GREEN)
             self.notice.set_text(
-                snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
+                self._flash[0]
+                if self._flash[1] > time.monotonic()
+                else snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
             )
         self.run.set_text(f"Runner ID  {run_id}")
         reset = run_id != DASH and self._run_id != run_id
@@ -1202,19 +1752,66 @@ class Dashboard:
                     )
         elif reset:
             self._update_project(None)
+        self._select_result(selected)
+        self._update_controls()
+
+    def _select_result(self, selected: ViewData | None) -> None:
+        if self._pending_selection is None:
+            return
+        origin, project, command, generation = self._pending_selection
+        if self._view is not origin or self._global() != (project is None):
+            self._pending_selection = None
+            return
+        key: str | None
+        if command is None and project is not None:
+            record = _find(self._snapshot.projects, "projects", project)
+            if record.get("scope") != generation:
+                if not self._refresh_requested:
+                    self._pending_selection = None
+                return
+            table, key = self.projects, project
+        elif command == "":
+            if selected is not None and selected.view == self._view:
+                task = selected.action.data if selected.action else None
+                if task and task.get("action_id") == generation:
+                    self._pending_selection = None
+                    self._select_action()
+                elif not self._refresh_requested:
+                    self._pending_selection = None
+            return
+        else:
+            table = self.commands if project is None else self.project_commands
+            key = command
+        if key is not None and table.tree.exists(key):
+            self._pending_selection = None
+            table.tree.selection_set(key)
+            table.tree.see(key)
+        elif not self._refresh_requested and (
+            project is None or selected and selected.view == self._view
+        ):
+            # A replay can reference a command or project that no longer exists.
+            self._pending_selection = None
 
     def close(self) -> None:
         if self._stop.is_set():
             return
         self._stop.set()
-        for after_id in (self._after_id, self._reopen_id):
+        for after_id in (self._after_id, self._reopen_id, self._operation_after):
             if after_id is not None:
                 self.root.after_cancel(after_id)
         self.root.destroy()
+        # Let cancelling exports discard their partial files without waiting on
+        # task submissions, which can still be waiting for Runner.shutdown.
+        deadline = time.monotonic() + 1
+        for worker in self._exports.values():
+            worker.join(max(0, deadline - time.monotonic()))
 
 
 def run_integrated(
-    snapshot: Callable[[View], Snapshot], is_running: Callable[[], bool]
+    snapshot: Callable[[View], Snapshot],
+    is_running: Callable[[], bool],
+    *,
+    desktop: DesktopRunner | None = None,
 ) -> None:
     """Keep Tk on the main thread and the HTTP server alive across window closes."""
     if threading.current_thread() is not threading.main_thread():
@@ -1234,6 +1831,7 @@ def run_integrated(
                 root,
                 snapshot=snapshot,
                 is_running=lambda: not stopping and is_running(),
+                desktop=desktop,
             )
         except BaseException:
             root.destroy()
@@ -1249,5 +1847,5 @@ def run_integrated(
 
 if __name__ == "__main__":
     raise SystemExit(
-        "Start local monitoring with: python winrunner.py (without --nogui)"
+        "Start the desktop console with: python winrunner.py (without --nogui)"
     )

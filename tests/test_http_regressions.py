@@ -116,6 +116,42 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertEqual(post("/projects/Other/actions", b"{}"), original)
         self.assertEqual(self.runner.start_action.call_count, 2)
 
+    def test_desktop_and_http_share_project_command_replay(self):
+        from winrunner_desktop import DesktopRunner, ProjectSelection
+
+        self.start_server()
+        desktop = DesktopRunner(self.runner, self.server.start_replay)
+        project = ProjectSelection("Demo", "first-instance")
+        self.runner.command_project.return_value = Mock(command_scope=project.scope)
+        self.runner.start_command.side_effect = [
+            (202, {"id": "0"}),
+            (200, {"id": "1"}),
+            (202, {"id": "2"}),
+        ]
+        values: dict[str, object] = {
+            "mode": "cmd",
+            "command": "echo test",
+            "timeout": 0,
+        }
+        payload = json.dumps(values).encode()
+        path = "/projects/demo/commands"
+
+        first = self.request("POST", path, payload=payload, key="http-first")[:2]
+        response = desktop.start_command(project, values, "http-first")
+        self.assertEqual((response.status, response.data), first)
+        response = desktop.start_command(project, values, "desktop-first")
+        self.assertEqual(
+            self.request("POST", path, payload=payload, key="desktop-first")[:2],
+            (response.status, response.data),
+        )
+        self.assertEqual(self.runner.start_command.call_count, 2)
+        self.runner.command_project.return_value = Mock(command_scope="replacement")
+        self.assertEqual(
+            self.request("POST", path, payload=payload, key="desktop-first")[:2],
+            (202, {"id": "2"}),
+        )
+        self.assertEqual(self.runner.start_command.call_count, 3)
+
     def test_concurrent_start_replay_never_submits_twice(self):
         self.start_server()
         entered, release = threading.Event(), threading.Event()
@@ -154,6 +190,7 @@ class HTTPRegressionTests(unittest.TestCase):
         with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
             server.token = TOKEN.encode("ascii")
             server.runner = runner = Mock()
+            runner.lock = threading.RLock()
             server.cpu_sampler = Mock()
             runner.list_projects.return_value = [{"name": "demo"}]
             runner.list_commands.return_value = []
@@ -162,7 +199,9 @@ class HTTPRegressionTests(unittest.TestCase):
             runner.get_action.return_value = {"status": "running"}
             runner.get_command.return_value = {"command": "echo exact"}
 
-            def window(snapshot, is_running):
+            def window(snapshot, is_running, *, desktop):
+                self.assertIs(desktop.runner, runner)
+                self.assertIs(desktop.replay, server.start_replay)
                 self.assertIs(threading.current_thread(), threading.main_thread())
                 self.assertTrue(is_running())
                 with patch("http.client.HTTPConnection") as connection:
@@ -179,7 +218,7 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.assertEqual(state.health.data, {"run_id": "demo-run"})
                 self.assertEqual(state.projects.data, {"projects": [{"name": "demo"}]})
                 self.assertEqual(state.commands.data, {"commands": []})
-                runner.list_projects.assert_called_once_with()
+                runner.list_projects.assert_called_once_with(include_scope=True)
                 status, body, _ = self.request("GET", "/projects")
                 self.assertEqual(
                     (status, body), (200, {"projects": [{"name": "demo"}]})

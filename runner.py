@@ -531,17 +531,27 @@ class Runner:
     def _commands(self, name):
         return self.commands if name is None else self._project(name).commands
 
-    def command_project(self, name) -> Project:
+    def _selected_project(self, name, expected_scope: str | None):
+        project = self._project(name)
+        if expected_scope is not None and project.command_scope != expected_scope:
+            raise APIError(409, "project_changed", "The selected project was replaced")
+        return project
+
+    def command_project(self, name, *, expected_scope: str | None = None) -> Project:
         with self.lock:
-            return self._project(name)
+            return self._selected_project(name, expected_scope)
 
     def _repo(self, project, job):
         return Repository(project.cache, project.worktree, project.url, job, self.base)
 
-    def list_projects(self):
+    def list_projects(self, *, include_scope: bool = False):
         with self.lock:
             return [
-                project.snapshot()
+                (
+                    {**project.snapshot(), "scope": project.command_scope}
+                    if include_scope
+                    else project.snapshot()
+                )
                 for project in self.projects.values()
                 if not project.create_failed or project.lifecycle != "cloning"
             ]
@@ -550,7 +560,7 @@ class Runner:
         with self.lock:
             return self._project(name).snapshot()
 
-    def create(self, name, raw):
+    def create(self, name, raw, *, include_scope: bool = False):
         url = project_body(name, raw)
         key = name.lower()
         with self.lock:
@@ -581,7 +591,10 @@ class Runner:
                 project.lifecycle = None
                 project.visible = True
                 success = True
-                return project.snapshot()
+                data = project.snapshot()
+                if include_scope:
+                    data["scope"] = project.command_scope
+                return data
         except GitFailure as exc:
             message = exc.stderr.decode("utf-8", errors="replace").strip() or str(exc)
             raise APIError(502, "git_clone_failed", message) from exc
@@ -624,11 +637,11 @@ class Runner:
                             self.projects.pop(key, None)
                     project.cloned.set()
 
-    def delete_project(self, name):
+    def delete_project(self, name, *, expected_scope: str | None = None):
         timeout = project_drain_timeout()
         with self.lock:
             self._available()
-            project = self._project(name)
+            project = self._selected_project(name, expected_scope)
             if project.delete_in_progress:
                 raise conflict("Project deletion is already in progress")
             project.delete_in_progress = True
@@ -679,11 +692,13 @@ class Runner:
                 project.delete_done.set()
 
     @contextmanager
-    def file_entry(self, name, relative, *, cancel_read=None):
+    def file_entry(
+        self, name, relative, *, cancel_read=None, expected_scope: str | None = None
+    ):
         key = object()
         with self.lock:
             self._available()
-            project = self._project(name)
+            project = self._selected_project(name, expected_scope)
             if not project.visible or project.lifecycle is not None:
                 raise not_found("The current project directory is not available")
             project.readers[key] = cancel_read
@@ -749,10 +764,12 @@ class Runner:
                 "reset_blocked", "Could not clear the previous worktree", exc
             ) from exc
 
-    def start_action(self, name, raw, accepted_at):
+    def start_action(
+        self, name, raw, accepted_at, *, expected_scope: str | None = None
+    ):
         with self.lock:
             self._available()
-            project = self._project(name)
+            project = self._selected_project(name, expected_scope)
             if project.lifecycle is not None or (
                 project.task and not project.task.done.is_set()
             ):
@@ -900,28 +917,51 @@ class Runner:
             if project.lifecycle is None:
                 project.visible = visible
 
-    def get_action(self, name, offsets=None, limit=65536, *, include_input=False):
+    def get_action(
+        self,
+        name,
+        offsets=None,
+        limit=65536,
+        *,
+        include_input=False,
+        expected_scope: str | None = None,
+        expected_action: str | None = None,
+    ):
         with self.lock:
-            project = self._project(name)
+            project = self._selected_project(name, expected_scope)
             if project.lifecycle in ("deleting", "delete_failed"):
                 raise conflict("Project deletion is in progress or must be retried")
             task = project.task
             if task is None:
                 raise not_found("No action has been submitted")
+            if expected_action is not None and task.action_id != expected_action:
+                raise APIError(
+                    409, "action_changed", "The selected Action was replaced"
+                )
             result = task.snapshot(offsets, limit)
             if include_input:
                 result["action_id"] = task.action_id
             return result
 
-    def cancel_action(self, name):
+    def cancel_action(
+        self,
+        name,
+        *,
+        expected_scope: str | None = None,
+        expected_action: str | None = None,
+    ):
         with self.lock:
             self._available()
-            project = self._project(name)
+            project = self._selected_project(name, expected_scope)
             if project.lifecycle in ("deleting", "delete_failed"):
                 raise conflict("Project deletion is in progress or must be retried")
-            if project.task is None:
-                raise not_found("No action has been submitted")
             task = project.task
+            if task is None:
+                raise not_found("No action has been submitted")
+            if expected_action is not None and task.action_id != expected_action:
+                raise APIError(
+                    409, "action_changed", "The selected Action was replaced"
+                )
         self._cancel_task(task)
         task.done.wait()
 

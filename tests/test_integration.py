@@ -87,6 +87,7 @@ class RunnerCase(unittest.TestCase):
             "winfiles.py",
             "winprocess.py",
             "winrunner.py",
+            "winrunner_files.py",
             "winrunner-progress.psm1",
         ):
             shutil.copyfile(ROOT / name, self.install / name)

@@ -12,6 +12,10 @@ files = [
     "winfiles.py",
     "winprocess.py",
     "winrunner.py",
+    "winrunner_desktop.py",
+    "winrunner_files.py",
     "winrunner_gui.py",
+    "winrunner_gui_files.py",
+    "winrunner_gui_forms.py",
     "tests",
 ]
