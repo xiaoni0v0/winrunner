@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from queue import Empty, SimpleQueue
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 from typing import Literal
 
 INTEGRATED_REFRESH_MS = 850
@@ -25,17 +25,26 @@ LOG_OVERLAP = 3  # Longest UTF-8 scalar minus one byte.
 LOG_READ = LOG_PAGE + 2 * LOG_OVERLAP
 STREAMS = ("stdout", "stderr")
 
-BG = "#eef3f8"
-WHITE = "#ffffff"
-INK = "#15253a"
-MUTED = "#52647a"
-NAVY = "#12253c"
-ACCENT = "#2466d8"
-GREEN = "#166348"
-AMBER = "#885110"
-RED = "#aa323e"
+BG = "#0e1520"
+PANEL = "#172332"
+HEADER = "#131e2b"
+INSET = "#101a27"
+RAISED = "#213249"
+HOVER = "#2b4058"
+BORDER = "#2c3d51"
+INK = "#edf4fa"
+MUTED = "#a5b6c8"
+TEAL = "#65e0cd"
+BLUE = "#92bdff"
+GREEN = "#8de3b6"
+AMBER = "#ffcf89"
+RED = "#ffabb4"
 FONT = "Microsoft YaHei UI"
+MONO = "Consolas"
 DASH = "—"
+MIN_WIDTH, MIN_HEIGHT = 870, 700
+STATUS_COLORS = {"active": BLUE, "success": GREEN, "warning": AMBER, "error": RED}
+METRIC_COLORS = (TEAL, BLUE, "#c0a9fa", AMBER)
 
 STATUSES = {
     "cloning": ("克隆中", "active"),
@@ -60,12 +69,12 @@ PHASES = {
 }
 COMMAND_COLUMNS = (
     ("id", "ID", 55, False),
-    ("mode", "Shell", 100, True),
-    ("status", "状态", 87, True),
-    ("phase", "阶段", 65, True),
-    ("exit", "退出码", 62, False),
-    ("stdout", "stdout", 80, True),
-    ("stderr", "stderr", 80, True),
+    ("mode", "Shell", 88, True),
+    ("status", "状态", 66, True),
+    ("phase", "阶段", 96, True),
+    ("exit", "退出码", 60, False),
+    ("stdout", "stdout", 76, True),
+    ("stderr", "stderr", 76, True),
 )
 
 JsonObject = dict[str, object]
@@ -273,7 +282,7 @@ def _label(
     parent: tk.Misc,
     text: str,
     *,
-    bg: str = WHITE,
+    bg: str = PANEL,
     fg: str = INK,
     size: int = 10,
     bold: bool = False,
@@ -288,24 +297,95 @@ def _label(
     )
 
 
+def _ellipsize(text: str, width: int, measure: Callable[[str], int]) -> str:
+    if measure(text) <= width:
+        return text
+    if measure("…") > width:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if measure(text[:mid] + "…") <= width:
+            low = mid
+        else:
+            high = mid - 1
+    return text[:low].rstrip() + "…"
+
+
+class FitLabel(tk.Label):
+    """Keep data-driven text from setting the minimum size of its container."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        text: str,
+        *,
+        bg: str = PANEL,
+        fg: str = INK,
+        size: int = 10,
+        bold: bool = False,
+        family: str = FONT,
+    ) -> None:
+        self._font = tkfont.Font(
+            root=parent, family=family, size=size, weight="bold" if bold else "normal"
+        )
+        super().__init__(
+            parent,
+            width=1,
+            padx=0,
+            pady=0,
+            borderwidth=0,
+            highlightthickness=0,
+            anchor="w",
+            bg=bg,
+            fg=fg,
+            font=self._font,
+        )
+        self._text = ""
+        self.set_text(text)
+        self.bind("<Configure>", self._fit)
+
+    def set_text(self, text: str) -> None:
+        # Labels are single-line surfaces; full command/log text lives in Text.
+        text = text.encode("utf-8", "backslashreplace").decode().replace("\0", "\\x00")
+        text = re.sub(r"[\r\n\t]+", " ", text)
+        if text != self._text:
+            self._text = text
+            self._fit()
+
+    def _fit(self, _event: tk.Event | None = None) -> None:
+        visible = _ellipsize(self._text, self.winfo_width(), self._font.measure)
+        if visible != self.cget("text"):
+            self.configure(text=visible)
+
+
 class Metric(tk.Frame):
-    def __init__(self, parent: tk.Misc, title: str, bar: bool = True) -> None:
-        super().__init__(parent, bg=WHITE, padx=15, pady=10)
-        self.title = _label(self, title, fg=MUTED, bold=True)
+    def __init__(
+        self, parent: tk.Misc, title: str, accent: str, bar: bool = True
+    ) -> None:
+        super().__init__(
+            parent, bg=PANEL, highlightbackground=BORDER, highlightthickness=1
+        )
+        tk.Frame(self, bg=accent, height=2).pack(fill="x")
+        body = tk.Frame(self, bg=PANEL, padx=12, pady=7)
+        body.pack(fill="both", expand=True)
+        self.title = FitLabel(body, title, fg=MUTED, size=9, bold=True)
         self.title.pack(fill="x")
-        self.value = _label(self, DASH, size=21, bold=True)
-        self.value.pack(fill="x", pady=(3, 0))
-        self.detail = _label(self, DASH, fg=MUTED, size=9)
-        self.detail.pack(fill="x", pady=(0, 8))
+        self.value = FitLabel(
+            body, DASH, size=20 if bar else 15, bold=True, family=MONO
+        )
+        self.value.pack(fill="x", pady=(3, 1))
+        self.detail = FitLabel(body, DASH, fg=MUTED, size=8)
+        self.detail.pack(fill="x", pady=(0, 7))
         self.bar = ttk.Progressbar(
-            self, style="Health.Horizontal.TProgressbar", maximum=100
+            body, style=f"{accent}.Horizontal.TProgressbar", maximum=100
         )
         if bar:
             self.bar.pack(fill="x")
 
     def update_value(self, value: str, detail: str, percent: float = 0) -> None:
-        self.value.configure(text=value)
-        self.detail.configure(text=detail)
+        self.value.set_text(value)
+        self.detail.set_text(detail)
         self.bar.configure(value=percent)
 
 
@@ -313,13 +393,15 @@ class StatusTable(tk.Frame):
     def __init__(
         self, parent: tk.Misc, title: str, columns: tuple[Column, ...]
     ) -> None:
-        super().__init__(parent, bg=WHITE, padx=14, pady=10)
-        header = tk.Frame(self, bg=WHITE)
+        super().__init__(parent, bg=PANEL, padx=12, pady=9)
+        header = tk.Frame(self, bg=PANEL)
         header.pack(fill="x", pady=(0, 7))
-        _label(header, title, size=12, bold=True).pack(side="left")
-        self.summary = _label(header, "等待刷新…", fg=MUTED, size=9)
-        self.summary.pack(side="right")
-        body = tk.Frame(self, bg=WHITE)
+        header.columnconfigure(1, weight=1)
+        _label(header, title, size=10, bold=True).grid(row=0, column=0, sticky="w")
+        self.summary = FitLabel(header, "等待刷新…", fg=MUTED, size=8)
+        self.summary.configure(anchor="e")
+        self.summary.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+        body = tk.Frame(self, bg=PANEL)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
@@ -328,36 +410,60 @@ class StatusTable(tk.Frame):
             columns=[column[0] for column in columns],
             show="headings",
             selectmode="browse",
-            height=3,
+            height=1,
         )
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scroll.set)
+        cell_font = tkfont.Font(root=self, family=FONT, size=10)
+        examples = {
+            "mode": "PowerShell",
+            "status": "删除失败",
+            "phase": "更新远端引用",
+            "stdout": "1,024.0 MiB",
+            "stderr": "1,024.0 MiB",
+        }
         for key, label, width, stretch in columns:
-            self.tree.heading(key, text=label, anchor="w")
-            self.tree.column(
-                key, width=width, minwidth=width, stretch=stretch, anchor="w"
+            anchor: Literal["e", "w"] = (
+                "e" if key in {"exit", "stdout", "stderr"} else "w"
             )
-        for tag, color in (
-            ("active", ACCENT),
-            ("success", GREEN),
-            ("warning", AMBER),
-            ("error", RED),
-        ):
+            width = max(width, cell_font.measure(examples.get(key, label)) + 16)
+            self.tree.heading(key, text=label, anchor=anchor)
+            self.tree.column(
+                key, width=width, minwidth=width, stretch=stretch, anchor=anchor
+            )
+        for tag, color in STATUS_COLORS.items():
             self.tree.tag_configure(tag, foreground=color)
-        self.tree.tag_configure("stripe", background="#f4f7fb")
-        self.empty_message = _label(self.tree, "等待刷新…", fg=MUTED)
-        self.empty_message.place(relx=0.5, rely=0.62, anchor="center")
+        self.tree.tag_configure("stripe", background=HEADER)
+        if columns == COMMAND_COLUMNS:
+            self.horizontal = ttk.Scrollbar(
+                body, orient="horizontal", command=self.tree.xview
+            )
+            self.horizontal.grid(row=1, column=0, sticky="ew")
+            self.horizontal.grid_remove()
+            self.tree.configure(xscrollcommand=self._scroll_x)
+        self.empty_message = FitLabel(self.tree, "等待刷新…", fg=MUTED)
+        self.empty_message.configure(anchor="center")
+        self._place_empty()
         self._rendered: list[Row] = []
+
+    def _scroll_x(self, first: float, last: float) -> None:
+        self.horizontal.set(first, last)
+        if float(first) <= 0 and float(last) >= 1:
+            self.horizontal.grid_remove()
+        else:
+            self.horizontal.grid()
+
+    def _place_empty(self) -> None:
+        self.empty_message.place(relx=0.5, rely=0.62, relwidth=0.9, anchor="center")
 
     def show_rows(
         self, rows: list[Row], error: str = "", *, reset: bool = False
     ) -> None:
         if error and not reset and self._rendered:
-            self.summary.configure(
-                text=f"暂不可用 · 保留上次 {len(self._rendered)} 条", fg=AMBER
-            )
+            self.summary.set_text(f"暂不可用 · 保留上次 {len(self._rendered)} 条")
+            self.summary.configure(fg=AMBER)
             return
         if reset or rows != self._rendered:
             old = self.tree.get_children()
@@ -374,15 +480,13 @@ class StatusTable(tk.Frame):
                 else:
                     self.tree.insert("", index, iid=key, values=values, tags=tags)
             self._rendered = rows
-        self.summary.configure(
-            text="不可用" if error else f"{len(rows)} 条记录",
-            fg=AMBER if error else MUTED,
-        )
+        self.summary.set_text("不可用" if error else f"{len(rows)} 条记录")
+        self.summary.configure(fg=AMBER if error else MUTED)
         if rows:
             self.empty_message.place_forget()
         else:
-            self.empty_message.configure(text=error or "暂无记录")
-            self.empty_message.place(relx=0.5, rely=0.62, anchor="center")
+            self.empty_message.set_text(error or "暂无记录")
+            self._place_empty()
 
 
 def _status(data: JsonObject) -> str:
@@ -459,22 +563,27 @@ class ReadOnlyText(tk.Frame):
     def __init__(
         self, parent: tk.Misc, *, wrap: Literal["none", "char", "word"] = "none"
     ) -> None:
-        super().__init__(parent, bg=WHITE)
+        super().__init__(parent, bg=PANEL)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.text = tk.Text(
             self,
-            height=5,
+            height=2,
             width=1,
             wrap=wrap,
             state="disabled",
-            bg="#f5f8fc",
+            bg=INSET,
             fg=INK,
             relief="flat",
             padx=9,
             pady=6,
-            font=("Consolas", 10),
-            selectbackground="#c4ddff",
+            font=(MONO, 10),
+            selectbackground=HOVER,
+            selectforeground=INK,
+            inactiveselectbackground=RAISED,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=TEAL,
         )
         self.text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
@@ -513,34 +622,36 @@ class TaskDetail(tk.Frame):
         close: Callable[[], None],
         page: Callable[[str, int], None],
     ):
-        super().__init__(parent, bg=WHITE, padx=14, pady=10)
+        super().__init__(parent, bg=PANEL, padx=14, pady=10)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
-        header = tk.Frame(self, bg=WHITE)
+        header = tk.Frame(self, bg=PANEL)
         header.grid(row=0, column=0, sticky="ew")
-        self.title = _label(header, "任务详情", bold=True, size=12)
-        self.title.pack(side="left", fill="x", expand=True)
-        ttk.Button(header, text="收起详情", command=close).pack(side="right")
-        self.meta = _label(self, "", fg=MUTED, size=9)
+        header.columnconfigure(0, weight=1)
+        self.title = FitLabel(header, "任务详情", bold=True, size=11)
+        self.title.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(header, text="收起详情", command=close).grid(row=0, column=1)
+        self.meta = FitLabel(self, "", fg=MUTED, size=9)
         self.meta.grid(row=1, column=0, sticky="ew", pady=(2, 6))
         self.tabs = ttk.Notebook(self)
         self.tabs.grid(row=2, column=0, sticky="nsew")
         self.input = ReadOnlyText(self.tabs, wrap="char")
         self.tabs.add(self.input, text="命令原文")
         self.outputs: dict[str, ReadOnlyText] = {}
-        self.ranges: dict[str, tk.Label] = {}
+        self.ranges: dict[str, FitLabel] = {}
         self.buttons: dict[str, tuple[ttk.Button, ttk.Button]] = {}
         for stream in STREAMS:
-            tab = tk.Frame(self.tabs, bg=WHITE, padx=6, pady=5)
+            tab = tk.Frame(self.tabs, bg=PANEL, padx=6, pady=5)
             self.tabs.add(tab, text=stream)
-            nav = tk.Frame(tab, bg=WHITE)
+            nav = tk.Frame(tab, bg=PANEL)
             nav.pack(fill="x", pady=(0, 4))
-            self.ranges[stream] = _label(nav, "", fg=MUTED, size=9)
-            self.ranges[stream].pack(side="left")
+            nav.columnconfigure(0, weight=1)
+            self.ranges[stream] = FitLabel(nav, "", fg=MUTED, size=9, family=MONO)
+            self.ranges[stream].grid(row=0, column=0, sticky="ew", padx=(0, 8))
             prev = ttk.Button(nav, text="上一页", command=partial(page, stream, -1))
             nxt = ttk.Button(nav, text="下一页", command=partial(page, stream, 1))
-            nxt.pack(side="right")
-            prev.pack(side="right", padx=4)
+            prev.grid(row=0, column=1, padx=(0, 4))
+            nxt.grid(row=0, column=2)
             self.buttons[stream] = (prev, nxt)
             self.outputs[stream] = ReadOnlyText(tab)
             self.outputs[stream].pack(fill="both", expand=True)
@@ -554,7 +665,7 @@ class TaskDetail(tk.Frame):
             if target.command is None
             else f"{scope}  /  命令 #{target.command}"
         )
-        self.title.configure(text=title)
+        self.title.set_text(title)
         if target.command is None:
             self.tabs.hide(self.input)
             self.tabs.select(self.outputs["stdout"].master)
@@ -568,8 +679,8 @@ class TaskDetail(tk.Frame):
         exit_code = data.get("exit_code")
         mode = {"cmd": "CMD", "ps": "PowerShell"}.get(_text(data.get("mode")))
         meta = f"{_status(data)}  ·  {_phase(data)}  ·  退出码 {exit_code if type(exit_code) is int else DASH}"
-        self.meta.configure(
-            text=(
+        self.meta.set_text(
+            (
                 (f"{mode}  ·  " if mode else "") + meta
                 if data
                 else (result.error if result else "正在读取…")
@@ -595,12 +706,102 @@ class TaskDetail(tk.Frame):
                 self.outputs[stream].master,
                 text=f"{stream}  {_size(data.get(f'{stream}_bytes'))}",
             )
-            self.ranges[stream].configure(
-                text=(f"字节 {start:,}–{end:,} / {total:,}" if total else "暂无输出")
+            self.ranges[stream].set_text(
+                (f"字节 {start:,}–{end:,} / {total:,}" if total else "暂无输出")
             )
             prev, nxt = self.buttons[stream]
             prev.state(["!disabled" if data and start else "disabled"])
             nxt.state(["!disabled" if end < total else "disabled"])
+
+
+def _apply_theme(root: tk.Tk) -> None:
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    row_height = tkfont.Font(root=root, family=FONT, size=10).metrics("linespace") + 10
+    style.configure(
+        "Treeview",
+        background=PANEL,
+        fieldbackground=PANEL,
+        foreground=INK,
+        borderwidth=0,
+        rowheight=row_height,
+        font=(FONT, 10),
+    )
+    style.map(
+        "Treeview", background=[("selected", HOVER)], foreground=[("selected", INK)]
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=RAISED,
+        foreground=MUTED,
+        bordercolor=RAISED,
+        lightcolor=RAISED,
+        darkcolor=RAISED,
+        relief="flat",
+        padding=(7, 5),
+        font=(FONT, 9, "bold"),
+    )
+    style.map("Treeview.Heading", background=[("active", RAISED)])
+    style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 3))
+    style.configure(
+        "TNotebook.Tab",
+        background=HEADER,
+        foreground=MUTED,
+        bordercolor=BORDER,
+        lightcolor=HEADER,
+        darkcolor=HEADER,
+        padding=(12, 5),
+        font=(FONT, 9, "bold"),
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", RAISED), ("active", HOVER)],
+        foreground=[("selected", TEAL), ("active", INK)],
+        lightcolor=[("selected", RAISED)],
+        darkcolor=[("selected", RAISED)],
+    )
+    style.configure(
+        "TButton",
+        background=RAISED,
+        foreground=INK,
+        bordercolor=BORDER,
+        lightcolor=RAISED,
+        darkcolor=RAISED,
+        focuscolor=TEAL,
+        padding=(8, 3),
+        font=(FONT, 9, "bold"),
+        relief="flat",
+    )
+    style.map(
+        "TButton",
+        background=[("disabled", HEADER), ("pressed", BORDER), ("active", HOVER)],
+        foreground=[("disabled", MUTED)],
+        lightcolor=[("active", HOVER)],
+        darkcolor=[("active", HOVER)],
+    )
+    for direction in ("Vertical", "Horizontal"):
+        name = f"{direction}.TScrollbar"
+        style.configure(
+            name,
+            background=BORDER,
+            troughcolor=INSET,
+            arrowcolor=MUTED,
+            bordercolor=INSET,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            arrowsize=11,
+        )
+        style.map(name, background=[("active", HOVER), ("pressed", HOVER)])
+    for accent in METRIC_COLORS[:3]:
+        style.configure(
+            f"{accent}.Horizontal.TProgressbar",
+            background=accent,
+            troughcolor=INSET,
+            lightcolor=accent,
+            darkcolor=accent,
+            bordercolor=INSET,
+            thickness=5,
+        )
 
 
 class Dashboard:
@@ -633,70 +834,57 @@ class Dashboard:
         self._poll = poll
 
         root.title("WinRunner · 本机监控")
-        root.geometry("1120x780")
-        root.minsize(870, 640)
+        # Heights set in pixels need extra room when Tk renders larger fonts.
+        scale = float(root.tk.call("tk", "scaling"))
+        available_width = max(1, root.winfo_screenwidth() - 24)
+        available_height = max(1, root.winfo_screenheight() - 75)
+        min_height = min(
+            available_height, MIN_HEIGHT + round(210 * max(0, scale - 1.33))
+        )
+        root.minsize(min(available_width, MIN_WIDTH), min_height)
+        root.geometry(
+            f"{min(1120, available_width)}x{min(available_height, max(780, min_height))}"
+        )
         root.configure(bg=BG)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
         root.protocol("WM_DELETE_WINDOW", self._window_close)
 
-        style = ttk.Style(root)
-        style.theme_use("clam")
-        style.configure(
-            "Treeview",
-            background=WHITE,
-            fieldbackground=WHITE,
-            foreground=INK,
-            borderwidth=0,
-            rowheight=27,
-            font=(FONT, 10),
-        )
-        style.configure(
-            "Treeview.Heading",
-            background="#e9f0f8",
-            foreground=INK,
-            relief="flat",
-            padding=(5, 4),
-            font=(FONT, 9, "bold"),
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", "#dbeafe")],
-            foreground=[("selected", INK)],
-        )
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 5), font=(FONT, 9))
-        style.map("TNotebook.Tab", background=[("selected", WHITE)])
-        style.configure("TButton", padding=(7, 3), font=(FONT, 9))
-        style.configure(
-            "Health.Horizontal.TProgressbar",
-            background=ACCENT,
-            troughcolor="#e3edf9",
-            borderwidth=0,
-            thickness=4,
-        )
+        _apply_theme(root)
 
-        hero = tk.Frame(root, bg=NAVY, padx=19, pady=11)
+        hero = tk.Frame(root, bg=HEADER, padx=18, pady=11)
         hero.grid(row=0, column=0, sticky="ew")
-        heading = tk.Frame(hero, bg=NAVY)
-        heading.pack(side="left")
-        _label(heading, "WinRunner", bg=NAVY, fg=WHITE, size=18, bold=True).pack(
+        hero.columnconfigure(1, weight=1)
+        mark = tk.Label(
+            hero,
+            text="WR",
+            bg=TEAL,
+            fg=BG,
+            font=(MONO, 13, "bold"),
+            padx=10,
+            pady=7,
+            borderwidth=0,
+        )
+        mark.grid(row=0, column=0, padx=(0, 11))
+        heading = tk.Frame(hero, bg=HEADER)
+        heading.grid(row=0, column=1, sticky="w")
+        _label(heading, "WinRunner", bg=HEADER, size=16, bold=True).pack(fill="x")
+        _label(heading, "本机监控  /  LOCAL MONITOR", bg=HEADER, fg=MUTED, size=8).pack(
             fill="x"
         )
-        _label(
-            heading,
-            "内置监控  ·  在控制台按 Ctrl+C 停止服务",
-            bg=NAVY,
-            fg="#a9c0da",
-            size=9,
-        ).pack(fill="x")
-        self.connection = _label(hero, "● 正在读取", bg=NAVY, fg="#e7c07b", bold=True)
-        self.connection.pack(side="right")
+        self.connection = _label(
+            hero, "● 正在读取", bg=RAISED, fg=AMBER, size=9, bold=True
+        )
+        self.connection.configure(padx=9, pady=4)
+        self.connection.grid(row=0, column=2)
 
         cards = tk.Frame(root, bg=BG)
         cards.grid(row=1, column=0, sticky="ew", padx=14, pady=9)
         names = ("CPU 使用率", "物理内存", "工作区磁盘", "Runner 运行时长")
-        metrics = [Metric(cards, name, bar=i < 3) for i, name in enumerate(names)]
+        metrics = [
+            Metric(cards, name, accent, bar=i < 3)
+            for i, (name, accent) in enumerate(zip(names, METRIC_COLORS))
+        ]
         self.cpu, self.memory, self.disk, self.uptime = metrics
         for index, metric in enumerate(metrics):
             cards.columnconfigure(index, weight=1, uniform="metrics")
@@ -717,29 +905,32 @@ class Dashboard:
             "项目列表",
             (("name", "名称", 115, True), ("status", "状态", 76, False)),
         )
-        self.projects.pack(side="left", fill="y", padx=(0, 7))
+        projects.columnconfigure(1, weight=1)
+        projects.rowconfigure(0, weight=1)
+        self.projects.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         self.projects.tree.bind("<<TreeviewSelect>>", self._select_project)
 
-        project = tk.Frame(projects, bg=WHITE)
-        project.pack(side="left", fill="both", expand=True)
-        intro = tk.Frame(project, bg=WHITE, padx=14, pady=8)
-        intro.pack(fill="x")
-        self.project_title = _label(intro, "选择左侧项目", bold=True, size=12)
+        project = tk.Frame(projects, bg=PANEL)
+        project.grid(row=0, column=1, sticky="nsew")
+        project.columnconfigure(0, weight=1)
+        project.rowconfigure(2, weight=1)
+        intro = tk.Frame(project, bg=PANEL, padx=12, pady=6)
+        intro.grid(row=0, column=0, sticky="ew")
+        self.project_title = FitLabel(intro, "选择左侧项目", bold=True, size=11)
         self.project_title.pack(fill="x")
-        self.repo = _label(intro, "", fg=MUTED, size=9)
+        self.repo = FitLabel(intro, "", fg=MUTED, size=9)
         self.repo.pack(fill="x")
-        # Keep long repository URLs from pushing task columns off-screen.
-        self.repo.configure(width=1)
-        action = tk.Frame(project, bg="#eef4fc", padx=9, pady=5)
-        action.pack(fill="x", padx=14)
+        action = tk.Frame(project, bg=INSET, padx=8, pady=4)
+        action.grid(row=1, column=0, padx=12, sticky="ew")
+        action.columnconfigure(0, weight=1)
         self.action_button = ttk.Button(
             action, text="查看 Action", command=self._select_action
         )
-        self.action_button.pack(side="right")
-        self.action_text = _label(action, "Action  ·  未选择项目", bg="#eef4fc", size=9)
-        self.action_text.pack(side="left", fill="x", expand=True)
+        self.action_button.grid(row=0, column=1)
+        self.action_text = FitLabel(action, "Action  ·  未选择项目", bg=INSET, size=9)
+        self.action_text.grid(row=0, column=0, padx=(0, 8), sticky="ew")
         self.project_commands = StatusTable(project, "项目命令", COMMAND_COLUMNS)
-        self.project_commands.pack(fill="both", expand=True)
+        self.project_commands.grid(row=2, column=0, sticky="nsew")
 
         self.commands = StatusTable(self.tabs, "全局命令", COMMAND_COLUMNS)
         self.tabs.add(self.commands, text="全局命令")
@@ -752,12 +943,18 @@ class Dashboard:
         self.workspace = workspace
         self._update_project(None)
 
-        footer = tk.Frame(root, bg=BG, padx=14, pady=5)
+        footer = tk.Frame(root, bg=BG, padx=14, pady=6)
         footer.grid(row=3, column=0, sticky="ew")
-        self.notice = _label(footer, "正在读取状态…", bg=BG, fg=MUTED, size=9)
-        self.notice.pack(side="left")
-        self.run = _label(footer, "", bg=BG, fg=MUTED, size=9)
-        self.run.pack(side="right")
+        footer.columnconfigure(0, weight=1)
+        self.notice = FitLabel(footer, "正在读取状态…", bg=BG, fg=MUTED, size=8)
+        self.notice.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        _label(footer, "只读  /  Ctrl+C 停止服务", bg=BG, fg=MUTED, size=8).grid(
+            row=0, column=1, padx=(0, 12)
+        )
+        self.run = FitLabel(footer, "", bg=BG, fg=MUTED, size=8, family=MONO)
+        self.run.configure(anchor="e")
+        footer.columnconfigure(2, weight=1)
+        self.run.grid(row=0, column=2, sticky="ew")
         self._after_id = root.after_idle(self.refresh)
 
     @staticmethod
@@ -862,7 +1059,7 @@ class Dashboard:
         self._backend_exited = True
         if self._after_id is not None:
             self.root.after_cancel(self._after_id)
-        self.connection.configure(text="● 已停止", fg="#f5c386")
+        self.connection.configure(text="● 已停止", fg=AMBER)
         self._after_id = self.root.after(BACKEND_EXIT_MS, self.close)
         return False
 
@@ -905,10 +1102,10 @@ class Dashboard:
     def _update_project(self, data: ViewData | None) -> None:
         name = self._view.project
         project = _find(self._snapshot.projects, "projects", name) if name else {}
-        self.project_title.configure(
-            text=f"{name}  ·  {_status(project)}" if name else "选择左侧项目"
+        self.project_title.set_text(
+            f"{name}  ·  {_status(project)}" if name else "选择左侧项目"
         )
-        self.repo.configure(text=_text(project.get("repo_url"), ""))
+        self.repo.set_text(_text(project.get("repo_url"), ""))
         action = data.action if data else None
         task = action.data if action and action.data else {}
         if task:
@@ -926,7 +1123,9 @@ class Dashboard:
                     else "尚未提交" if action.status == 404 else action.error
                 )
             )
-        self.action_text.configure(text=f"Action  ·  {message}")
+        self.action_text.set_text(f"Action  ·  {message}")
+        tag = STATUSES.get(_text(task.get("status")), ("", "neutral"))[1]
+        self.action_text.configure(fg=STATUS_COLORS.get(tag, MUTED))
         self.action_button.state(["!disabled" if task else "disabled"])
         self.project_commands.show_rows(
             *(
@@ -941,8 +1140,8 @@ class Dashboard:
         self._snapshot = snapshot
         health = snapshot.health.data
         if health is None:
-            self.connection.configure(text="● 状态不可用", fg="#f5c386")
-            self.notice.configure(text=snapshot.health.error)
+            self.connection.configure(text="● 状态不可用", fg=AMBER)
+            self.notice.set_text(snapshot.health.error)
             self.cpu.update_value(*_cpu_usage({}))
             for metric in (self.memory, self.disk, self.uptime):
                 metric.update_value(DASH, "等待 Runner 状态")
@@ -950,8 +1149,8 @@ class Dashboard:
         else:
             cpu = _object(health.get("cpu"))
             cores = _number(cpu.get("logical_cores"))
-            self.cpu.title.configure(
-                text=f"CPU 使用率 · {cores:g} 核" if cores else "CPU 使用率"
+            self.cpu.title.set_text(
+                f"CPU 使用率 · {cores:g} 核" if cores else "CPU 使用率"
             )
             self.cpu.update_value(*_cpu_usage(cpu))
             self.memory.update_value(*_capacity(_object(health.get("memory"))))
@@ -960,11 +1159,11 @@ class Dashboard:
                 _uptime(health.get("uptime_seconds")), "当前服务进程"
             )
             run_id = _text(health.get("run_id"))
-            self.connection.configure(text="● 服务运行中", fg="#82e0b9")
-            self.notice.configure(
-                text=snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
+            self.connection.configure(text="● 服务运行中", fg=GREEN)
+            self.notice.set_text(
+                snapshot.note or f"自动刷新  ·  {datetime.now():%H:%M:%S}"
             )
-        self.run.configure(text=f"只读  ·  Runner ID  {run_id}")
+        self.run.set_text(f"Runner ID  {run_id}")
         reset = run_id != DASH and self._run_id != run_id
         if reset and self._run_id != DASH:
             self._collapse()

@@ -1,4 +1,4 @@
-"""Exercise the dashboard without launching Tk or listening on a port."""
+"""Exercise dashboard behavior and check layout when a Tk display is available."""
 
 import base64
 import signal
@@ -37,10 +37,15 @@ class IntegratedTests(unittest.TestCase):
     @staticmethod
     def dashboard(snapshot, is_running):
         root = MagicMock()
+        root.tk.call.return_value = 1.33
+        root.winfo_screenwidth.return_value = 1920
+        root.winfo_screenheight.return_value = 1080
         with (
             patch.object(gui.tk, "Frame"),
+            patch.object(gui.tk, "Label"),
             patch.object(gui, "_label", side_effect=lambda *a, **kw: MagicMock()),
-            patch.object(gui.ttk, "Style"),
+            patch.object(gui, "_apply_theme"),
+            patch.object(gui, "FitLabel"),
             patch.object(gui.ttk, "Button"),
             patch.object(gui.ttk, "Notebook"),
             patch.object(gui, "TaskDetail"),
@@ -160,8 +165,8 @@ class IntegratedTests(unittest.TestCase):
             self.assertTrue(entered.wait(timeout=2))
             alive.clear()
             dashboard._receive()
-            dashboard.connection.configure.assert_called_once_with(
-                text="● 已停止", fg="#f5c386"
+            dashboard.connection.configure.assert_called_with(
+                text="● 已停止", fg=gui.AMBER
             )
             dashboard.root.after.assert_called_with(
                 gui.BACKEND_EXIT_MS, dashboard.close
@@ -205,6 +210,131 @@ class IntegratedTests(unittest.TestCase):
         self.assertIs(dashboard.call_args.kwargs["snapshot"], snapshot)
         self.assertIs(signal.getsignal(signal.SIGINT), previous)
         tk_factory.return_value.mainloop.assert_called_once_with()
+
+
+class TkLayoutTests(unittest.TestCase):
+    def test_long_content_at_minimum_size_and_larger_scaling(self) -> None:
+        for scale in (1.33, 2.0):
+            with self.subTest(scale=scale):
+                try:
+                    root = gui.tk.Tk()
+                except gui.tk.TclError as exc:
+                    self.skipTest(f"Tk display unavailable: {exc}")
+                root.tk.call("tk", "scaling", scale)
+                dashboard = gui.Dashboard(
+                    root,
+                    snapshot=lambda view: gui.Snapshot(gui.Response()),
+                    is_running=lambda: True,
+                )
+                scheduler = patch.object(dashboard, "_schedule")
+                scheduler.start()
+                try:
+                    if dashboard._after_id is not None:
+                        root.after_cancel(dashboard._after_id)
+                        dashboard._after_id = None
+                    width, height = root.minsize()
+                    root.geometry(f"{width}x{height}+0+0")
+                    name = "W" * 64
+                    url = "https://github.example/owner/" + "long-segment/" * 80
+                    command_id = "1"
+                    command = {
+                        "id": command_id,
+                        "mode": "ps",
+                        "status": "failed",
+                        "phase": "fetch",
+                        "command": "Write-Output " + "中" * 512,
+                        "stdout_bytes": 2**62,
+                        "stderr_bytes": 2**62,
+                        "stdout": {
+                            "data_base64": base64.b64encode(b"x" * 512).decode()
+                        },
+                    }
+                    health = gui.Response({"run_id": "r" * 32})
+                    projects = gui.Response(
+                        {
+                            "projects": [
+                                {"name": name, "repo_url": url, "status": "idle"}
+                            ]
+                        }
+                    )
+                    commands = gui.Response({"commands": [command]})
+                    dashboard._show(gui.Snapshot(health, projects, commands))
+                    dashboard.projects.tree.selection_set(name)
+                    root.update()
+                    self.assertEqual(dashboard._view.project, name)
+                    action = gui.Response(error="错误信息" * 200, status=409)
+                    dashboard._show(
+                        gui.Snapshot(
+                            health,
+                            projects,
+                            commands,
+                            selected=gui.ViewData(dashboard._view, action, commands),
+                        )
+                    )
+                    dashboard.project_commands.tree.selection_set(command_id)
+                    root.update()
+                    self.assertEqual(
+                        dashboard._view.target, gui.Target(name, command_id)
+                    )
+                    dashboard._show(
+                        gui.Snapshot(
+                            health,
+                            projects,
+                            commands,
+                            "很长的刷新状态" * 100,
+                            gui.ViewData(
+                                dashboard._view, action, commands, gui.Response(command)
+                            ),
+                        )
+                    )
+                    output = dashboard.detail.outputs["stdout"]
+                    dashboard.detail.tabs.select(output.master)
+                    root.update()
+                    for label in (
+                        dashboard.repo,
+                        dashboard.detail.title,
+                        dashboard.action_text,
+                        dashboard.notice,
+                    ):
+                        text = str(label.cget("text"))
+                        self.assertTrue(text.endswith("…"), text)
+                        self.assertLessEqual(
+                            label._font.measure(text), label.winfo_width()
+                        )
+                    for button in dashboard.detail.buttons["stdout"]:
+                        self.assertTrue(button.winfo_ismapped())
+                    self.assertGreater(output.text.winfo_height(), 25)
+                    self.assertLess(output.text.xview()[1], 1)
+                    self.assertEqual(output.value, "x" * 512)
+                    tree = dashboard.project_commands.tree
+                    self.assertTrue(tree.bbox(command_id))
+                    if tree.xview()[1] < 1:
+                        self.assertTrue(
+                            dashboard.project_commands.horizontal.winfo_ismapped()
+                        )
+                        tree.xview_moveto(1.0)
+                        root.update()
+                        self.assertEqual(tree.xview()[1], 1)
+                    for widget in (dashboard.detail, dashboard.projects, tree, output):
+                        self.assertGreaterEqual(
+                            widget.winfo_rootx(), root.winfo_rootx()
+                        )
+                        self.assertLessEqual(
+                            widget.winfo_rootx() + widget.winfo_width(),
+                            root.winfo_rootx() + root.winfo_width(),
+                        )
+                        self.assertLessEqual(
+                            widget.winfo_rooty() + widget.winfo_height(),
+                            root.winfo_rooty() + root.winfo_height(),
+                        )
+                    root.geometry(f"{width + 250}x{height}")
+                    root.update()
+                    self.assertIn(
+                        "https://github.example/", str(dashboard.repo.cget("text"))
+                    )
+                finally:
+                    scheduler.stop()
+                    dashboard.close()
 
 
 class DisplayTests(unittest.TestCase):
