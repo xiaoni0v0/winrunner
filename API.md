@@ -4,7 +4,8 @@
 
 ## HTTP 约定
 
-- 所有接口要求 `Authorization: Bearer <token>`，缺失或错误返回 `401`。默认最多接纳 64 个并发 HTTP 连接；满额会在鉴权前尝试返回 `503` 和 `Retry-After: 1`；已收到方法的非 HEAD 请求附 `server_busy` JSON，尚无法识别方法时不附报文体。这个限制不控制后台任务并发数。
+- 所有接口要求 `Authorization: Bearer <token>`。缺失或错误时返回 `401`，并封禁 TCP 对端 IP 10 秒（不信任 `X-Forwarded-For`）。封禁期间不校验令牌，直接返回 `429 auth_ip_banned` 和 `Retry-After`（剩余秒数向上取整），不会延长封禁。未被封禁的 IP 不受鉴权频率限制。共享出口或代理 IP 的客户端共用封禁；已通过鉴权的请求不会被中断。封禁仅存内存，重启清除。
+- 默认最多接纳 64 个并发 HTTP 连接；满额会在鉴权前尝试返回 `503` 和 `Retry-After: 1`；已收到方法的非 HEAD 请求附 `server_busy` JSON，尚无法识别方法时不附报文体。这个限制不控制后台任务并发数。
 - POST 用 `Content-Length` 发送 UTF-8 JSON 对象，默认上限 1 MiB。请直接发送正文，不要等待 `Expect: 100-continue`；Runner 不发送该临时响应。除文件下载、`204` 和无报文体的 `HEAD` 外，响应为 JSON。
 - 错误体为 `{"error":{"code":"…","message":"…"}}`。`400` 表示请求不合法，`404` 表示路由或资源不存在，`405` 表示该路由不支持此方法（附 `Allow`），`409` 表示状态冲突，`413` 表示请求体过大，`500` 表示服务端错误。
 

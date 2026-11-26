@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -13,9 +14,11 @@ import textwrap
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from email.message import Message
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +41,7 @@ def health_snapshot(runner: Runner, sampler: CpuSampler) -> dict:
 
 
 DECIMAL = re.compile(r"[0-9]+\Z")
+AUTH_BAN_SECONDS = 10
 LOG = logging.getLogger("winrunner")
 LOG_FILE = Path(__file__).resolve().with_name("winrunner.log")
 
@@ -263,7 +267,35 @@ class HTTPServer(ThreadingHTTPServer):
             raise ValueError("MAX_HTTP_CONNECTIONS must be a positive integer")
         self.connections = BoundedSemaphore(limit)
         self.start_replay = StartReplay()
+        self._auth_lock = Lock()
+        self._auth_deadlines: OrderedDict[str, float] = OrderedDict()
         super().__init__(*args, **kwargs)
+
+    def authenticate(self, peer: str, headers: Message) -> int | None:
+        """Return None for valid credentials, zero for failure, or a retry delay."""
+        with self._auth_lock:
+            now = time.monotonic()
+            # Cooldowns never extend, so deadlines are in insertion order.
+            while self._auth_deadlines:
+                if next(iter(self._auth_deadlines.values())) > now:
+                    break
+                self._auth_deadlines.popitem(last=False)
+            deadline = self._auth_deadlines.get(peer)
+            if deadline is not None:
+                return math.ceil(deadline - now)
+            values = headers.get_all("Authorization", [])
+            try:
+                scheme, token = (
+                    values[0].split(" ", 1) if len(values) == 1 else ("", "")
+                )
+                if scheme.lower() == "bearer" and hmac.compare_digest(
+                    token.encode("ascii"), self.token
+                ):
+                    return None
+            except ValueError:  # Includes UnicodeEncodeError.
+                pass
+            self._auth_deadlines[peer] = time.monotonic() + AUTH_BAN_SECONDS
+            return 0
 
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
@@ -412,15 +444,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
     def parse_request(self):
         if not super().parse_request():
             return False
-        values = self.headers.get_all("Authorization", [])
-        try:
-            scheme, token = values[0].split(" ", 1) if len(values) == 1 else ("", "")
-            valid = scheme.lower() == "bearer" and hmac.compare_digest(
-                token.encode("ascii"), self.server.token
-            )
-        except (ValueError, UnicodeError):
-            valid = False
-        if not valid:
+        retry = self.server.authenticate(self.client_address[0], self.headers)
+        if retry is None:
+            return True
+        if retry == 0:
             self.operation = "authentication rejected"
             self.reply(
                 401,
@@ -432,8 +459,19 @@ class HTTPHandler(BaseHTTPRequestHandler):
                 },
                 {"WWW-Authenticate": "Bearer"},
             )
-            return False
-        return True
+        else:
+            self.operation = "authentication blocked"
+            self.reply(
+                429,
+                {
+                    "error": {
+                        "code": "auth_ip_banned",
+                        "message": "IP temporarily blocked after failed authentication",
+                    }
+                },
+                {"Retry-After": str(retry)},
+            )
+        return False
 
     def send_error(self, code, message=None, explain=None):
         reason = self.responses.get(code, ("HTTP error",))[0]

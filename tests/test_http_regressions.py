@@ -1,5 +1,6 @@
 """HTTP regression tests with a loopback listener and a fake Runner."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stdout
 import http.client
 import io
@@ -77,10 +78,12 @@ class HTTPRegressionTests(unittest.TestCase):
     def connect(self):
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
 
-    def request(self, method, path, *, auth=True, payload=None, key=None):
+    def request(self, method, path, *, auth=True, payload=None, key=None, headers=None):
         conn = self.connect()
         try:
-            headers = {"Authorization": "Bearer " + TOKEN} if auth else {}
+            headers = dict(headers or {})
+            if auth is not False:
+                headers["Authorization"] = "Bearer " + TOKEN if auth is True else auth
             if key is not None:
                 headers["Idempotency-Key"] = key
             conn.request(method, path, body=payload, headers=headers)
@@ -89,6 +92,71 @@ class HTTPRegressionTests(unittest.TestCase):
             return response.status, json.loads(body) if body else body, response.headers
         finally:
             conn.close()
+
+    def test_failed_auth_bans_peer_for_ten_seconds_without_extending(self):
+        self.start_server(reported_peer="203.0.113.42")
+        clock = Mock(return_value=100.0)
+        with patch("winrunner.time", Mock(monotonic=clock)):
+            status, body, headers = self.request(
+                "GET", "/projects", auth="Bearer wrong"
+            )
+            self.assertEqual((status, body["error"]["code"]), (401, "unauthorized"))
+            self.assertEqual(headers["WWW-Authenticate"], "Bearer")
+
+            with patch("winrunner.hmac.compare_digest") as compare:
+                for now, retry, auth in (
+                    (100.0, "10", True),
+                    (105.25, "5", "Bearer wrong"),
+                    (109.99, "1", False),
+                ):
+                    with self.subTest(now=now):
+                        clock.return_value = now
+                        status, body, headers = self.request(
+                            "POST",
+                            "/commands",
+                            auth=auth,
+                            payload=b"{",
+                            headers={"X-Forwarded-For": "203.0.113.43"},
+                        )
+                        self.assertEqual(
+                            (status, body["error"]["code"]), (429, "auth_ip_banned")
+                        )
+                        self.assertEqual(headers["Retry-After"], retry)
+                compare.assert_not_called()
+            self.runner.start_command.assert_not_called()
+
+            self.server.reported_peer = "203.0.113.43"
+            self.assertEqual(
+                self.request(
+                    "GET", "/projects", headers={"X-Forwarded-For": "203.0.113.42"}
+                )[0],
+                200,
+            )
+            self.server.reported_peer = "203.0.113.42"
+            clock.return_value = 110.0
+            self.assertEqual(self.request("GET", "/projects")[0], 200)
+            self.assertEqual(self.request("GET", "/projects", auth=False)[0], 401)
+            status, body, headers = self.request("HEAD", "/projects")
+            self.assertEqual((status, body, headers["Retry-After"]), (429, b"", "10"))
+
+    def test_correct_token_is_not_rate_limited(self):
+        self.start_server()
+        # All requests fall within the same instant on the server clock.
+        with patch("winrunner.time", Mock(monotonic=Mock(return_value=100.0))):
+            for _ in range(20):
+                self.assertEqual(self.request("GET", "/projects")[0], 200)
+        self.assertEqual(self.runner.list_projects.call_count, 20)
+
+    def test_concurrent_failed_auth_has_only_one_first_failure(self):
+        self.start_server()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            statuses = list(
+                pool.map(
+                    lambda _: self.request("GET", "/projects", auth=False)[0], range(8)
+                )
+            )
+        self.assertCountEqual(statuses, [401] + [429] * 7)
+        self.runner.list_projects.assert_not_called()
 
     def test_start_replay_scopes_keys_and_returns_original_response(self):
         self.start_server()
@@ -355,16 +423,20 @@ class HTTPRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             logfile = Path(folder) / "winrunner.log"
             with redirect_stdout(console), service_logging(logfile, TOKEN):
-                for auth, expected in ((True, 200), (False, 401)):
+                self.runner.list_projects.side_effect = [
+                    [],
+                    RuntimeError("test failure"),
+                ]
+                for auth, expected in (
+                    (True, 200),
+                    (True, 500),
+                    (False, 401),
+                    (True, 429),
+                ):
                     self.server.worker_done.clear()
                     status, _, _ = self.request("GET", "/projects", auth=auth)
                     self.assertEqual(status, expected)
                     self.assertTrue(self.server.worker_done.wait(3))
-                self.runner.list_projects.side_effect = RuntimeError("test failure")
-                self.server.worker_done.clear()
-                status, _, _ = self.request("GET", "/projects")
-                self.assertEqual(status, 500)
-                self.assertTrue(self.server.worker_done.wait(3))
             self.assertEqual(console.getvalue(), "")
             self.assertEqual(logfile.read_text(encoding="utf-8"), "")
 
@@ -480,7 +552,6 @@ class HTTPRegressionTests(unittest.TestCase):
         for path, auth, expected, allow in [
             ("/health", True, 405, "GET"),
             ("/unknown", True, 404, None),
-            ("/projects", False, 401, None),
         ]:
             with self.subTest(path=path):
                 # Read the raw response so http.client cannot mask an erroneous HEAD body.
@@ -514,6 +585,10 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.assertEqual(body["error"]["code"], "not_found")
                 self.assertIsNone(headers["Allow"])
         self.assertEqual(self.runner.mock_calls, [])
+        status, body, headers = self.request("HEAD", "/projects", auth=False)
+        self.assertEqual(
+            (status, body, headers["WWW-Authenticate"]), (401, b"", "Bearer")
+        )
 
     def test_only_windows_sharing_and_lock_violations_on_files_are_busy(self):
         self.start_server(reported_peer="203.0.113.42")
