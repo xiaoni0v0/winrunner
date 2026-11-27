@@ -309,6 +309,8 @@ class Task:
         self.done = threading.Event()
         self.cancelled = threading.Event()
         self.status, self.phase = "preparing", phase
+        self.started_at = time.time_ns() // 1_000_000
+        self.finished_at: int | None = None
         self.source, self.exit_code, self.error, self.commit = None, None, None, None
         self.output = {"stdout": bytearray(), "stderr": bytearray()}
         self.command_id, self.mode = command_id, mode
@@ -387,6 +389,7 @@ class Task:
                 self.source = source
             self.output["stdout"].extend(stdout)
             self.output["stderr"].extend(stderr)
+            self.finished_at = time.time_ns() // 1_000_000
             self.done.set()
 
     def snapshot(self, offsets=None, limit=65536):
@@ -395,6 +398,8 @@ class Task:
             result = {
                 "status": self.status,
                 "phase": self.phase,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
                 "output_source": self.source,
                 "exit_code": self.exit_code,
                 "error": self.error,

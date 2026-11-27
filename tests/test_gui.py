@@ -4,6 +4,7 @@ import base64
 import signal
 import threading
 import unittest
+from datetime import datetime
 from queue import SimpleQueue
 from unittest.mock import MagicMock, call, patch
 
@@ -213,6 +214,31 @@ class IntegratedTests(unittest.TestCase):
 
 
 class TkLayoutTests(unittest.TestCase):
+    def test_task_details_show_both_local_times(self) -> None:
+        try:
+            root = gui.tk.Tk()
+        except gui.tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        detail = gui.TaskDetail(root, lambda: None, lambda *_: None)
+        start = 1_767_323_045_000
+        end = start + 1000
+        for target in (
+            gui.Target("Demo"),
+            gui.Target("Demo", "1"),
+            gui.Target(None, "1"),
+        ):
+            with self.subTest(target=target):
+                detail.open(target)
+                detail.show(
+                    gui.View(target.project, target),
+                    gui.Response({"started_at": start, "finished_at": end}),
+                )
+                self.assertEqual(
+                    detail.times._text,
+                    f"开始：{gui._local_time(start)}  ·  结束：{gui._local_time(end)}",
+                )
+
     def test_switching_command_keeps_detail_tab_until_collapsed(self) -> None:
         try:
             root = gui.tk.Tk()
@@ -514,6 +540,16 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["10", "z"])
         self.assertEqual(rows[0][1][4], "0")
         self.assertEqual(rows[1][1][1], "PowerShell")
+
+    def test_command_rows_display_local_times_and_missing_finish(self) -> None:
+        stamp = 1_767_323_045_678
+        expected = f"{datetime.fromtimestamp(stamp // 1000):%Y-%m-%d %H:%M:%S}"
+        commands = gui.Response(
+            {"commands": [{"id": "1", "started_at": stamp, "finished_at": None}]}
+        )
+        rows, error = gui._rows(commands, "commands")
+        self.assertFalse(error)
+        self.assertEqual(rows[0][1][-2:], (expected, gui.DASH))
 
     def test_cpu_usage_displays_latest_and_both_averages(self) -> None:
         self.assertEqual(

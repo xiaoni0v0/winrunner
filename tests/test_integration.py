@@ -69,6 +69,17 @@ def free_port():
 
 
 class RunnerCase(unittest.TestCase):
+    def assert_task_times(self, task, *, finished=True):
+        started_at = task["started_at"]
+        self.assertIs(type(started_at), int)
+        self.assertAlmostEqual(started_at / 1000, time.time(), delta=120)
+        if finished:
+            finished_at = task["finished_at"]
+            self.assertIs(type(finished_at), int)
+            self.assertGreaterEqual(finished_at, started_at)
+        else:
+            self.assertIsNone(task["finished_at"])
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="winrunner-integration-")
         self.addCleanup(temp.cleanup)
@@ -322,6 +333,7 @@ class CommandIntegrationTests(RunnerCase):
                 self.assertEqual(snapshot["id"], str(index))
                 self.assertEqual(snapshot["status"], "failed")
                 self.assertEqual(snapshot["phase"], "validate")
+                self.assert_task_times(snapshot)
                 self.assertEqual(self.call(200, "GET", f"/commands/{index}"), snapshot)
         self.call(400, "POST", "/commands", b"{")
         key = {"Idempotency-Key": "malformed-json"}
@@ -825,6 +837,14 @@ class ProjectIntegrationTests(RunnerCase):
         global_task = self.call(200, "POST", "/commands", payload, headers=key)
         other_task = self.call(200, "POST", other, payload, headers=key)
         self.assertEqual((global_task["id"], other_task["id"]), ("0", "0"))
+        for collection, task in (
+            (commands, first),
+            ("/commands", global_task),
+            (other, other_task),
+        ):
+            self.assert_task_times(task)
+            self.assertEqual(self.call(200, "GET", collection)["commands"][-1], task)
+            self.assertEqual(self.call(200, "GET", collection + "/" + task["id"]), task)
         for endpoint, cwd in (
             (commands + "/1", self.data / "projects" / "Fixture"),
             (other + "/0", self.data / "projects" / "Other"),
@@ -954,6 +974,8 @@ class ProjectIntegrationTests(RunnerCase):
         )
         self.assertEqual(running["status"], "running")
         self.assertEqual(running["commit"], self.commit)
+        self.assert_task_times(running, finished=False)
+        self.assertEqual(running["started_at"], accepted["started_at"])
         self.assertNotIn("action_id", running)
         original_action = self.call(200, "GET", endpoint + "?include_input=1")[
             "action_id"
@@ -970,6 +992,8 @@ class ProjectIntegrationTests(RunnerCase):
         self.call(409, "POST", endpoint, b"{")
         self.call(204, "DELETE", endpoint)
         cancelled = self.finished(endpoint, expected="cancelled")
+        self.assert_task_times(cancelled)
+        self.assertEqual(cancelled["started_at"], running["started_at"])
         self.assertEqual(log_bytes(cancelled, "stdout"), log_bytes(running, "stdout"))
         self.assertEqual(log_bytes(cancelled, "stderr"), log_bytes(running, "stderr"))
         self.assertEqual(self.call(200, "GET", project)["status"], "cancelled")

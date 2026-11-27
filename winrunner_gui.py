@@ -84,6 +84,8 @@ COMMAND_COLUMNS = (
     ("exit", "退出码", 60, False),
     ("stdout", "stdout", 76, True),
     ("stderr", "stderr", 76, True),
+    ("started_at", "开始时间", 144, False),
+    ("finished_at", "结束时间", 144, False),
 )
 
 JsonObject = dict[str, object]
@@ -239,6 +241,15 @@ def _cpu_usage(data: JsonObject) -> tuple[str, str, float]:
     return label(latest), f"5s {short}  ·  60s {long}", latest or 0
 
 
+def _local_time(value: object) -> str:
+    if type(value) is int:
+        try:
+            return f"{datetime.fromtimestamp(value // 1000):%Y-%m-%d %H:%M:%S}"
+        except (ValueError, OverflowError, OSError):
+            pass
+    return DASH
+
+
 def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
     if response is None:
         return [], "等待 Runner 状态"
@@ -277,6 +288,8 @@ def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
                 str(exit_code) if type(exit_code) is int else DASH,
                 _size(entry.get("stdout_bytes")),
                 _size(entry.get("stderr_bytes")),
+                _local_time(entry.get("started_at")),
+                _local_time(entry.get("finished_at")),
             )
         rows.append((key, values, tag))
     if collection == "projects":
@@ -438,6 +451,8 @@ class StatusTable(tk.Frame):
             "phase": "更新远端引用",
             "stdout": "1,024.0 MiB",
             "stderr": "1,024.0 MiB",
+            "started_at": "2026-01-02 03:04:05",
+            "finished_at": "2026-01-02 03:04:05",
         }
         for key, label, width, stretch in columns:
             anchor: Literal["e", "w"] = (
@@ -638,9 +653,9 @@ class TaskDetail(tk.Frame):
         page: Callable[[str, int], None],
         save: Callable[[str], None] | None = None,
     ):
-        super().__init__(parent, bg=PANEL, padx=14, pady=10)
+        super().__init__(parent, bg=PANEL, padx=14, pady=6)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
         header = tk.Frame(self, bg=PANEL)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
@@ -648,9 +663,11 @@ class TaskDetail(tk.Frame):
         self.title.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(header, text="收起详情", command=close).grid(row=0, column=1)
         self.meta = FitLabel(self, "", fg=MUTED, size=9)
-        self.meta.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        self.meta.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.times = FitLabel(self, "", fg=MUTED, size=9)
+        self.times.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.tabs = ttk.Notebook(self)
-        self.tabs.grid(row=2, column=0, sticky="nsew")
+        self.tabs.grid(row=3, column=0, sticky="nsew")
         self.input = ReadOnlyText(self.tabs, wrap="char")
         self.tabs.add(self.input, text="命令原文")
         self.outputs: dict[str, ReadOnlyText] = {}
@@ -709,6 +726,11 @@ class TaskDetail(tk.Frame):
                 if data
                 else (result.error if result else "正在读取…")
             )
+        )
+        self.times.set_text(
+            f"开始：{_local_time(data.get('started_at'))}  ·  结束：{_local_time(data.get('finished_at'))}"
+            if data
+            else ""
         )
         self.input.show(_text(data.get("command"), ""))
         error = _object(data.get("error"))

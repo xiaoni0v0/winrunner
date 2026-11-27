@@ -139,6 +139,8 @@ PowerShell 不加载用户配置，默认关闭进度提示，并以 UTF-8（无
 | `status` | `preparing`、`running`、`cancelling`、`succeeded`、`failed`、`cancelled`；后三项为终态。 |
 | `phase` | Action：`reset`、`validate`、`fetch`、`resolve`、`checkout`、`launch`、`run`；命令：`validate`、`launch`、`run`。终态保留最后阶段。 |
 | `output_source` | `null`（尚无来源）、`runner`（Runner 诊断）、`git`（Git 失败）、`launch`（启动失败）、`process`（进程输出，包括解释器报错）。成功的 Git 准备输出不混入脚本日志。 |
+| `started_at` | Runner 创建任务记录的时间，含准备阶段，不等子进程启动。Unix 时间戳，单位为毫秒，类型为整数，不受时区影响。 |
+| `finished_at` | 任务进入成功、失败或取消终态的时间，同为 Unix 毫秒时间戳；未结束时为 `null`。 |
 | `exit_code` | 主进程退出码（integer），未取得时为 `null`。 |
 | `error` | 失败或取消时的诊断 `{"code":"…","message":"…"}`，没有则为 `null`。 |
 | `stdout_bytes` / `stderr_bytes` | 两路日志当前各自保存的字节数。 |
