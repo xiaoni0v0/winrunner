@@ -214,6 +214,56 @@ class IntegratedTests(unittest.TestCase):
 
 
 class TkLayoutTests(unittest.TestCase):
+    def test_command_table_header_click_sorts_and_refresh_keeps_selection(self) -> None:
+        try:
+            root = gui.tk.Tk()
+        except gui.tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        table = gui.StatusTable(root, "命令", gui.COMMAND_COLUMNS)
+        table.pack(fill="both", expand=True)
+
+        def show(z_exit: int) -> None:
+            response = gui.Response(
+                {
+                    "commands": [
+                        {"id": "10", "exit_code": 2},
+                        {"id": "z", "exit_code": z_exit},
+                    ]
+                }
+            )
+            table.show_rows(*gui._rows(response, "commands"))
+            root.update()
+
+        def click_exit(event_time: int) -> None:
+            x = (
+                sum(
+                    table.tree.column(key, "width") for key in table.tree["columns"][:4]
+                )
+                + 10
+            )
+            self.assertEqual(table.tree.identify_region(x, 5), "heading")
+            table.tree.event_generate("<ButtonPress-1>", x=x, y=5, time=event_time)
+            table.tree.event_generate(
+                "<ButtonRelease-1>", x=x, y=5, time=event_time + 1
+            )
+            root.update()
+
+        show(-1)
+        self.assertEqual(table.tree.get_children(), ("10", "z"))
+        self.assertEqual(table.tree.heading("id", "text"), "ID ▼")
+        table.tree.selection_set("10")
+        click_exit(1000)
+        self.assertEqual(table.tree.get_children(), ("z", "10"))
+        self.assertEqual(table.tree.heading("exit", "text"), "退出码 ▲")
+        click_exit(2000)
+        self.assertEqual(table.tree.get_children(), ("10", "z"))
+        show(12)
+        self.assertEqual(table.tree.get_children(), ("z", "10"))
+        self.assertEqual(table.tree.selection(), ("10",))
+        self.assertEqual(table.tree.heading("exit", "text"), "退出码 ▼")
+        self.assertEqual(table.tree.heading("id", "text"), "ID")
+
     def test_task_details_show_both_local_times(self) -> None:
         try:
             root = gui.tk.Tk()
@@ -537,9 +587,49 @@ class DisplayTests(unittest.TestCase):
         )
         rows, error = gui._rows(commands, "commands")
         self.assertEqual(error, "")
-        self.assertEqual([row[0] for row in rows], ["10", "z"])
-        self.assertEqual(rows[0][1][4], "0")
-        self.assertEqual(rows[1][1][1], "PowerShell")
+        ordered = gui._sort_commands(rows, "id", descending=True)
+        self.assertEqual([row.key for row in ordered], ["10", "z"])
+        self.assertEqual(ordered[0].values[4], "0")
+        self.assertEqual(ordered[1].values[1], "PowerShell")
+
+    def test_command_columns_sort_by_raw_values_with_newest_id_breaking_ties(
+        self,
+    ) -> None:
+        stamp = 1_767_323_045_000
+        fields = (
+            ("mode", "mode", "cmd", "ps", None),
+            ("status", "status", "preparing", "running", "cancelled"),
+            ("phase", "phase", "validate", "launch", "run"),
+            ("exit", "exit_code", -2, 2, 12),
+            ("stdout", "stdout_bytes", 1100, 1101, 2**54),
+            ("stderr", "stderr_bytes", 2**54, 2**54 + 1, 2**54 + 2),
+            ("started_at", "started_at", stamp, stamp + 1, None),
+            ("finished_at", "finished_at", stamp, stamp + 1, None),
+        )
+        for column, field, low, middle, high in fields:
+            with self.subTest(column=column):
+                rows, error = gui._rows(
+                    gui.Response(
+                        {
+                            "commands": [
+                                {"id": "10", field: middle},
+                                {"id": "z", field: middle},
+                                {"id": "y", field: high},
+                                {"id": "11", field: low},
+                            ]
+                        }
+                    ),
+                    "commands",
+                )
+                self.assertFalse(error)
+                self.assertEqual(
+                    [row.key for row in gui._sort_commands(rows, column, False)],
+                    ["11", "10", "z", "y"],
+                )
+                self.assertEqual(
+                    [row.key for row in gui._sort_commands(rows, column, True)],
+                    ["y", "10", "z", "11"],
+                )
 
     def test_command_rows_display_local_times_and_missing_finish(self) -> None:
         stamp = 1_767_323_045_678
@@ -549,7 +639,7 @@ class DisplayTests(unittest.TestCase):
         )
         rows, error = gui._rows(commands, "commands")
         self.assertFalse(error)
-        self.assertEqual(rows[0][1][-2:], (expected, gui.DASH))
+        self.assertEqual(rows[0].values[-2:], (expected, gui.DASH))
 
     def test_cpu_usage_displays_latest_and_both_averages(self) -> None:
         self.assertEqual(

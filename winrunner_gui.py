@@ -89,8 +89,23 @@ COMMAND_COLUMNS = (
 )
 
 JsonObject = dict[str, object]
-Row = tuple[str, tuple[str, ...], str]
 Column = tuple[str, str, int, bool]
+SHELL_ORDER = {"cmd": 0, "ps": 1}
+STATUS_ORDER = {
+    status: index
+    for index, status in enumerate(
+        ("preparing", "running", "cancelling", "succeeded", "failed", "cancelled")
+    )
+}
+PHASE_ORDER = {"validate": 0, "launch": 1, "run": 2}
+
+
+@dataclass(frozen=True)
+class Row:
+    key: str
+    values: tuple[str, ...]
+    status: str
+    sort_values: dict[str, int | float] | None = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +265,19 @@ def _local_time(value: object) -> str:
     return DASH
 
 
+def _sort_number(value: object) -> int | float:
+    return value if type(value) is int else math.inf
+
+
+def _sort_commands(rows: list[Row], column: str, descending: bool) -> list[Row]:
+    def key(row: Row) -> tuple[int | float, int | float]:
+        assert row.sort_values is not None
+        value = row.sort_values[column]
+        return (-value if descending else value, -row.sort_values["id"])
+
+    return sorted(rows, key=key)
+
+
 def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
     if response is None:
         return [], "等待 Runner 状态"
@@ -273,30 +301,41 @@ def _rows(response: Response | None, collection: str) -> tuple[list[Row], str]:
         seen.add(key)
         status = _text(entry.get("status"))
         label, tag = STATUSES.get(status, (status, "neutral"))
-        values: tuple[str, ...]
         if collection == "projects":
-            values = (key, label)
-        else:
-            mode = _text(entry.get("mode"))
-            phase = _text(entry.get("phase"))
-            exit_code = entry.get("exit_code")
-            values = (
-                key,
-                {"cmd": "CMD", "ps": "PowerShell"}.get(mode, mode),
-                label,
-                PHASES.get(phase, phase),
-                str(exit_code) if type(exit_code) is int else DASH,
-                _size(entry.get("stdout_bytes")),
-                _size(entry.get("stderr_bytes")),
-                _local_time(entry.get("started_at")),
-                _local_time(entry.get("finished_at")),
-            )
-        rows.append((key, values, tag))
+            rows.append(Row(key, (key, label), tag))
+            continue
+        mode = _text(entry.get("mode"))
+        phase = _text(entry.get("phase"))
+        exit_code = entry.get("exit_code")
+        stdout = entry.get("stdout_bytes")
+        stderr = entry.get("stderr_bytes")
+        start = entry.get("started_at")
+        finish = entry.get("finished_at")
+        values = (
+            key,
+            {"cmd": "CMD", "ps": "PowerShell"}.get(mode, mode),
+            label,
+            PHASES.get(phase, phase),
+            str(exit_code) if type(exit_code) is int else DASH,
+            _size(stdout),
+            _size(stderr),
+            _local_time(start),
+            _local_time(finish),
+        )
+        sort_values: dict[str, int | float] = {
+            "id": int(key, 36),
+            "mode": SHELL_ORDER.get(mode, len(SHELL_ORDER)),
+            "status": STATUS_ORDER.get(status, len(STATUS_ORDER)),
+            "phase": PHASE_ORDER.get(phase, len(PHASE_ORDER)),
+            "exit": _sort_number(exit_code),
+            "stdout": _sort_number(stdout),
+            "stderr": _sort_number(stderr),
+            "started_at": _sort_number(start),
+            "finished_at": _sort_number(finish),
+        }
+        rows.append(Row(key, values, tag, sort_values))
     if collection == "projects":
-        rows.sort(key=lambda row: row[0].casefold())
-    else:
-        # The API lists commands in insertion order. Keep IDs as opaque strings.
-        rows.reverse()
+        rows.sort(key=lambda row: row.key.casefold())
     return rows, ""
 
 
@@ -444,6 +483,10 @@ class StatusTable(tk.Frame):
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scroll.set)
+        self._command_table = columns == COMMAND_COLUMNS
+        self._sort_column = "id"
+        self._descending = True
+        self._headings = {key: label for key, label, _, _ in columns}
         cell_font = tkfont.Font(root=self, family=FONT, size=10)
         examples = {
             "mode": "PowerShell",
@@ -460,13 +503,18 @@ class StatusTable(tk.Frame):
             )
             width = max(width, cell_font.measure(examples.get(key, label)) + 16)
             self.tree.heading(key, text=label, anchor=anchor)
+            if self._command_table:
+                width = max(width, cell_font.measure(f"{label} ▼") + 16)
+                self.tree.heading(key, command=partial(self._sort_by, key))
             self.tree.column(
                 key, width=width, minwidth=width, stretch=stretch, anchor=anchor
             )
+        if self._command_table:
+            self._show_sort_heading()
         for tag, color in STATUS_COLORS.items():
             self.tree.tag_configure(tag, foreground=color)
         self.tree.tag_configure("stripe", background=HEADER)
-        if columns == COMMAND_COLUMNS:
+        if self._command_table:
             self.horizontal = ttk.Scrollbar(
                 body, orient="horizontal", command=self.tree.xview
             )
@@ -488,6 +536,24 @@ class StatusTable(tk.Frame):
     def _place_empty(self) -> None:
         self.empty_message.place(relx=0.5, rely=0.62, relwidth=0.9, anchor="center")
 
+    def _show_sort_heading(self) -> None:
+        arrow = "▼" if self._descending else "▲"
+        column = self._sort_column
+        self.tree.heading(column, text=f"{self._headings[column]} {arrow}")
+
+    def _sort_by(self, column: str) -> None:
+        if column == self._sort_column:
+            self._descending = not self._descending
+        else:
+            self.tree.heading(self._sort_column, text=self._headings[self._sort_column])
+            self._sort_column = column
+            self._descending = False
+        self._show_sort_heading()
+        self._render_rows(self._rendered, reset=False)
+        selected = self.tree.selection()
+        if selected:
+            self.tree.see(selected[0])
+
     def show_rows(
         self, rows: list[Row], error: str = "", *, reset: bool = False
     ) -> None:
@@ -495,21 +561,7 @@ class StatusTable(tk.Frame):
             self.summary.set_text(f"暂不可用 · 保留上次 {len(self._rendered)} 条")
             self.summary.configure(fg=AMBER)
             return
-        if reset or rows != self._rendered:
-            old = self.tree.get_children()
-            ids = {key for key, _, _ in rows}
-            for key in old:
-                if reset or key not in ids:
-                    self.tree.delete(key)
-            for index, (key, values, status) in enumerate(rows):
-                tags = (status, "stripe") if index % 2 else (status,)
-                if self.tree.exists(key):
-                    self.tree.item(key, values=values, tags=tags)
-                    if self.tree.index(key) != index:
-                        self.tree.move(key, "", index)
-                else:
-                    self.tree.insert("", index, iid=key, values=values, tags=tags)
-            self._rendered = rows
+        self._render_rows(rows, reset=reset)
         self.summary.set_text("不可用" if error else f"{len(rows)} 条记录")
         self.summary.configure(fg=AMBER if error else MUTED)
         if rows:
@@ -517,6 +569,25 @@ class StatusTable(tk.Frame):
         else:
             self.empty_message.set_text(error or "暂无记录")
             self._place_empty()
+
+    def _render_rows(self, rows: list[Row], *, reset: bool) -> None:
+        if self._command_table:
+            rows = _sort_commands(rows, self._sort_column, self._descending)
+        if not reset and rows == self._rendered:
+            return
+        ids = {row.key for row in rows}
+        for key in self.tree.get_children():
+            if reset or key not in ids:
+                self.tree.delete(key)
+        for index, row in enumerate(rows):
+            tags = (row.status, "stripe") if index % 2 else (row.status,)
+            if self.tree.exists(row.key):
+                self.tree.item(row.key, values=row.values, tags=tags)
+                if self.tree.index(row.key) != index:
+                    self.tree.move(row.key, "", index)
+            else:
+                self.tree.insert("", index, iid=row.key, values=row.values, tags=tags)
+        self._rendered = rows
 
 
 def _status(data: JsonObject) -> str:
