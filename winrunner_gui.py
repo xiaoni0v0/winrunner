@@ -41,6 +41,7 @@ INSET = "#101a27"
 RAISED = "#213249"
 HOVER = "#2b4058"
 BORDER = "#2c3d51"
+COLUMN_DIVIDER = "#6b86a1"
 INK = "#edf4fa"
 MUTED = "#a5b6c8"
 TEAL = "#65e0cd"
@@ -855,14 +856,16 @@ def _apply_theme(root: tk.Tk) -> None:
         "Treeview.Heading",
         background=RAISED,
         foreground=MUTED,
-        bordercolor=RAISED,
-        lightcolor=RAISED,
-        darkcolor=RAISED,
-        relief="flat",
-        padding=(7, 5),
+        # Paint the border on the native heading so it follows its drag hitbox.
+        borderwidth=1,
+        bordercolor=COLUMN_DIVIDER,
+        lightcolor=COLUMN_DIVIDER,
+        darkcolor=COLUMN_DIVIDER,
+        relief="solid",
+        padding=(7, 4),
         font=(FONT, 9, "bold"),
     )
-    style.map("Treeview.Heading", background=[("active", RAISED)])
+    style.map("Treeview.Heading", background=[("active", HOVER)])
     style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 3))
     style.configure(
         "TNotebook.Tab",

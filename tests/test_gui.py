@@ -214,6 +214,34 @@ class IntegratedTests(unittest.TestCase):
 
 
 class TkLayoutTests(unittest.TestCase):
+    def test_command_table_heading_divider_is_a_native_resize_handle(self) -> None:
+        try:
+            root = gui.tk.Tk()
+        except gui.tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        root.geometry("620x220")
+        gui._apply_theme(root)
+        table = gui.StatusTable(root, "命令", gui.COMMAND_COLUMNS)
+        table.pack(fill="both", expand=True)
+        root.update()
+
+        tree = table.tree
+        original = tree.column("id", "width")
+        x, y = original - 1, 10
+        self.assertEqual(tree.identify_region(x, y), "separator")
+        tree.event_generate("<Motion>", x=x, y=y)
+        self.assertTrue(tree.cget("cursor"))
+        tree.event_generate("<ButtonPress-1>", x=x, y=y)
+        tree.event_generate("<B1-Motion>", x=x + 36, y=y)
+        tree.event_generate("<ButtonRelease-1>", x=x + 36, y=y)
+        root.update()
+
+        resized = tree.column("id", "width")
+        self.assertGreater(resized, original)
+        self.assertEqual(tree.identify_region(resized - 1, y), "separator")
+        self.assertEqual(tree.heading("id", "text"), "ID ▼")
+
     def test_command_table_header_click_sorts_and_refresh_keeps_selection(self) -> None:
         try:
             root = gui.tk.Tk()
