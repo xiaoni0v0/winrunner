@@ -30,6 +30,8 @@ PS_SINGLE_QUOTES = str.maketrans(
     {quote: quote * 2 for quote in "'\u2018\u2019\u201a\u201b"}
 )
 BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+ACTIVE_TASK_STATUSES = frozenset({"preparing", "running", "cancelling"})
+TERMINAL_TASK_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 
 
 def short_command_id(number: int) -> str:
@@ -315,6 +317,8 @@ class Task:
         self.output = {"stdout": bytearray(), "stderr": bytearray()}
         self.command_id, self.mode = command_id, mode
         self.deleting = False
+        self.command_stop_lock = threading.Lock()
+        self.command_stop_sent = False
 
     def stage(self, phase):
         with self.lock:
@@ -360,6 +364,15 @@ class Task:
         else:
             self.job.cancel()
 
+    def stop_command(self):
+        # Concurrent cancel/DELETE calls share a successful termination request.
+        # If the native request fails, the next caller may retry it.
+        with self.command_stop_lock:
+            if not self.command_stop_sent:
+                self.cancel()
+                self.command_stop_sent = True
+        self.done.wait()
+
     def finish(
         self, *, exit_code=None, error=None, source=None, stdout=b"", stderr=b""
     ):
@@ -392,8 +405,9 @@ class Task:
             self.finished_at = time.time_ns() // 1_000_000
             self.done.set()
 
-    def snapshot(self, offsets=None, limit=65536):
+    def snapshot(self, offsets=None, limit=65536, *, tails=None):
         offsets = offsets or {}
+        tails = tails or {}
         with self.lock:
             result = {
                 "status": self.status,
@@ -410,15 +424,21 @@ class Task:
                 result["commit"] = self.commit
             else:
                 result.update(id=self.command_id, mode=self.mode)
-            for stream, offset in offsets.items():
+            for stream in offsets.keys() | tails.keys():
                 output = self.output[stream]
+                tail = tails.get(stream)
+                offset = offsets[stream] if tail is None else max(0, len(output) - tail)
                 if offset > len(output):
                     raise APIError(
                         400,
                         "invalid_offset",
                         f"{stream}_offset exceeds the stored length",
                     )
-                chunk = output[offset : offset + limit]
+                chunk = (
+                    output[offset:]
+                    if tail is not None
+                    else output[offset : offset + limit]
+                )
                 result[stream] = {
                     "data_base64": base64.b64encode(chunk).decode("ascii"),
                     "next_offset": offset + len(chunk),
@@ -436,9 +456,7 @@ class Task:
         result = self.snapshot()
         if self.action_id is not None:
             result["action_id"] = self.action_id
-        status = (
-            200 if result["status"] in ("succeeded", "failed", "cancelled") else 202
-        )
+        status = 200 if result["status"] in TERMINAL_TASK_STATUSES else 202
         return status, result
 
 
@@ -931,6 +949,7 @@ class Runner:
         include_input=False,
         expected_scope: str | None = None,
         expected_action: str | None = None,
+        tails=None,
     ):
         with self.lock:
             project = self._selected_project(name, expected_scope)
@@ -943,7 +962,7 @@ class Runner:
                 raise APIError(
                     409, "action_changed", "The selected Action was replaced"
                 )
-            result = task.snapshot(offsets, limit)
+            result = task.snapshot(offsets, limit, tails=tails)
             if include_input:
                 result["action_id"] = task.action_id
             return result
@@ -1066,19 +1085,39 @@ class Runner:
         finally:
             task.finish(**result)
 
-    def list_commands(self, *, name=None):
+    def list_commands(self, *, name=None, statuses=None):
         with self.lock:
-            return [task.snapshot() for task in self._commands(name).values()]
+            if statuses is None:
+                return [task.snapshot() for task in self._commands(name).values()]
+            result = []
+            for task in self._commands(name).values():
+                with task.lock:
+                    if task.status in statuses:
+                        result.append(task.snapshot())
+            return result
 
     def get_command(
-        self, command_id, offsets=None, limit=65536, *, name=None, include_input=False
+        self,
+        command_id,
+        offsets=None,
+        limit=65536,
+        *,
+        name=None,
+        include_input=False,
+        tails=None,
     ):
         with self.lock:
             task = self._command(self._commands(name), command_id)
-            result = task.snapshot(offsets, limit)
+            result = task.snapshot(offsets, limit, tails=tails)
             if include_input:
                 result["command"] = task.command
             return result
+
+    def cancel_command(self, command_id, *, name=None):
+        with self.lock:
+            self._available()
+            task = self._command(self._commands(name), command_id)
+        task.stop_command()
 
     def delete_command(self, command_id, *, name=None):
         with self.lock:
@@ -1089,8 +1128,7 @@ class Runner:
                 raise conflict("Command deletion is already in progress")
             task.deleting = True
         try:
-            self._cancel_task(task)
-            task.done.wait()
+            task.stop_command()
         except BaseException:
             with self.lock:
                 task.deleting = False

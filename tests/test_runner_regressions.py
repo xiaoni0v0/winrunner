@@ -649,6 +649,114 @@ class RunnerRegressions(unittest.TestCase):
         self.assertTrue(project.commands["0"].done.wait(WAIT))
         self.model.delete_project(project.name)
 
+    def test_filter_matches_snapshot_status_and_tail_can_resume_incrementally(self):
+        project = self.create()
+        for index, status in enumerate(
+            ("preparing", "running", "cancelling", "succeeded", "failed", "cancelled")
+        ):
+            task = runner.Task("run", command_id=str(index))
+            task.status = status
+            self.model.commands[str(index)] = task
+        task = self.model.commands["1"]
+        project.commands["0"] = runner.Task("validate", command_id="0")
+        task.append("stdout", b"abc\x00\xff")
+        task.append("stderr", b"1234")
+        self.assertEqual(
+            [
+                row["id"]
+                for row in self.model.list_commands(
+                    statuses=runner.ACTIVE_TASK_STATUSES
+                )
+            ],
+            ["0", "1", "2"],
+        )
+        self.assertEqual(
+            self.model.list_commands(name=project.name, statuses={"running"}), []
+        )
+        self.assertEqual(
+            [row["id"] for row in self.model.list_commands(statuses={"cancelled"})],
+            ["5"],
+        )
+        snapshot = self.model.get_command("1", {"stderr": 1}, 2, tails={"stdout": 3})
+        self.assertEqual(
+            base64.b64decode(snapshot["stdout"]["data_base64"]), b"c\x00\xff"
+        )
+        self.assertEqual(snapshot["stdout"]["next_offset"], snapshot["stdout_bytes"])
+        self.assertEqual(base64.b64decode(snapshot["stderr"]["data_base64"]), b"23")
+        task.append("stdout", b"new")
+        continued = self.model.get_command(
+            "1", {"stdout": snapshot["stdout"]["next_offset"]}
+        )
+        self.assertEqual(base64.b64decode(continued["stdout"]["data_base64"]), b"new")
+        empty = self.model.get_command("0", name=project.name, tails={"stderr": 10})
+        self.assertEqual(empty["stderr"], {"data_base64": "", "next_offset": 0})
+        self.assertNotIn("stdout", empty)
+
+    def test_concurrent_command_cancel_waits_and_keeps_same_terminal_snapshot(self):
+        running, terminating, release = (threading.Event() for _ in range(3))
+
+        def active_process(*args, on_started, stdout, **kwargs):
+            on_started()
+            stdout(b"keep")
+            running.set()
+            self.assertTrue(release.wait(2 * WAIT))
+            raise runner.JobCancelled(exit_code=23)
+
+        def force_stop():
+            terminating.set()
+            self.assertTrue(release.wait(2 * WAIT))
+
+        self.job.run.side_effect = active_process
+        self.job.cancel.side_effect = force_stop
+        submitted = self.background(self.model.start_command, COMMAND, time.monotonic())
+        try:
+            self.assertTrue(running.wait(WAIT))
+            first = self.background(self.model.cancel_command, "0")
+            self.assertTrue(terminating.wait(WAIT))
+            second = self.background(self.model.cancel_command, "0")
+            self.assertEqual(self.model.get_command("0")["status"], "cancelling")
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+        finally:
+            release.set()
+        first.result(timeout=WAIT)
+        second.result(timeout=WAIT)
+        submitted.result(timeout=WAIT)
+        final = self.model.get_command("0", OFFSETS)
+        self.assertEqual((final["status"], final["exit_code"]), ("cancelled", 23))
+        self.assertEqual(base64.b64decode(final["stdout"]["data_base64"]), b"keep")
+        self.model.cancel_command("0")
+        self.assertEqual(self.model.get_command("0", OFFSETS), final)
+        self.job.cancel.assert_called_once_with()
+        self.model.delete_command("0")
+        self.assert_api_error(404, "not_found", self.model.cancel_command, "0")
+
+    def test_failed_force_cancel_can_be_retried_without_deleting_command(self):
+        running, release = threading.Event(), threading.Event()
+
+        def active_process(*args, on_started, **kwargs):
+            on_started()
+            running.set()
+            self.assertTrue(release.wait(2 * WAIT))
+            raise runner.JobCancelled()
+
+        self.job.run.side_effect = active_process
+        self.model.start_command(
+            COMMAND.replace(b'"timeout":30', b'"timeout":0'), time.monotonic()
+        )
+        try:
+            self.assertTrue(running.wait(WAIT))
+            self.job.cancel.side_effect = OSError("termination failed")
+            with self.assertRaisesRegex(OSError, "termination failed"):
+                self.model.cancel_command("0")
+            self.assertEqual(self.model.get_command("0")["status"], "cancelling")
+            self.job.cancel.side_effect = release.set
+            self.background(self.model.cancel_command, "0").result(timeout=WAIT)
+            self.assertEqual(self.model.get_command("0")["status"], "cancelled")
+            self.assertEqual(self.job.cancel.call_count, 2)
+        finally:
+            release.set()
+
     def test_cancelled_command_reports_reaped_exit_code(self):
         # #06: DELETE cancels while the caller is still waiting for the command result.
         running, release = threading.Event(), threading.Event()

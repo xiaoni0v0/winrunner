@@ -522,6 +522,114 @@ class HTTPRegressionTests(unittest.TestCase):
         status, body, _ = self.request("GET", "/projects")
         self.assertEqual((status, body), (200, {"projects": []}))
 
+    def test_command_list_status_filters_apply_only_to_get(self):
+        self.start_server()
+        self.runner.list_commands.return_value = []
+        statuses = (
+            "preparing",
+            "running",
+            "cancelling",
+            "succeeded",
+            "failed",
+            "cancelled",
+        )
+        for endpoint, project in (
+            ("/commands", None),
+            ("/projects/demo/commands", "demo"),
+        ):
+            for selected in (*statuses, "active", None):
+                with self.subTest(endpoint=endpoint, status=selected):
+                    query = f"?status={selected}" if selected else ""
+                    status, body, _ = self.request("GET", endpoint + query)
+                    self.assertEqual((status, body), (200, {"commands": []}))
+                    options = (
+                        {
+                            "statuses": frozenset(
+                                statuses[:3] if selected == "active" else [selected]
+                            )
+                        }
+                        if selected
+                        else {}
+                    )
+                    self.runner.list_commands.assert_called_with(
+                        name=project, **options
+                    )
+            for method, query in (
+                ("GET", "?status=RUNNING"),
+                ("GET", "?status="),
+                ("GET", "?status=active&status=running"),
+                ("GET", "?status=active&other=1"),
+                ("POST", "?status=active"),
+            ):
+                self.runner.reset_mock()
+                status, body, _ = self.request(method, endpoint + query)
+                self.assertEqual(
+                    (status, body["error"]["code"]), (400, "invalid_request")
+                )
+                self.assertEqual(self.runner.mock_calls, [])
+
+    def test_log_tail_routes_validate_and_allow_other_stream_offset(self):
+        self.start_server()
+        for path, getter, args, kwargs in (
+            ("/commands/1", self.runner.get_command, ("1",), {"name": None}),
+            (
+                "/projects/demo/commands/1",
+                self.runner.get_command,
+                ("1",),
+                {"name": "demo"},
+            ),
+            ("/projects/demo/actions", self.runner.get_action, ("demo",), {}),
+        ):
+            with self.subTest(path=path):
+                getter.return_value = {"status": "running"}
+                status, _, _ = self.request(
+                    "GET",
+                    path
+                    + "?stdout_tail=1048576&stderr_offset=10&limit=20&include_input=1",
+                )
+                self.assertEqual(status, 200)
+                getter.assert_called_with(
+                    *args,
+                    {"stderr": 10},
+                    20,
+                    tails={"stdout": 1048576},
+                    include_input=True,
+                    **kwargs,
+                )
+                getter.reset_mock()
+                for query in (
+                    "stdout_tail=0",
+                    "stdout_tail=-1",
+                    "stderr_tail=1048577",
+                    "stderr_tail=",
+                    "stdout_tail=3&stdout_offset=0",
+                    "stderr_tail=3&stderr_tail=4",
+                ):
+                    status, body, _ = self.request("GET", path + "?" + query)
+                    self.assertEqual(
+                        (status, body["error"]["code"]), (400, "invalid_request")
+                    )
+                getter.assert_not_called()
+
+    def test_cancel_routes_are_exact_and_require_empty_post(self):
+        self.start_server()
+        for endpoint, project in (
+            ("/commands/a/cancel", None),
+            ("/projects/demo/commands/a/cancel", "demo"),
+        ):
+            self.runner.reset_mock()
+            status, body, _ = self.request("POST", endpoint)
+            self.assertEqual((status, body), (204, b""))
+            self.runner.cancel_command.assert_called_once_with("a", name=project)
+            self.runner.delete_command.assert_not_called()
+            self.runner.reset_mock()
+            status, _, headers = self.request("GET", endpoint)
+            self.assertEqual((status, headers["Allow"]), (405, "POST"))
+            self.assertEqual(self.request("POST", endpoint + "?force=1")[0], 400)
+            self.assertEqual(self.request("POST", endpoint, payload=b"{}")[0], 400)
+            self.assertEqual(self.request("POST", endpoint + "/extra")[0], 404)
+            self.assertEqual(self.runner.mock_calls, [])
+
     def test_known_routes_reject_unsupported_methods_after_auth(self):
         self.start_server()
         cases = [

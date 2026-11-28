@@ -24,11 +24,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socket import SHUT_RDWR
 from threading import BoundedSemaphore, Lock
-from typing import cast
+from typing import Any, cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import config
-from runner import APIError, Runner, invalid, json_value, not_found
+from runner import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_TASK_STATUSES,
+    APIError,
+    Runner,
+    invalid,
+    json_value,
+    not_found,
+)
 from winprocess import CpuSampler, health
 from winrunner_files import directory_listing, range_bounds
 
@@ -150,26 +158,34 @@ def uint(text, name):
     raise invalid(f"{name} must be a non-negative integer")
 
 
-def log_params(query):
-    offsets = {}
-    for stream in ("stdout", "stderr"):
-        key = stream + "_offset"
-        if key in query:
-            offsets[stream] = uint(query[key], key)
-    limit = uint(query.get("limit", "65536"), "limit")
-    if not 1 <= limit <= 1048576:
-        raise invalid("limit must be between 1 and 1048576")
-    if query.keys() - {"stdout_offset", "stderr_offset", "limit"}:
-        raise invalid("Unexpected query parameter")
-    return offsets, limit
-
-
 def task_query(query):
     query = dict(query)
     include_input = query.pop("include_input", None)
     if include_input not in (None, "1"):
         raise invalid("include_input must be 1")
-    return log_params(query), {"include_input": True} if include_input else {}
+    offsets, tails = {}, {}
+    for stream in ("stdout", "stderr"):
+        offset_key, tail_key = stream + "_offset", stream + "_tail"
+        offset = query.pop(offset_key, None)
+        tail = query.pop(tail_key, None)
+        if offset is not None and tail is not None:
+            raise invalid(f"{offset_key} and {tail_key} cannot be combined")
+        if offset is not None:
+            offsets[stream] = uint(offset, offset_key)
+        if tail is not None:
+            size = uint(tail, tail_key)
+            if not 1 <= size <= 1048576:
+                raise invalid(f"{tail_key} must be between 1 and 1048576")
+            tails[stream] = size
+    limit = uint(query.pop("limit", "65536"), "limit")
+    if not 1 <= limit <= 1048576:
+        raise invalid("limit must be between 1 and 1048576")
+    if query:
+        raise invalid("Unexpected query parameter")
+    options: dict[str, Any] = {"include_input": True} if include_input else {}
+    if tails:
+        options["tails"] = tails
+    return (offsets, limit), options
 
 
 @dataclass
@@ -595,9 +611,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
     def route(self, method, parts, raw_query):
         key = (parts[0], None, *parts[2:]) if len(parts) > 1 else tuple(parts)
-        if len(parts) == 4:
+        if len(parts) >= 4 and parts[0] == "projects":
             # Project command items have a second variable path segment.
-            key = (*key[:3], None)
+            key = (*key[:3], None, *key[4:])
         route = self.routes.get(key)
         if route is None:
             self.operation = "unknown route"
@@ -613,7 +629,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.operation = f"{method} {route_name}"
         name = parts[1] if len(parts) > 1 else None
         self.note("project" if parts[0] == "projects" else "id", name)
-        extra = parts[3:]
+        extra = parts[3:4] if parts[0] == "projects" else []
         if extra:
             self.note("id", extra[0])
         query = self.parse_query(raw_query)
@@ -706,11 +722,22 @@ class HTTPHandler(BaseHTTPRequestHandler):
             pass  # The client may have already disconnected.
 
     def commands(self, method, name, query):
-        self.no_query(query)
         runner = self.server.runner
         if method == "GET":
-            self.reply(200, {"commands": runner.list_commands(name=name)})
+            status = query.pop("status", None)
+            self.no_query(query)
+            options = {}
+            if status == "active":
+                options["statuses"] = ACTIVE_TASK_STATUSES
+            elif status in ACTIVE_TASK_STATUSES | TERMINAL_TASK_STATUSES:
+                options["statuses"] = frozenset({status})
+            elif status is not None:
+                raise invalid(
+                    "status must be active, preparing, running, cancelling, succeeded, failed, or cancelled"
+                )
+            self.reply(200, {"commands": runner.list_commands(name=name, **options)})
         else:
+            self.no_query(query)
             raw = self.raw_body()
             accepted_at = time.monotonic()
             self.note_body(raw, "mode", "timeout")
@@ -739,6 +766,15 @@ class HTTPHandler(BaseHTTPRequestHandler):
             runner.delete_command(command_id, name=name)
             self.reply(204)
 
+    def command_cancel(self, _method, name, query, command_id=None):
+        if command_id is None:
+            command_id, name = name, None
+        self.no_query(query)
+        if self.raw_body():
+            raise invalid("Command cancellation does not accept a request body")
+        self.server.runner.cancel_command(command_id, name=name)
+        self.reply(204)
+
     routes: dict[
         tuple[str | None, ...], tuple[tuple[str, ...], Callable[..., None]]
     ] = {
@@ -749,8 +785,10 @@ class HTTPHandler(BaseHTTPRequestHandler):
         ("projects", None, "files"): (("GET",), project_files),
         ("projects", None, "commands"): (("GET", "POST"), commands),
         ("projects", None, "commands", None): (("GET", "DELETE"), command_task),
+        ("projects", None, "commands", None, "cancel"): (("POST",), command_cancel),
         ("commands",): (("GET", "POST"), commands),
         ("commands", None): (("GET", "DELETE"), command_task),
+        ("commands", None, "cancel"): (("POST",), command_cancel),
     }
 
     @staticmethod

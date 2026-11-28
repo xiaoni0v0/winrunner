@@ -577,6 +577,29 @@ class CommandIntegrationTests(RunnerCase):
         self.call(204, "DELETE", other_endpoint)
         self.assertEqual(self.call(200, "GET", "/commands")["commands"], [])
 
+    def test_cancel_kills_the_process_tree_but_keeps_record_and_logs(self):
+        endpoint = self.launch_tree_command()
+        command_id = endpoint.rsplit("/", 1)[-1]
+        with self.live_tree(endpoint) as assert_stopped:
+            tail = self.call(200, "GET", endpoint + "?stdout_tail=8")
+            self.assertEqual(len(log_bytes(tail, "stdout")), 8)
+            self.assertEqual(tail["stdout"]["next_offset"], tail["stdout_bytes"])
+            active = self.call(200, "GET", "/commands?status=active")["commands"]
+            self.assertEqual([task["id"] for task in active], [command_id])
+            self.call(204, "POST", endpoint + "/cancel")
+            assert_stopped()
+        cancelled = self.finished(endpoint, expected="cancelled")
+        self.assertIn(b"TREE ", log_bytes(cancelled, "stdout"))
+        self.call(204, "POST", endpoint + "/cancel")
+        self.assertEqual(self.finished(endpoint, expected="cancelled"), cancelled)
+        self.assertEqual(
+            self.call(200, "GET", "/commands?status=active"), {"commands": []}
+        )
+        terminal = self.call(200, "GET", "/commands?status=cancelled")["commands"]
+        self.assertEqual([task["id"] for task in terminal], [command_id])
+        self.call(204, "DELETE", endpoint)
+        self.call(404, "POST", endpoint + "/cancel")
+
     def test_restart_terminates_live_processes_and_does_not_restore_commands(self):
         run_id = self.call(200, "GET", "/health")["run_id"]
         self.assertRegex(run_id, r"\A[0-9a-f]{32}\Z")
@@ -957,6 +980,37 @@ class ProjectIntegrationTests(RunnerCase):
             self.call(204, "DELETE", project)
             second_stopped()
         self.call(404, "GET", second_url)
+
+    def test_cancel_project_command_does_not_stop_another_command(self):
+        project = self.register()
+        commands = project + "/commands"
+        completed = self.call(
+            200, "POST", commands, {"mode": "cmd", "command": "echo done"}
+        )
+        completed_url = commands + "/" + completed["id"]
+        tree = {
+            "mode": "cmd",
+            "command": f'"{sys.executable}" -u tree.py',
+            "timeout": 0,
+        }
+        first = self.call(202, "POST", commands, tree)
+        second = self.call(202, "POST", commands, tree)
+        first_url, second_url = (
+            commands + "/" + task["id"] for task in (first, second)
+        )
+        with (
+            self.live_tree(first_url) as first_stopped,
+            self.live_tree(second_url) as second_stopped,
+        ):
+            self.call(204, "POST", first_url + "/cancel")
+            first_stopped()
+            self.call(204, "POST", completed_url + "/cancel")
+            self.assertEqual(self.call(200, "GET", completed_url), completed)
+            self.assertEqual(self.call(200, "GET", first_url)["status"], "cancelled")
+            running = self.call(200, "GET", commands + "?status=running")["commands"]
+            self.assertEqual([task["id"] for task in running], [second["id"]])
+            self.call(204, "DELETE", project)
+            second_stopped()
 
     def test_action_conflict_cancel_preserves_logs_and_invalid_request_replaces_round(
         self,
