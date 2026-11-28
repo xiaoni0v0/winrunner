@@ -81,9 +81,9 @@ test('only a post-dispatch cancellation of a write adds the reconciliation warni
   const client = await fixture(t)
   const { finalizeContent } = client.tools.get('winrunner_command')
   const aborted = { error: { info: { code: 'ABORTED' } }, content: [{ type: 'text', text: 'Aborted' }] }
-  assert.match(finalizeContent({ args: { op: 'start' } }, aborted)[1].text, /不要盲目重试/)
-  assert.equal(finalizeContent({ args: { op: 'wait' } }, aborted), undefined)
-  assert.equal(finalizeContent({ args: { op: 'start' } }, { ...aborted, error: { info: { code: 'ABORTED_BEFORE_DISPATCH' } } }), undefined)
+  assert.match(finalizeContent({ arguments: { op: 'start' } }, aborted)[1].text, /不要盲目重试/)
+  assert.equal(finalizeContent({ arguments: { op: 'wait' } }, aborted), undefined)
+  assert.equal(finalizeContent({ arguments: { op: 'start' } }, { ...aborted, error: { info: { code: 'ABORTED_BEFORE_DISPATCH' } } }), undefined)
 })
 
 test('health preserves all CPU windows, including zero and missing samples', async t => {
@@ -250,7 +250,7 @@ test('maps project, action and command endpoints, preserves task and HTTP error 
   assert.equal((await client.run('command', { op: 'delete', id: 'id1' })).http_status, 204)
   assert.deepEqual(seen.map(([method, path]) => `${method} ${path}`), [
     'GET /projects', 'POST /projects/demo', 'GET /projects/demo', 'DELETE /projects/demo',
-    'POST /projects/demo/actions', 'GET /projects/demo/actions?stdout_offset=0&stderr_offset=0&limit=2048',
+    'POST /projects/demo/actions', 'GET /projects/demo/actions?include_input=1&stdout_offset=0&stderr_offset=0&limit=2048',
     'DELETE /projects/demo/actions', 'POST /commands', 'GET /commands', 'GET /commands/id1?stdout_offset=0&limit=4096', 'DELETE /commands/id1',
   ])
   assert.deepEqual(seen[1][2], { repo_url: 'https://example.invalid/repo.git' })
@@ -392,6 +392,45 @@ test('Action wait distinguishes separate runs of the same commit', async t => {
   sameAction = true
   hits = 0
   assert.equal((await client.run('action', args)).outcome, 'succeeded')
+})
+
+test('Action continuation hints bind the first read to the original round', async t => {
+  const client = await fixture(t)
+  const original = 'a'.repeat(32)
+  const replacement = 'b'.repeat(32)
+  let current = original
+  let reads = 0
+  await client.configure(await server(t, (req, res) => {
+    const url = new URL(req.url, 'http://localhost')
+    assert.equal(url.pathname, '/projects/demo/actions')
+    if (req.method === 'POST') return json(res, { action_id: original, status: 'preparing' }, 202)
+    reads++
+    assert.equal(url.searchParams.get('include_input'), '1')
+    const offset = Number(url.searchParams.get('stdout_offset') ?? 0)
+    json(res, { action_id: current, status: 'succeeded', commit: 'abcdef', stdout_bytes: 6, stderr_bytes: 0,
+      stdout: { data_base64: Buffer.from(offset === 0 ? 'abcd' : 'ef').toString('base64'), next_offset: offset === 0 ? 4 : 6 },
+      stderr: { data_base64: '', next_offset: 0 } })
+  }))
+  const start = await client.run('action', { op: 'start', params_json: JSON.stringify({
+    name: 'demo', commit: 'abcdef', interpreter: 'python', script: 'task.py', idempotency_key: 'same' }) })
+  assert.deepEqual(JSON.parse(start.next_wait.params_json), { name: 'demo', action_id: original })
+  current = replacement
+  const replaced = await client.run('action', start.next_wait)
+  assert.equal(replaced.error.code, 'task_changed')
+  assert.equal(replaced.stdout, undefined)
+  assert.equal(replaced.next_get, undefined)
+  assert.equal(reads, 1)
+  current = original
+  const firstPage = await client.run('action', { ...start.next_wait, params_json: JSON.stringify({
+    ...JSON.parse(start.next_wait.params_json), limit: 4 }) })
+  assert.deepEqual(JSON.parse(firstPage.next_get.params_json), { name: 'demo', action_id: original, stdout_offset: 4, limit: 4 })
+  assert.equal((await client.run('action', firstPage.next_get)).stdout.text, 'ef')
+  current = replacement
+  const page = await client.run('action', firstPage.next_get)
+  assert.equal(page.error.code, 'task_changed')
+  assert.equal(page.stdout, undefined)
+  current = undefined
+  assert.equal((await client.run('action', firstPage.next_get)).error.code, 'action_identity_unavailable')
 })
 
 test('a rejected command with an allocated ID provides a scoped lookup', async t => {
@@ -747,6 +786,34 @@ test('passes explicit idempotency keys without automatic retry or merging snapsh
     ['POST', '/commands', 'lost', { mode: 'ps', command: 'echo ok', timeout: 5 }],
     ['POST', '/projects/demo/actions', 'action', { commit: 'abc', interpreter: 'python', script: 'no.py', args: [], timeout: 0 }],
   ])
+})
+
+test('ambiguous JSON 5xx write results are unknown, but explicit Runner rejections are not', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res) => {
+    seen.push(req.method)
+    if (req.method === 'POST') {
+      assert.equal(req.headers['idempotency-key'], 'same')
+      return json(res, { error: { code: 'internal_error', message: 'Internal runner error' } }, 500)
+    }
+    if (req.method === 'DELETE') {
+      res.setHeader('Retry-After', '2')
+      return json(res, { error: { code: 'bad_gateway', message: 'Gateway error' } }, 502)
+    }
+    json(res, { error: { code: 'internal_error', message: 'Internal runner error' } }, 500)
+  }))
+  const start = await client.run('command', { op: 'start', mode: 'cmd', command: 'echo ok', idempotency_key: 'same' })
+  assert.equal(start.outcome, 'unknown')
+  assert.equal(start.outcome_unknown, true)
+  assert.equal(start.idempotency_key, 'same')
+  assert.equal(start.http_status, 500)
+  assert.match(start.note, /原键和原参数/)
+  const removed = await client.run('command', { op: 'delete', id: '0' })
+  assert.equal(removed.outcome, 'unknown')
+  assert.equal(removed.retry_after_seconds, 2)
+  assert.equal((await client.run('command', { op: 'get', id: '0' })).outcome, 'request_error')
+  assert.deepEqual(seen, ['POST', 'DELETE', 'GET'])
 })
 
 test('never follows redirects or retries mutations, and respects an already cancelled run', async t => {

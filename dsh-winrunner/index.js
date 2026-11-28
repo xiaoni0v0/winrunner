@@ -6,6 +6,7 @@ const modes = ['cmd', 'ps']
 const encodings = ['utf8', 'base64']
 const projectName = /^[a-z\d][a-z\d_-]{0,63}$/i
 const commandId = /^[a-z\d_-]{1,128}$/i
+const actionId = /^[a-f\d]{32}$/
 const hex = /^[a-f\d]{1,64}$/i
 const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
 const choice = (description, choices) => ({ type: 'string', description, enum: choices })
@@ -39,7 +40,7 @@ const groups = {
   action: {
     description: `提交、查询或取消项目的 Git Action。start 覆盖上轮工作区和日志；忙时返回 409。先取完旧日志和产物再提交下一轮。${taskFlow}`,
     ops: ['start', 'get', 'wait', 'cancel'],
-    params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。get/wait 可用 include_input:true 查询本轮 action_id。${taskOptions}${startKeyHelp}`,
+    params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。get/wait 可传 action_id，只接受那一轮的结果；续查提示会保留它。cancel 仍只按项目名取消当前轮。${taskOptions}${startKeyHelp}`,
   },
   command: {
     description: `运行和管理项目内或全局的 Windows 命令。项目命令不重置工作树，可与 Action 并行。cancel 强制终止进程树并保留记录和日志；delete 强制终止并删除。${taskFlow}`,
@@ -193,8 +194,11 @@ function forAction(args) {
     return request('POST', path, { body: { commit, interpreter, script, args: argv, timeout }, ...startOptions(args, timeout) })
   }
   if (args.op === 'get' || args.op === 'wait') {
-    select(args, ['name', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
-    return getTask(path, args, args.op === 'wait')
+    select(args, ['name', 'action_id', ...taskLogKeys, ...(args.op === 'wait' ? ['wait_seconds'] : [])])
+    const expectedAction = args.action_id === undefined ? undefined : match(args.action_id, actionId, 'action_id')
+    const allowIdentityFallback = expectedAction === undefined && !args.include_input &&
+      !streams.some(stream => args[`${stream}_tail`] !== undefined)
+    return { ...getTask(path, args, true), expectedAction, allowIdentityFallback }
   }
   select(args, ['name'])
   return request('DELETE', path, { deadline: 30000 })
@@ -233,7 +237,8 @@ const pollInterval = 1000
 const transientWaitErrors = new Set(['request_timeout', 'transport_error', 'wait_expired'])
 
 function taskTarget(group, args, body) {
-  if (group === 'action') return { name: args.name }
+  if (group === 'action') return { name: args.name,
+    ...(typeof body.action_id === 'string' && actionId.test(body.action_id) ? { action_id: body.action_id } : {}) }
   const command = args.id ?? body.id
   if (typeof command !== 'string' || !commandId.test(command)) return null
   return args.name === undefined ? { id: command } : { name: args.name, id: command }
@@ -290,7 +295,45 @@ async function withStartLogs(group, args, response, signal, call) {
   }
 }
 
-async function waitForTask(spec, seconds, signal, call, allowIdentityFallback) {
+function checkActionIdentity(response, expected) {
+  if (!response.ok || expected === undefined || response.action_id === expected) return
+  if (typeof response.action_id !== 'string') {
+    throw new ClientError('action_identity_unavailable', 'Runner 未返回 Action 轮次，无法确认这是原任务；没有返回该响应的日志。')
+  }
+  throw new ClientError('task_changed', '项目的 Action 已被替换；没有把新一轮当作原任务。')
+}
+
+function actionIdentityFallback(spec, response) {
+  if (!spec.allowIdentityFallback || response.http_status !== 400 || response.error?.code !== 'invalid_request' ||
+      !/^Unexpected query parameters?$/.test(response.error.message)) return null
+  // getTask always puts include_input first. Fall back only if no known ID is being checked.
+  const path = spec.path.replace(/\?include_input=1(?:&|$)/, match => match.endsWith('&') ? '?' : '')
+  return path === spec.path ? null : { ...spec, path, allowIdentityFallback: false }
+}
+
+async function checkActionOffset(response, spec, expected, signal, call) {
+  if (expected === undefined || response.error?.code !== 'invalid_offset') return
+  try {
+    const path = spec.path.split('?', 1)[0] + '?include_input=1'
+    const current = await requestRunner({ ...spec, path, logEncoding: undefined }, signal, call)
+    checkActionIdentity(current, expected)
+  } catch (error) {
+    if (!(error instanceof ClientError) || signal?.aborted ||
+        ['task_changed', 'runner_changed'].includes(error.code)) throw error
+    // A failed diagnostic probe must not hide the original offset error.
+  }
+}
+
+async function getTaskOnce(spec, signal, call) {
+  let response = await requestRunner(spec, signal, call)
+  const fallback = actionIdentityFallback(spec, response)
+  if (fallback) response = await requestRunner(fallback, signal, call)
+  checkActionIdentity(response, spec.expectedAction)
+  await checkActionOffset(response, spec, spec.expectedAction, signal, call)
+  return response
+}
+
+async function waitForTask(spec, seconds, signal, call) {
   const budget = AbortSignal.timeout(Math.ceil(seconds * 1000))
   const polling = signal ? AbortSignal.any([signal, budget]) : budget
   const interval = Math.min(pollInterval, seconds * 500)
@@ -298,31 +341,18 @@ async function waitForTask(spec, seconds, signal, call, allowIdentityFallback) {
   try {
     while (!polling.aborted) {
       let response = await requestRunner(spec, polling, call)
-      if (allowIdentityFallback && !last && response.http_status === 400 && response.error?.code === 'invalid_request' &&
-          response.error.message === 'Unexpected query parameter' && spec.path.includes('?include_input=1')) {
-        // Older Runner versions do not expose the Action identity query.
-        const path = spec.path.replace(/\?include_input=1(?:&|$)/, match => match.endsWith('&') ? '?' : '')
-        spec = { ...spec, path }
+      const fallback = !last && actionIdentityFallback(spec, response)
+      if (fallback) {
+        spec = fallback
         response = await requestRunner(spec, polling, call)
       }
+      const expected = spec.expectedAction ?? last?.action_id
       if (!response.ok) {
-        if (typeof last?.action_id === 'string' && response.error?.code === 'invalid_offset') {
-          try {
-            const path = spec.path.split('?', 1)[0] + '?include_input=1'
-            const current = await requestRunner({ ...spec, path, logEncoding: undefined }, polling, call)
-            if (current.ok && typeof current.action_id === 'string' && current.action_id !== last.action_id) {
-              throw new ClientError('task_changed', '等待期间项目的 Action 已被替换；未把新一轮当作原任务。')
-            }
-          } catch (error) {
-            if (!(error instanceof ClientError) || signal?.aborted ||
-                ['task_changed', 'runner_changed'].includes(error.code)) throw error
-            // A failed diagnostic probe must not hide the original offset error.
-          }
-        }
+        await checkActionOffset(response, spec, expected, polling, call)
         return response
       }
-      const replaced = typeof last?.action_id === 'string' && response.action_id !== last.action_id
-      if (replaced || (last?.commit && response.commit !== last.commit)) {
+      checkActionIdentity(response, expected)
+      if (last?.commit && response.commit !== last.commit) {
         throw new ClientError('task_changed', '等待期间项目的 Action 已被替换；未把新一轮当作原任务。')
       }
       if (!active.has(response.status)) return response
@@ -357,6 +387,12 @@ function toolResult(group, args, response) {
     if (body.error?.code === 'idempotency_pending') body.note = '同键的首次提交尚未返回；仅在同一 Runner 进程中稍后用原参数重试。'
   }
   if (!ok) {
+    if (body.outcome_unknown) {
+      body.note = args.op === 'start' && args.idempotency_key !== undefined
+        ? '不能确认提交结果。先核对同一台 Runner 的状态；仅确认是同一 Runner 进程和作用域时，才用原键和原参数恢复。'
+        : '不能确认本次写操作的结果；先在同一台 Runner 核对状态，不要盲目重试。'
+      return { ...body, outcome: 'unknown' }
+    }
     if (group === 'command' && args.op === 'cancel' && body.http_status === 404 &&
         body.error?.code === 'not_found' && body.error.message === 'Route not found') {
       body.note = '此 Runner 不支持仅取消；请升级服务端。没有尝试 delete。'
@@ -457,7 +493,7 @@ function definition(group, { description, ops, params }) {
     timeoutMs: 130000,
     finalizeContent(exec, result) {
       // DSH can replace execute's return value with a canonical abort after dispatch.
-      if (result.error?.info?.code === 'ABORTED' && ['start', 'create', 'delete', 'cancel'].includes(exec.args?.op)) {
+      if (result.error?.info?.code === 'ABORTED' && ['start', 'create', 'delete', 'cancel'].includes(exec.arguments?.op)) {
         return [...result.content, { type: 'text', text: '本地工具调用已取消，远端写操作可能已经生效。先在同一台 Runner 查询状态，不要盲目重试。' }]
       }
     },
@@ -472,9 +508,10 @@ function definition(group, { description, ops, params }) {
         const signal = exec?.signal
         const call = {}
         let response = args.op === 'wait'
-          ? await waitForTask(spec, waitSeconds(args), signal, call,
-            group === 'action' && !args.include_input && !streams.some(stream => args[`${stream}_tail`] !== undefined))
-          : await requestRunner(spec, signal, call)
+          ? await waitForTask(spec, waitSeconds(args), signal, call)
+          : group === 'action' && args.op === 'get'
+            ? await getTaskOnce(spec, signal, call)
+            : await requestRunner(spec, signal, call)
         if (spec.fileFallback && response.http_status === 400 && response.error?.code === 'invalid_request' &&
             response.error.message === 'entry_offset and entry_limit are only for directories') {
           response = await requestRunner(spec.fileFallback, signal, call)

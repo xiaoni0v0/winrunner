@@ -9,6 +9,12 @@ const CONFIG_LIMIT = 16 * 1024
 const JSON_LIMIT = 512 * 1024
 const INPUT_LIMIT = 1024 * 1024
 const INVALID_TOKEN_CHAR = /[^!-~]/
+// These Runner responses have a defined outcome, even when a task record exists.
+const knownWriteFailures = new Set([
+  '500 invalid_config', '500 validation_failed', '500 worker_unavailable',
+  '500 worker_unavailable_reset_incomplete', '502 git_clone_failed',
+  '503 idempotency_capacity', '503 server_busy', '503 shutting_down',
+])
 
 export class ClientError extends Error {
   constructor(code, message) {
@@ -233,7 +239,10 @@ export async function requestRunner(spec, signal, call = {}) {
       throw new ClientError('invalid_response', 'WinRunner 没有返回符合接口约定的错误对象。')
     }
     const retryAfter = integerHeader(response.headers['retry-after'])
-    return { ...body, ok, http_status: status, ...(retryAfter === undefined ? {} : { retry_after_seconds: retryAfter }) }
+    const outcomeUnknown = spec.method !== 'GET' && status >= 500 && status <= 599 &&
+      !knownWriteFailures.has(`${status} ${body.error?.code}`)
+    return { ...body, ok, http_status: status, ...(outcomeUnknown ? { outcome_unknown: true } : {}),
+      ...(retryAfter === undefined ? {} : { retry_after_seconds: retryAfter }) }
   } catch (error) {
     const failure = signal?.aborted
       ? new ClientError('cancelled', '本地请求已取消；已经提交的远端任务未必停止。')

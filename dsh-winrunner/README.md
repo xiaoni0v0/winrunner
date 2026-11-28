@@ -37,17 +37,17 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 - `get` / `wait` 不传日志选择参数时，从头预览两路日志（每路最多 2048 字节）。可用 `stdout_tail` / `stderr_tail` 取指定流最后 N 字节；同一路不能混用尾读和偏移，`limit` 仅控制偏移读取。尾读可能从行或字符中间开始；需要原始字节时用 `encoding: "base64"`。返回 `next_get` 或 `next_wait` 时可直接续读，续读用偏移而不是再取一次尾部。每路的 `remaining` 表示 `available`（有更多已存字节）、`caught_up`（暂时追平）或 `complete`（已读完）。
 - 只看状态用 `status_only: true`。`get` / `wait` 显式传 `include_input: true` 可查看命令原文（可能含敏感信息），或查询 Action 的 `action_id`；可与 `status_only` 一起用。正常的日志续读提示不再次请求命令原文。新版 Runner 返回 `started_at`（任务记录创建，含准备阶段）和 `finished_at`（进入终态，没结束为 `null`），都是 Unix 毫秒时间戳；旧版可能没有这两个字段。
 - 文件和目录有下一页时，直接把 `next_get` 传回 `winrunner_project`；原始偏移仍分别在 `next_offset` 和 `next_entry_offset`。UTF-8 页尾会尽量避开跨页字符；需要逐字节还原时用 `encoding: "base64"`。翻页不保证快照。`entry_offset` / `entry_limit` 由 Runner 处理，`entry_limit` 默认 100，最大 1000。文件的 `length` 和日志的 `limit` 在 UTF-8 模式下至少 4 字节，更小的页用 Base64。
-- `outcome_unknown: true` 表示写操作结果无法确认。超时或断线后，先在同一台 Runner 核对状态，不要盲目重试。项目创建用 `get` 和原 `name` 核对仓库地址与状态；同名创建不会覆盖已有项目。Action 可用项目名和计划提交哈希核对，但同一哈希的两次运行可能无法区分；命令提交响应里的 ID 丢失时，可在原命令集合用 `list` 查候选，但未必能唯一定位。
+- `outcome_unknown: true` 表示写操作结果无法确认。超时、断线，或收到无法明确判断结果的 `5xx` 后，先在同一台 Runner 核对状态，不要盲目重试。DSH 开始执行写操作后若取消本地工具调用，也会提示远端操作可能已生效。项目创建用 `get` 和原 `name` 核对仓库地址与状态；同名创建不会覆盖已有项目。Action 可用项目名和计划提交哈希核对，但同一哈希的两次运行可能无法区分；命令提交响应里的 ID 丢失时，可在原命令集合用 `list` 查候选，但未必能唯一定位。
 
 Action 和命令的 `start` 可选 `idempotency_key`（1–128 个字母、数字或 `._~-`）。新提交用新键。确认地址未变、Runner 未重启，且项目命令所属的项目未删除重建后，才用原键和原参数（包括 `wait_seconds`）重试；客户端不会自动重提。键只在本次 Runner 进程内有效，服务端最多记录 4096 个键。带键的响应是首次提交快照，可能不是当前状态；客户端不把当前日志合并进旧快照，另用返回的 `next_get` 或 `next_wait` 查询。同键正在处理时稍后用原键重试；已明确收到失败结果后若要发起新提交，应换新键。
 
-长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 只按项目名查询当前轮次，日志读完前不要对同一项目再次 `start`。同一次 Action `wait` 会检查轮次标记，避免把同一提交的新一轮误认为旧任务。`start` 的附带日志预览也会核对回执中的轮次标记；旧版 Runner 不提供该标记时，只能比较可见快照。跨工具调用仍由调用方核对目标，不会在每次轮询时另外调用 `health`。列表不分页；命令列表过大时优先用 `status: "active"` 或精确状态缩小范围，插件不会自动拉取全量列表。
+长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 的 `next_wait` / `next_get` 会保留已知的 `action_id`。手动续查时也可把该值传给工具的 `get` / `wait`；从第一次响应起就核对，轮次不同返回 `task_changed`，不返回其他轮次的日志。如果指定了轮次而响应没有标记，插件不会把它认作原任务。旧版 Runner 若从未返回轮次标记，仍可按项目名查当前轮次，但不能保证跨调用指向同一轮。`cancel` 仍按项目名操作当前轮次，日志读完前也不要对同一项目再次 `start`。插件不会在每次轮询时另外调用 `health`；命令 ID 和操作对象仍由调用方核对。列表不分页；命令列表过大时优先用 `status: "active"` 或精确状态缩小范围，插件不会自动拉取全量列表。
 
 收到 `429 auth_ip_banned` 时，`retry_after_seconds` 是封禁剩余秒数；先检查本机令牌配置，等待封禁到期再请求。插件不会自动重试。
 
 如果服务端还在 `b46ae98`，需要升级才能使用状态筛选、尾读和仅取消。旧版仍可无筛选列出命令、查询原文、按偏移读日志；插件不会把 `cancel` 降级成 `delete`。需要在旧版看尾部时，可先只查状态和日志字节数，再用 `max(字节数 - N, 0)` 作为偏移；这两次查询之间日志可能增长。
 
-例如 `start` 返回 `{"outcome":"pending","next_wait":{"op":"wait","params_json":"{\"name\":\"demo\"}"}}`，直接用同一个工具执行 `next_wait`。脚本退出码非零时，`outcome` 为 `failed`，即使 `http_status` 为 200。PowerShell 命令传原文，不用额外加一层引号或自行 Base64；CMD 语法与变量展开仍由 CMD 解释。
+例如 Action `start` 返回 `pending` 时，把 `next_wait`（包括 `params_json` 中的 `name` 和 `action_id`）原样传回同一个工具。脚本退出码非零时，`outcome` 为 `failed`，即使 `http_status` 为 200。PowerShell 命令传原文，不用额外加一层引号或自行 Base64；CMD 语法与变量展开仍由 CMD 解释。
 
 ## Git 复合操作
 
