@@ -368,7 +368,7 @@ class WinProcessTests(unittest.TestCase):
         self.assertFalse(started.is_set())
         self.assertEqual(self.out, b"")
 
-    def test_monitor_failure_keeps_primary_error_and_drains_logs(self):
+    def test_monitor_failure_keeps_primary_error_drains_logs_and_closes_job(self):
         for failed_operation, expected_log in (
             ("_QueryInformationJobObject", "Could not query the failed job"),
             ("_TerminateJobObject", "trying kill-on-close"),
@@ -441,11 +441,8 @@ class WinProcessTests(unittest.TestCase):
                     any(expected_log in line for line in diagnostics.output)
                 )
                 self.assertEqual((self.out, self.err), (b"out-tail", b"\xfferr-tail"))
-                if failed_operation == "_TerminateJobObject":
-                    with self.assertRaises(JobCancelled):
-                        self.run_python("pass")
-                else:
-                    self.assertEqual(self.run_python("pass"), 0)
+                with self.assertRaises(JobCancelled):
+                    self.run_python("pass")
 
     def test_double_cleanup_failure_keeps_work_pending_until_stop_succeeds(self):
         failure = RuntimeError("could not resume")

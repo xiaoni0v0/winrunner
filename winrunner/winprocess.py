@@ -447,8 +447,16 @@ def _monitor(
         with _cleanup_step("Could not stop the failed job"):
             accounting = abort()
         if accounting:
+            accounting = None
             with _cleanup_step("Could not query the failed job during cleanup"):
                 _wait_empty(has_processes)
+                accounting = True
+            if accounting is None:
+                # An unqueryable job cannot be safely reused. Kill on close
+                # rather than treating a termination request as confirmation.
+                with _cleanup_step("Could not close the unqueryable job"):
+                    abort(close=True)
+                    accounting = False
         if accounting is None:
             # Both termination and kill-on-close failed. Never publish a
             # finished task or forget this handle while members may be alive.
@@ -555,8 +563,12 @@ class Job:
                 raise C.WinError(C.get_last_error())
             return True
 
-    def _abort(self) -> bool:
+    def _abort(self, *, close: bool = False) -> bool:
         with self._lock:
+            if close:
+                self._closed = True
+                self._close_handle()
+                return False
             return self._terminate()
 
     def cancel(self) -> None:
