@@ -1,6 +1,6 @@
 # WinRunner 客户端（DeepSeek Harness）
 
-WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunner 服务端仍独立部署；此插件只发送已有 API 的请求。
+WinRunner 的 Host-only 客户端，不需要额外安装 Node 依赖。WinRunner 服务端仍独立部署；此插件只发送已有 API 的请求。
 
 ## 配置和安装
 
@@ -19,7 +19,7 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 
 工具只暴露 `op` 和 `params_json`。后者是该操作的 JSON 对象字符串，只写需要的字段；`health`、项目列表和全局命令列表填 `""` 或 `"{}"`。
 
-`health` 的 `cpu` 中，`usage_percent` 是瞬时值（最近约 1 秒），`usage_5s_percent` 和 `usage_60s_percent` 分别是过去 5 秒和 60 秒的时间加权平均。均为整机百分比（0–100），不是 0–1 比例；启动初期按已有样本计算，无有效样本时为 `null`，不代表 0%。
+`health` 的 `cpu` 中，`usage_percent` 是瞬时值（最近约 1 秒），`usage_5s_percent` 和 `usage_60s_percent` 分别是过去 5 秒和 60 秒的时间加权平均。均为整机百分比（0 至 100），不是 0 至 1 的比例；启动初期按已有样本计算，无有效样本时为 `null`，不代表 0%。
 
 | 工具 | `op` | 常用调用 |
 |---|---|---|
@@ -32,14 +32,14 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 项目命令从当前工作树启动，不重置目录、不覆盖已有日志。命令之间以及命令与 Action 可以并行，调用端需协调共享文件；Action 仍可能重置工作树。详见 [项目命令 API](<../docs/API.md#项目命令>)。
 
 - 短任务可以给 `start` 传 `wait_seconds: 5`。任务已结束且有输出时，客户端顺带读取两路短日志；如果补读失败，仍返回原任务结果，并单列 `logs_error`。`start` 默认不等（0 秒），最多等 60 秒；终态日志是额外的只读请求，最多再等 4 秒。
-- `pending` 时优先用返回的 `next_wait`，不要重复提交。`wait` 默认最多等 15 秒，可指定 1–60 秒。它把约每秒一次的查询合在一次工具调用里；等满还没结束时返回最后一次状态，标记 `wait_expired: true`；续接的 `next_wait` 回到默认 15 秒，不沿用本次的短等待上限。`start` 和 `wait` 的等待上限都不会停止远端任务。Action 和命令都可用 `cancel` 停止并保留记录和日志；命令的 `cancel` 强制终止进程树，可重复调用，不改已结束命令的状态。命令的 `cancel` 返回成功表示操作完成，不等于任务一定变成 `cancelled`；用返回的 `next_get` 核对。只有要丢弃命令记录和日志时才用 `delete`。
+- `pending` 时优先用返回的 `next_wait`，不要重复提交。`wait` 默认最多等 15 秒，可指定 1 至 60 秒。它把约每秒一次的查询合在一次工具调用里；等满还没结束时返回最后一次状态，标记 `wait_expired: true`；续接的 `next_wait` 回到默认 15 秒，不沿用本次的短等待上限。`start` 和 `wait` 的等待上限都不会停止远端任务。Action 和命令都可用 `cancel` 停止并保留记录和日志；命令的 `cancel` 强制终止进程树，可重复调用，不改已结束命令的状态。命令的 `cancel` 返回成功表示操作完成，不等于任务一定变成 `cancelled`；用返回的 `next_get` 核对。只有要丢弃命令记录和日志时才用 `delete`。
 - 优先读 `outcome`：`succeeded` / `failed` / `cancelled` 是任务终态；`pending` 表示仍在准备、运行或取消；`request_error` 表示请求失败，`unknown` 表示没有可靠结论。`http_status` 只用于诊断。任务的 `status`、`phase`、`output_source` 和 `error` 仍保留；请求错误也保留服务端提供的 `action` 诊断。
 - `get` / `wait` 不传日志选择参数时，从头预览两路日志（每路最多 2048 字节）。可用 `stdout_tail` / `stderr_tail` 取指定流最后 N 字节；同一路不能混用尾读和偏移，`limit` 仅控制偏移读取。尾读可能从行或字符中间开始；需要原始字节时用 `encoding: "base64"`。返回 `next_get` 或 `next_wait` 时可直接续读，续读用偏移而不是再取一次尾部。每路的 `remaining` 表示 `available`（有更多已存字节）、`caught_up`（暂时追平）或 `complete`（已读完）。
 - 只看状态用 `status_only: true`。`get` / `wait` 显式传 `include_input: true` 可查看命令原文（可能含敏感信息），或查询 Action 的 `action_id`；可与 `status_only` 一起用。正常的日志续读提示不再次请求命令原文。新版 Runner 返回 `started_at`（任务记录创建，含准备阶段）和 `finished_at`（进入终态，没结束为 `null`），都是 Unix 毫秒时间戳；旧版可能没有这两个字段。
 - 文件和目录有下一页时，直接把 `next_get` 传回 `winrunner_project`；原始偏移仍分别在 `next_offset` 和 `next_entry_offset`。UTF-8 页尾会尽量避开跨页字符；需要逐字节还原时用 `encoding: "base64"`。翻页不保证快照。`entry_offset` / `entry_limit` 由 Runner 处理，`entry_limit` 默认 100，最大 1000。文件的 `length` 和日志的 `limit` 在 UTF-8 模式下至少 4 字节，更小的页用 Base64。
 - `outcome_unknown: true` 表示写操作结果无法确认。超时、断线，或收到无法明确判断结果的 `5xx` 后，先在同一台 Runner 核对状态，不要盲目重试。DSH 开始执行写操作后若取消本地工具调用，也会提示远端操作可能已生效。项目创建用 `get` 和原 `name` 核对仓库地址与状态；同名创建不会覆盖已有项目。Action 可用项目名和计划提交哈希核对，但同一哈希的两次运行可能无法区分；命令提交响应里的 ID 丢失时，可在原命令集合用 `list` 查候选，但未必能唯一定位。
 
-Action 和命令的 `start` 可选 `idempotency_key`（1–128 个字母、数字或 `._~-`）。新提交用新键。确认地址未变、Runner 未重启，且项目命令所属的项目未删除重建后，才用原键和原参数（包括 `wait_seconds`）重试；客户端不会自动重提。键只在本次 Runner 进程内有效，服务端最多记录 4096 个键。带键的响应是首次提交快照，可能不是当前状态；客户端不把当前日志合并进旧快照，另用返回的 `next_get` 或 `next_wait` 查询。同键正在处理时稍后用原键重试；已明确收到失败结果后若要发起新提交，应换新键。
+Action 和命令的 `start` 可选 `idempotency_key`（1 至 128 个字母、数字或 `._~-`）。新提交用新键。确认地址未变、Runner 未重启，且项目命令所属的项目未删除重建后，才用原键和原参数（包括 `wait_seconds`）重试；客户端不会自动重提。键只在本次 Runner 进程内有效，服务端最多记录 4096 个键。带键的响应是首次提交快照，可能不是当前状态；客户端不把当前日志合并进旧快照，另用返回的 `next_get` 或 `next_wait` 查询。同键正在处理时稍后用原键重试；已明确收到失败结果后若要发起新提交，应换新键。
 
 长任务开始前用 `winrunner_project` 的 `health` 检查 Runner，必要时记住 `run_id`。命令 ID 只在 Runner 本轮运行内有效；收到中断或重启通知后，不要继续操作旧 ID。Action 的 `next_wait` / `next_get` 会保留已知的 `action_id`。手动续查时也可把该值传给工具的 `get` / `wait`；从第一次响应起就核对，轮次不同返回 `task_changed`，不返回其他轮次的日志。如果指定了轮次而响应没有标记，插件不会把它认作原任务。旧版 Runner 若从未返回轮次标记，仍可按项目名查当前轮次，但不能保证跨调用指向同一轮。`cancel` 仍按项目名操作当前轮次，日志读完前也不要对同一项目再次 `start`。插件不会在每次轮询时另外调用 `health`；命令 ID 和操作对象仍由调用方核对。列表不分页；命令列表过大时优先用 `status: "active"` 或精确状态缩小范围，插件不会自动拉取全量列表。
 

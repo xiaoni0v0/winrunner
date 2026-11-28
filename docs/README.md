@@ -13,7 +13,7 @@
 - **启动前在云安全组中只允许调用端的出口 IP 访问 TCP 18080。** 所有 API 均要求 `Authorization: Bearer <token>`。HTTP 不防窃听或篡改；任务以 Runner 账号权限运行，不做沙箱，只接收可信调用方和脚本。
 - 数据目录默认是项目目录下的 `.winrunner-data`；Runner 每次启动会清掉其中的旧项目和缓存。Action 解释器白名单也在 [config.py](<../winrunner/config.py>) 中，默认提供 `python`、`python3` 和 `node`。
 
-从项目目录在 PowerShell 启动（升级旧部署时，把本机配置值迁入新的 `winrunner/config.py`，并将启动命令改为 `python main.py`；不要提交令牌）：
+在 PowerShell 中从项目目录启动（升级旧部署时，把本机配置值迁入新的 `winrunner/config.py`，并将启动命令改为 `python main.py`；不要提交令牌）：
 
 ```powershell
 python main.py
