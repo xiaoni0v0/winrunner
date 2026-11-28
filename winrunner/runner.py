@@ -72,6 +72,10 @@ class APIError(Exception):
         return response
 
 
+class ShutdownIncomplete(RuntimeError):
+    """The runner is closed to new work but still holds its data lease."""
+
+
 def invalid(message):
     return APIError(400, "invalid_request", message)
 
@@ -628,36 +632,46 @@ class Runner:
                 with self.lock:
                     project.create_failed = True
                     tasks = project.tasks()
-                # Stop commands accepted during cloning before rolling back the
-                # worktree or releasing its name, even if a cancellation fails.
-                for task in tasks:
-                    try:
-                        self._cancel_task(task)
-                    except Exception:
-                        LOG.exception(
-                            "Could not cancel a task during rollback for %s", name
-                        )
-                for task in tasks:
-                    task.done.wait()
+            drained = success
             try:
-                project.clone_job.close()
-            except Exception:
-                LOG.exception("Could not close clone job for %s", name)
-            try:
+                if not success:
+                    deadline = time.monotonic() + project_drain_timeout()
+                    for task in tasks:
+                        self._stop_for_cleanup(task, f"rollback of {name}")
+                    drained = all(
+                        task.done.wait(max(0, deadline - time.monotonic()))
+                        for task in tasks
+                    )
+                if not drained:
+                    LOG.warning("Project rollback for %s left running tasks", name)
+                    raise APIError(
+                        409, "project_busy", "Project is still stopping; retry DELETE"
+                    )
                 if not success and not failed_paths:
                     failed_paths = _clean_paths(paths)
                 for path, cleanup_failure in failed_paths.items():
                     LOG.warning("Project rollback left %s: %s", path, cleanup_failure)
             finally:
+                try:
+                    project.clone_job.close()
+                except Exception:
+                    LOG.exception("Could not close clone job for %s", name)
                 with self.lock:
-                    if failed_paths:
-                        self.pending_cleanup[key] = tuple(failed_paths)
+                    if not drained:
+                        # Preserve the name, command records, and old paths for
+                        # DELETE to retry; this project never became visible.
+                        self.pending_cleanup[key] = paths
+                        if not project.delete_in_progress:
+                            project.lifecycle = "delete_failed"
                     else:
-                        self.pending_cleanup.pop(key, None)
-                    if not success:
-                        project.commands.clear()
-                        if project.lifecycle == "cloning":
-                            self.projects.pop(key, None)
+                        if failed_paths:
+                            self.pending_cleanup[key] = tuple(failed_paths)
+                        else:
+                            self.pending_cleanup.pop(key, None)
+                        if not success:
+                            project.commands.clear()
+                            if project.lifecycle == "cloning":
+                                self.projects.pop(key, None)
                     project.cloned.set()
 
     def delete_project(self, name, *, expected_scope: str | None = None):
@@ -754,6 +768,12 @@ class Runner:
 
     def _request_task_stop(self, task):
         task.cancel(self._notify_readers, background=True)
+
+    def _stop_for_cleanup(self, task, operation):
+        try:
+            self._request_task_stop(task)
+        except Exception:
+            LOG.exception("Could not request task cancellation during %s", operation)
 
     def _wait_readers(self, project, deadline, cancelled=None):
         with self.reader_changed:
@@ -1001,8 +1021,12 @@ class Runner:
                     raise not_found("Project not found")
                 if project.delete_in_progress:
                     raise conflict("Project deletion is already in progress")
-                if project.lifecycle == "delete_failed" and not project.cloned.is_set():
-                    raise conflict("Project creation is still rolling back")
+                if project.lifecycle == "delete_failed" and (
+                    project.create_failed or not project.cloned.is_set()
+                ):
+                    raise conflict(
+                        "Project creation failed; retry DELETE before submitting commands"
+                    )
                 commands, cwd = project.commands, project.worktree
             number = self.next_command_numbers.get(key, 0)
             command_id = short_command_id(number)
@@ -1137,37 +1161,42 @@ class Runner:
             commands.pop(command_id, None)
 
     def close(self):
+        deadline = time.monotonic() + project_drain_timeout()
         with self.lock:
             self.closing = True
             projects = list(self.projects.values())
             tasks = list(self.commands.values())
             for project in projects:
                 tasks.extend(project.tasks())
-        try:
-            for project in projects:
-                if not project.cloned.is_set():
-                    try:
-                        project.clone_job.cancel()
-                    except Exception:
-                        LOG.exception("Could not cancel clone during shutdown")
-            for project in projects:
-                self._interrupt_readers(project)
-            for task in tasks:
+        for project in projects:
+            if not project.cloned.is_set():
                 try:
-                    self._cancel_task(task)
+                    project.clone_job.request_stop()
                 except Exception:
-                    LOG.exception("Could not cancel task during shutdown")
-            for project in projects:
-                project.cloned.wait()
-                project.delete_done.wait()
-            for task in tasks:
-                task.done.wait()
+                    LOG.exception(
+                        "Could not request clone cancellation during shutdown"
+                    )
+            self._interrupt_readers(project)
+        for task in tasks:
+            self._stop_for_cleanup(task, "shutdown")
+
+        def remaining():
+            return max(0, deadline - time.monotonic())
+
+        events = (
+            *(event for p in projects for event in (p.cloned, p.delete_done)),
+            *(task.done for task in tasks),
+        )
+        if all(event.wait(remaining()) for event in events):
             with self.reader_changed:
-                self.reader_changed.wait_for(
-                    lambda: not any(p.readers for p in projects)
-                )
-        finally:
-            self.lease.close()
+                if self.reader_changed.wait_for(
+                    lambda: not any(p.readers for p in projects), timeout=remaining()
+                ):
+                    self.lease.close()
+                    return
+        raise ShutdownIncomplete(
+            "Shutdown still has active work; the data directory remains locked"
+        )
 
 
 def _failure(error, source):

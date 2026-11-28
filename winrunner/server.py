@@ -33,6 +33,7 @@ from .runner import (
     TERMINAL_TASK_STATUSES,
     APIError,
     Runner,
+    ShutdownIncomplete,
     invalid,
     json_value,
     not_found,
@@ -917,7 +918,15 @@ def serve(token: str, *, nogui: bool) -> None:
         finally:
             LOG.info("WinRunner stopping")
             try:
-                server.runner.close()
+                # HTTP no longer accepts work. Keep the process (and its data
+                # lease) alive while an incomplete shutdown is retried.
+                while True:
+                    try:
+                        server.runner.close()
+                        break
+                    except ShutdownIncomplete as exc:
+                        LOG.warning("%s; retrying cleanup", exc)
+                        time.sleep(1)
             finally:
                 server.cpu_sampler.close()
 

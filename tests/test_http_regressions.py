@@ -17,10 +17,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from winrunner import config
+from winrunner.runner import ShutdownIncomplete
 from winrunner.server import (
     HTTPHandler,
     HTTPServer,
     ThreadingHTTPServer,
+    serve,
     serve_with_gui,
     service_logging,
 )
@@ -305,6 +307,25 @@ class HTTPRegressionTests(unittest.TestCase):
                 serve_with_gui(server)
             gui.assert_called_once()
             self.assertFalse(self.backend_is_running())
+
+    def test_service_retries_incomplete_shutdown_before_returning(self):
+        listener = Mock()
+        listener.server_address = ("127.0.0.1", 0)
+        model, sampler = Mock(), Mock()
+        model.close.side_effect = [ShutdownIncomplete("still locked"), None]
+        with (
+            patch("winrunner.server.HTTPServer") as server_class,
+            patch("winrunner.server.Runner", return_value=model),
+            patch("winrunner.server.CpuSampler", return_value=sampler),
+            patch("winrunner.server.time.sleep") as pause,
+            self.assertLogs("winrunner", "WARNING") as messages,
+        ):
+            server_class.return_value.__enter__.return_value = listener
+            serve(TOKEN, nogui=True)
+        self.assertEqual(model.close.call_count, 2)
+        sampler.close.assert_called_once()
+        pause.assert_called_once_with(1)
+        self.assertIn("still locked", "\n".join(messages.output))
 
     def test_ctrl_c_during_integrated_http_start_stops_worker(self):
         with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:

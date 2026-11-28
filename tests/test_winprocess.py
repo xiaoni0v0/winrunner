@@ -222,6 +222,40 @@ class WinProcessTests(unittest.TestCase):
         with self.assertRaises(JobCancelled):
             self.run_python("raise AssertionError('must not start')")
 
+    def test_cancel_falls_back_to_kill_on_close(self):
+        ready = threading.Event()
+
+        def capture(chunk):
+            self.out.extend(chunk)
+            ready.set()
+
+        worker = self.start_worker(
+            lambda: self.run_python(
+                "import time; print('ready', flush=True); time.sleep(60)",
+                stdout=capture,
+            )
+        )
+        self.assertTrue(ready.wait(8))
+
+        def fail_terminate(*_):
+            winprocess.C.set_last_error(5)
+            return 0
+
+        with (
+            patch.object(
+                winprocess, "_TerminateJobObject", side_effect=fail_terminate
+            ) as terminate,
+            self.assertLogs(winprocess.LOG, "ERROR") as logs,
+        ):
+            self.job.cancel()
+            result = self.finish(worker)
+        self.assertEqual(terminate.call_count, 2)
+        self.assertTrue(any("trying kill-on-close" in line for line in logs.output))
+        self.assertIsInstance(result, JobCancelled)
+        self.assertIsNotNone(result.exit_code)
+        self.assertIn(b"ready", self.out)
+        self.assertIsNone(self.job._handle)
+
     def test_cancel_before_launch_and_close_are_idempotent(self):
         self.job.cancel()
         self.job.cancel()
@@ -413,13 +447,15 @@ class WinProcessTests(unittest.TestCase):
                 else:
                     self.assertEqual(self.run_python("pass"), 0)
 
-    def test_double_cleanup_failure_does_not_wait_for_live_pipes(self):
+    def test_double_cleanup_failure_keeps_work_pending_until_stop_succeeds(self):
         failure = RuntimeError("could not resume")
+        close_attempted = threading.Event()
         close_handle = winprocess._CloseHandle
         job_handle = self.job._handle
 
         def fail_to_close_job(handle):
             if handle == job_handle:
+                close_attempted.set()
                 winprocess.C.set_last_error(5)
                 return 0
             return close_handle(handle)
@@ -431,15 +467,18 @@ class WinProcessTests(unittest.TestCase):
             self.assertLogs(winprocess.LOG, level="ERROR") as diagnostics,
         ):
             worker = self.start_worker(lambda: self.run_python("pass"))
-            self.assertIs(self.finish(worker, timeout=3), failure)
+            self.assertTrue(close_attempted.wait(3))
+            worker[0].join(0.25)
+            self.assertTrue(worker[0].is_alive())
         self.assertTrue(
             any("trying kill-on-close" in line for line in diagnostics.output)
         )
         self.assertTrue(
             any("Could not stop the failed job" in line for line in diagnostics.output)
         )
-        # Real close still has the handle and can terminate the suspended child.
+        # The handle is retained, so retry can still terminate the suspended child.
         self.job.close()
+        self.assertIs(self.finish(worker, timeout=3), failure)
         with self.assertRaises(JobCancelled):
             self.run_python("pass")
 

@@ -174,9 +174,9 @@ class RunnerRegressions(unittest.TestCase):
                 raise TimeoutError("test did not release directory cleanup")
             return clean(paths)
 
-        def observe_wait():
+        def observe_wait(timeout=None):
             draining.set()
-            return wait(WAIT)
+            return wait(timeout)
 
         with (
             patch.object(runner, "_clean_paths", side_effect=gated_clean),
@@ -202,8 +202,10 @@ class RunnerRegressions(unittest.TestCase):
         self.model.commands.update({"0": first, "1": second})
         cancelled = threading.Event()
         with (
-            patch.object(first.job, "cancel", side_effect=OSError("cancel failed")),
-            patch.object(second.job, "cancel", side_effect=cancelled.set),
+            patch.object(
+                first.job, "request_stop", side_effect=OSError("cancel failed")
+            ),
+            patch.object(second.job, "request_stop", side_effect=cancelled.set),
             self.assertLogs(runner.LOG, "ERROR"),
         ):
             shutdown = self.background(self.model.close)
@@ -215,6 +217,30 @@ class RunnerRegressions(unittest.TestCase):
                 first.finish()
                 second.finish()
             shutdown.result(timeout=WAIT)
+        self.assertTrue(self.model.lease.closed)
+
+    def test_incomplete_shutdown_keeps_data_lease_and_can_retry(self):
+        task = runner.Task("run", command_id="0")
+        self.model.commands["0"] = task
+        with (
+            patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", 0.02),
+            patch.object(task.job, "request_stop") as stop,
+        ):
+            with self.assertRaisesRegex(runner.ShutdownIncomplete, "remains locked"):
+                self.model.close()
+            self.assertFalse(self.model.lease.closed)
+            with self.assertRaisesRegex(RuntimeError, "already in use"):
+                runner.Runner(self.model.base)
+            self.assert_api_error(
+                503,
+                "shutting_down",
+                self.model.start_command,
+                COMMAND,
+                time.monotonic(),
+            )
+            stop.side_effect = task.finish
+            self.model.close()
+            self.assertEqual(stop.call_count, 2)
         self.assertTrue(self.model.lease.closed)
 
     def test_shutdown_rejects_new_readers_and_drains_existing_reader(self):
@@ -583,6 +609,66 @@ class RunnerRegressions(unittest.TestCase):
         self.assertEqual(project.commands, {})
         self.assertFalse(project.worktree.exists())
         self.assert_api_error(404, "not_found", self.model.list_commands, name="sample")
+
+    def test_failed_clone_keeps_project_for_delete_if_commands_do_not_stop(self):
+        cloning, fail_clone, running, stop = (threading.Event() for _ in range(4))
+
+        def clone(repo):
+            repo.cache.mkdir()
+            repo.worktree.mkdir()
+            (repo.worktree / "keep.txt").touch()
+            cloning.set()
+            self.assertTrue(fail_clone.wait(WAIT))
+            raise runner.GitFailure("clone failed")
+
+        def command(*args, on_started, **kwargs):
+            on_started()
+            running.set()
+            self.assertTrue(stop.wait(WAIT))
+            return 0
+
+        self.job.run.side_effect = command
+        with (
+            patch.object(LocalRepository, "create", clone),
+            patch.object(runner.config, "PROJECT_DRAIN_TIMEOUT", 0.02),
+            self.assertLogs(runner.LOG, "WARNING"),
+        ):
+            creation = self.background(self.create)
+            try:
+                self.assertTrue(cloning.wait(WAIT))
+                project = self.model.command_project("sample")
+                self.model.start_command(
+                    COMMAND.replace(b'"timeout":30', b'"timeout":0'),
+                    time.monotonic(),
+                    project=project,
+                )
+                self.assertTrue(running.wait(WAIT))
+                fail_clone.set()
+                self.assert_api_error(
+                    409, "project_busy", creation.result, timeout=WAIT
+                )
+                self.assertEqual(
+                    self.model.get_project("sample")["status"], "delete_failed"
+                )
+                self.assertTrue((project.worktree / "keep.txt").exists())
+                self.assertEqual(
+                    self.model.get_command("0", name="sample")["status"], "cancelling"
+                )
+                self.assert_api_error(409, "conflict", self.create)
+                self.assert_api_error(
+                    409,
+                    "conflict",
+                    lambda: self.model.start_command(
+                        COMMAND, time.monotonic(), project=project
+                    ),
+                )
+            finally:
+                fail_clone.set()
+                stop.set()
+        self.assertTrue(project.commands["0"].done.wait(WAIT))
+        self.model.delete_project("sample")
+        self.assertFalse(project.worktree.exists())
+        self.assertFalse(project.cache.exists())
 
     def test_failed_clone_discards_commands_after_delete_times_out(self):
         cloning, release = threading.Event(), threading.Event()

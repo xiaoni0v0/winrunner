@@ -192,7 +192,6 @@ _ERROR_INSUFFICIENT_BUFFER = 122
 _ERROR_BROKEN_PIPE = 109
 _ERROR_HANDLE_EOF = 38
 _ERROR_NO_DATA = 232
-_WAIT_TIMEOUT = 258
 _INFINITE = 0xFFFFFFFF
 _CANCEL_EXIT_CODE = 1
 
@@ -375,23 +374,14 @@ def _raise_reader_failure(failures):
     raise error
 
 
-def _wait_empty(job, failures=None):
-    # A job can be reused, and Windows does not guarantee delivery of job
-    # completion-port messages. Query the authoritative active process count.
+def _wait_empty(has_processes, failures=None):
+    # Completion-port messages are not guaranteed. Query the active count
+    # through the owner so cancellation can safely close the job handle.
     accounting = _Accounting()
     while True:
         if failures is not None:
             _raise_reader_failure(failures)
-        _check(
-            _QueryInformationJobObject(
-                job,
-                _JOB_BASIC_ACCOUNTING,
-                C.byref(accounting),
-                C.sizeof(accounting),
-                None,
-            )
-        )
-        if not accounting.ActiveProcesses:
+        if not has_processes(accounting):
             return
         time.sleep(0.015)
 
@@ -407,7 +397,15 @@ def _cleanup_step(message):
 
 
 def _monitor(
-    job, process, out_read, err_read, stdout, stderr, resume, abort, on_started
+    has_processes,
+    process,
+    out_read,
+    err_read,
+    stdout,
+    stderr,
+    resume,
+    abort,
+    on_started,
 ):
     readers: list[threading.Thread] = []
     abandoned = None
@@ -433,7 +431,7 @@ def _monitor(
         _raise_reader_failure(failures)
         if resume() and on_started is not None:
             on_started()
-        _wait_empty(job, failures)
+        _wait_empty(has_processes, failures)
         for reader in readers:
             reader.join()
         _raise_reader_failure(failures)
@@ -450,19 +448,28 @@ def _monitor(
             accounting = abort()
         if accounting:
             with _cleanup_step("Could not query the failed job during cleanup"):
-                _wait_empty(job)
-        stopped = accounting is not None
-        if not stopped and abandoned is not None:
-            # Both termination and kill-on-close failed. A writer may still
-            # hold the pipe open; don't wait indefinitely or publish more logs.
-            abandoned.set()
+                _wait_empty(has_processes)
+        if accounting is None:
+            # Both termination and kill-on-close failed. Never publish a
+            # finished task or forget this handle while members may be alive.
+            # The owning Runner bounds its waits and can retry cancellation.
+            if abandoned is not None:
+                abandoned.set()
+            pending = _Accounting()
+            while True:
+                try:
+                    if not has_processes(pending):
+                        break
+                except OSError:
+                    # A later cancellation can still close the job handle.
+                    pass
+                time.sleep(0.05)
         for reader in readers:
             with _cleanup_step("Could not join a job output reader"):
                 if reader.ident is not None:
-                    reader.join(timeout=None if stopped else 0.1)
+                    reader.join()
         with _cleanup_step("Could not reap the failed job's process"):
-            status = _WaitForSingleObject(process, _INFINITE if stopped else 100)
-            if status not in (0, _WAIT_TIMEOUT):
+            if _WaitForSingleObject(process, _INFINITE) != 0:
                 raise C.WinError(C.get_last_error())
         raise
 
@@ -505,12 +512,44 @@ class Job:
             _check(_CloseHandle(self._handle))
             self._handle = None
 
+    def _has_processes(self, accounting) -> bool:
+        with self._lock:
+            if self._handle is None:
+                # The fallback requested termination by closing the last handle.
+                # The monitor still reaps the process and drains its pipes.
+                return False
+            _check(
+                _QueryInformationJobObject(
+                    self._handle,
+                    _JOB_BASIC_ACCOUNTING,
+                    C.byref(accounting),
+                    C.sizeof(accounting),
+                    None,
+                )
+            )
+            return bool(accounting.ActiveProcesses)
+
+    def _terminate(self) -> bool:
+        # Called under _lock; a live handle says the monitor can still query it.
+        if self._handle is None:
+            return False
+        with _cleanup_step("Could not terminate the job; retrying"):
+            _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+            return True
+        with _cleanup_step(
+            "Could not terminate the job on retry; trying kill-on-close"
+        ):
+            _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+            return True
+        self._closed = True
+        self._close_handle()
+        return False
+
     def _resume(self, thread) -> bool:
         with self._lock:
             if self._cancelled:
-                # cancel/close may have arrived during reader setup. Do not
-                # resume the child, even if the earlier termination failed.
-                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+                # Do not resume if cancellation raced pipe setup.
+                self._terminate()
                 return False
             if _ResumeThread(thread) == _INFINITE:
                 raise C.WinError(C.get_last_error())
@@ -518,30 +557,20 @@ class Job:
 
     def _abort(self) -> bool:
         with self._lock:
-            with _cleanup_step(
-                "Could not terminate the failed job; trying kill-on-close"
-            ):
-                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
-                return True  # The handle is still available for accounting.
-            # Fall back to kill-on-close. This Job cannot be reused afterward.
-            self._closed = True
-            self._close_handle()
-            return False
+            return self._terminate()
 
     def cancel(self) -> None:
         with self._lock:
             self._cancelled = True
-            if self._active and self._handle is not None:
-                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+            if self._active:
+                self._terminate()
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
             self._cancelled = True
-            if self._active and self._handle is not None:
-                # The worker still needs this handle for accounting. Its final
-                # critical section will close it after this termination request.
-                _check(_TerminateJobObject(self._handle, _CANCEL_EXIT_CODE))
+            if self._active:
+                self._terminate()
             else:
                 self._close_handle()
 
@@ -569,7 +598,7 @@ class Job:
                 self._active = True
             try:
                 code = _monitor(
-                    job,
+                    self._has_processes,
                     process,
                     out_read,
                     err_read,

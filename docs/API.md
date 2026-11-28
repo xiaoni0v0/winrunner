@@ -33,13 +33,13 @@ Action、项目命令和文件接口使用同一个工作树。不同项目的�
 创建时由调用端在路径中指定 `name`，请求体只传 `{"repo_url":"https://example.com/owner/repo.git"}`。
 
 - `name` 匹配 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`，大小写不敏感、全局唯一，不接受 Windows 设备保留名。工作目录按注册名命名；重名返回 `409`，不重新克隆或改动已有项目。
-- `repo_url` 是公开 HTTPS Git 仓库的最终地址，不含凭据、查询或片段。Runner 不跟随重定向，不取子模块或 Git LFS 内容。创建从同一次克隆的快照初始化工作树；后续 Action 以远端分支和标签为准重新检出，Runner 自身不会 commit、push、merge 或 rebase。Git 克隆失败返回 `502`，含原始原因，不留下可见项目。
+- `repo_url` 是公开 HTTPS Git 仓库的最终地址，不含凭据、查询或片段。Runner 不跟随重定向，不取子模块或 Git LFS 内容。创建从同一次克隆的快照初始化工作树；后续 Action 以远端分支和标签为准重新检出，Runner 自身不会 commit、push、merge 或 rebase。Git 克隆失败且回滚完成时返回 `502`，含原始原因，不留下项目。若回滚时项目命令未能在清理期限内退出，则返回 `409 project_busy`，保留名字和目录，不对外提供工作树文件；请重试 `DELETE /projects/{name}` 完成清理。
 
 创建请求断线后，可用同一路径的 GET 核对 `repo_url` 和 `status`；`cloning` 表示同步克隆尚未完成。`POST /projects` 不再接受创建请求，返回 `405`。
 
 创建时先占用名字并清理同名残留目录，不复用残留。清理受阻返回 `409 project_cleanup_blocked`，释放占用后可重试创建。删除项目时，默认最多等 5 秒让任务和下载退出，超时返回 `409 project_busy`；磁盘清理受阻返回 `409 project_cleanup_blocked`。这两种删除失败都可重试 DELETE。项目不存在时 DELETE 返回 `404`。
 
-`Project` 含 `name`、`repo_url` 和 `status`。`cloning` / `deleting` 表示正在创建或删除；`delete_failed` 表示删除未完成，此时不能提交 Action 或读取文件，但创建回滚完成后仍可提交项目命令。`idle` 表示项目已创建且没有 Action；其他值是当前或最近一次 Action 的 [任务状态](<#任务响应与日志>)。项目命令不改变 `Project.status`。
+`Project` 含 `name`、`repo_url` 和 `status`。`cloning` / `deleting` 表示正在创建或删除；`delete_failed` 表示删除或创建回滚未完成，此时不能提交 Action 或读取文件。已创建的项目在删除失败后仍可接收项目命令；克隆失败且清理尚未完成的项目须先 DELETE，不再接收新命令。`idle` 表示项目已创建且没有 Action；其他值是当前或最近一次 Action 的 [任务状态](<#任务响应与日志>)。项目命令不改变 `Project.status`。
 
 ### 文件
 
@@ -82,7 +82,7 @@ GET 和 DELETE 在没有 Action 时返回 `404`，项目正在删除或删除未
 | `POST /projects/{name}/commands/{id}/cancel` | 强制终止该命令的进程树，等待退出，保留记录和日志，返回 `204`。 |
 | `DELETE /projects/{name}/commands/{id}` | 强制终止该命令的进程树，等退出后删除记录和日志，返回 `204`。 |
 
-项目或命令不存在时返回 `404`。项目正在删除时，新命令返回 `409`；其他项目状态不拦截提交，包括克隆中、Action 准备或运行、项目删除未完成。如果启动时工作树不存在或无法用作起始目录，仍保留已分配的 ID，任务以 `failed` 结束，`error.code` 为 `launch_failed`。Runner 不建目录，也不退回用户目录。克隆失败回滚时会停止并丢弃该项目已接收的命令。
+项目或命令不存在时返回 `404`。项目正在删除，或克隆失败、仍需清理时，新命令返回 `409`。其他项目状态不拦截提交，包括克隆中、Action 准备或运行，以及已创建项目的删除失败状态。如果启动时工作树不存在或无法用作起始目录，仍保留已分配的 ID，任务以 `failed` 结束，`error.code` 为 `launch_failed`。Runner 不建目录，也不退回用户目录。克隆失败回滚会停止已接收的命令；只有清理可以继续时才丢弃记录。
 
 并行时由调用端协调共享文件。Action 不会停止正在运行的项目命令，但重置可能删除命令依赖的文件；目录被占用时，Action 可能以 `reset_blocked` 失败。起始目录不是权限边界。
 
