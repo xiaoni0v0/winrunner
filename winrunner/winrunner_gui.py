@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import codecs
+import logging
 import math
 import re
 import signal
@@ -11,6 +12,7 @@ import threading
 import time
 import tkinter as tk
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
@@ -27,6 +29,7 @@ if TYPE_CHECKING:
     from .winrunner_gui_forms import FormKind, SubmitForm
 
 INTEGRATED_REFRESH_MS = 850
+REFRESH_RETRY_MS = 1500
 REOPEN_MS = 450
 BACKEND_EXIT_MS = 850
 LOG_PAGE = 32768
@@ -53,6 +56,7 @@ FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
 DASH = "—"
 MIN_WIDTH, MIN_HEIGHT = 870, 700
+LOG = logging.getLogger("winrunner")
 STATUS_COLORS = {"active": BLUE, "success": GREEN, "warning": AMBER, "error": RED}
 METRIC_COLORS = (TEAL, BLUE, "#c0a9fa", AMBER)
 
@@ -952,9 +956,8 @@ def _run_operation(
     except OSError as exc:
         result = OperationResult(key, error=str(exc))
     except Exception:
-        import logging
-
-        logging.getLogger("winrunner").exception("Desktop operation failed: %s", key[0])
+        with suppress(BaseException):
+            LOG.exception("Desktop operation failed: %s", key[0])
         result = OperationResult(key, error="内部错误，请查看服务日志。")
     if not stop.is_set():
         results.put(result)
@@ -1716,12 +1719,23 @@ class Dashboard:
         self._busy = True
         self._refresh_requested = False
         self._poll_revision = self._view.revision
-        threading.Thread(
-            target=self._poll,
-            args=(self._view,),
-            daemon=True,
-            name="winrunner-dashboard-poll",
-        ).start()
+        try:
+            worker = threading.Thread(
+                target=self._poll,
+                args=(self._view,),
+                daemon=True,
+                name="winrunner-dashboard-poll",
+            )
+            worker.start()
+        except RuntimeError:
+            # Retry on the open window instead of stranding the dashboard on a
+            # stale snapshot. Clear the busy flag first so _schedule reschedules.
+            self._busy = False
+            with suppress(BaseException):
+                LOG.exception("Could not start the dashboard refresh worker")
+            self._report("状态刷新未启动，正在重试…")
+            self._schedule(REFRESH_RETRY_MS)
+            return
         self._after_id = self.root.after(50, self._receive)
 
     def _receive(self) -> None:

@@ -149,6 +149,47 @@ class IntegratedTests(unittest.TestCase):
             dashboard._view.offsets(), {"stdout": gui.LOG_PAGE, "stderr": gui.LOG_PAGE}
         )
 
+    def test_failed_refresh_thread_start_is_retried_without_reopening_tk(self) -> None:
+        dashboard = self.dashboard(MagicMock(), lambda: True)
+        with (
+            patch.object(
+                gui.threading,
+                "Thread",
+                side_effect=RuntimeError("can't start new thread"),
+            ),
+            self.assertLogs(gui.LOG, level="ERROR") as logs,
+        ):
+            dashboard.refresh()
+        # The failure is reported, the window stays open, and no snapshot is
+        # awaited: retrying must not depend on a worker that never started.
+        self.assertIn("refresh worker", "\n".join(logs.output))
+        self.assertEqual(
+            dashboard.notice.set_text.call_args.args, ("状态刷新未启动，正在重试…",)
+        )
+        self.assertFalse(dashboard._busy)
+        dashboard.root.withdraw.assert_not_called()
+        dashboard.root.destroy.assert_not_called()
+        dashboard.root.deiconify.assert_not_called()
+        self.assertTrue(dashboard._results.empty())
+        # A single retry timer replaced any normal receive timer.
+        dashboard.root.after.assert_called_once_with(
+            gui.REFRESH_RETRY_MS, dashboard.refresh
+        )
+
+    def test_refresh_retry_resumes_normal_polling(self) -> None:
+        sample = gui.Snapshot(gui.Response({"run_id": "integrated"}))
+        dashboard = self.dashboard(lambda _view: sample, lambda: True)
+        dashboard._show = MagicMock()
+        with patch.object(
+            gui.threading, "Thread", side_effect=RuntimeError("can't start new thread")
+        ):
+            dashboard.refresh()
+        self.assertFalse(dashboard._busy)
+        # The retry starts a real worker and polls normally again.
+        dashboard.refresh()
+        self.assertTrue(dashboard._busy)
+        self.assertIs(dashboard._results.get(timeout=2), sample)
+
     def test_backend_exit_closes_during_a_poll(self) -> None:
         entered = threading.Event()
         release = threading.Event()
