@@ -1,6 +1,7 @@
 """Windows desktop file service tests with real Runner worktrees and local I/O."""
 
 import ctypes
+import io
 import os
 import subprocess
 import tempfile
@@ -399,6 +400,115 @@ class GUIFileBackendTests(unittest.TestCase):
         self.assertTrue(self.cancelled.is_set())
         self.assertFalse(self.project.worktree.exists())
         self.assert_original_output()
+
+    def temp_name(self, destination=None):
+        """Return the one private temporary export name beside the destination."""
+        destination = self.destination if destination is None else destination
+        names = [path.name for path in self.exports.iterdir() if path != destination]
+        self.assertEqual(len(names), 1, names)
+        return names[0]
+
+    def test_failed_temp_deletion_is_reported_and_keeps_the_final_file(self):
+        self.destination.write_bytes(b"original")
+
+        def broken_chunks():
+            yield b"partial bytes"
+            raise RuntimeError("source iterator failed")
+
+        # A discard that fails used to be silent and could hide a leaked
+        # temporary file. Report it, still release every handle, and keep the
+        # original export error authoritative.
+        with (
+            patch.object(
+                winrunner_files,
+                "_discard_temp",
+                side_effect=OSError("cannot discard temporary export"),
+            ),
+            self.assertLogs(winrunner_files.LOG, level="ERROR") as logs,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source iterator failed"):
+                save_bytes(
+                    self.model, self.destination, broken_chunks(), self.cancelled
+                )
+        self.assertIn("temporary export", "\n".join(logs.output))
+        self.assertIn(self.destination.name, "\n".join(logs.output))
+        self.assertEqual(self.destination.read_bytes(), b"original")
+        # Handles were released despite the failed delete, so the leaked
+        # private name can be removed and nothing else was touched.
+        leftover = self.exports / self.temp_name()
+        leftover.unlink()
+        self.assert_original_output()
+
+    def test_cleanup_diagnostics_never_replace_the_original_error(self):
+        self.destination.write_bytes(b"original")
+        fail = RuntimeError("source iterator failed")
+        closed = []
+
+        def broken_chunks():
+            yield b"partial bytes"
+            raise fail
+
+        original_close = winrunner_files._close_temp
+
+        def tracking_close(file, fd, handle, destination, *, discard):
+            original_close(file, fd, handle, destination, discard=discard)
+            closed.append(fd)
+
+        with (
+            patch.object(
+                winrunner_files,
+                "_discard_temp",
+                side_effect=OSError("cannot discard temporary export"),
+            ),
+            patch.object(winrunner_files, "_close_temp", side_effect=tracking_close),
+            self.assertLogs(winrunner_files.LOG, level="ERROR") as logs,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                save_bytes(
+                    self.model, self.destination, broken_chunks(), self.cancelled
+                )
+        self.assertIs(caught.exception, fail)
+        self.assertEqual(len(closed), 1)
+        self.assertIn("temporary export", "\n".join(logs.output))
+        self.assertEqual(self.destination.read_bytes(), b"original")
+        (self.exports / self.temp_name()).unlink()
+        self.assert_original_output()
+
+    def test_file_close_failure_still_closes_the_descriptor_and_reports(self):
+        # Exercise the cleanup helper directly: only the file object fails, so
+        # the descriptor must still be released and the leak reported.
+        class BrokenFile(io.BytesIO):
+            def close(self) -> None:
+                raise OSError("close failed")
+
+        with winfiles._walk(self.exports, "", relative_handles=True) as (_, parent, _):
+            handle = winrunner_files._open_temp(parent, self.destination)
+            fd = winrunner_files.msvcrt.open_osfhandle(
+                handle, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT
+            )
+            with self.assertLogs(winrunner_files.LOG, level="ERROR") as logs:
+                winrunner_files._close_temp(
+                    BrokenFile(), fd, handle, self.destination, discard=False
+                )
+            self.assertIn(str(self.destination), "\n".join(logs.output))
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+            # Cleanup only ever touched the private temporary name.
+            self.assertFalse(self.destination.exists())
+            self.assertEqual(len(list(self.exports.iterdir())), 1)
+
+    def test_committed_export_succeeds_when_cleanup_discards_nothing(self):
+        # The normal path: a committed export never leaves a temporary name and
+        # never logs a cleanup complaint.
+        with patch.object(winrunner_files, "_discard_temp") as discard:
+            self.assertEqual(
+                save_bytes(self.model, self.destination, [b"payload"], self.cancelled),
+                7,
+            )
+        discard.assert_not_called()
+        self.assertEqual(self.destination.read_bytes(), b"payload")
+        self.assertEqual(list(self.exports.iterdir()), [self.destination])
+        self.assertEqual(self.project.readers, {})
 
 
 if __name__ == "__main__":

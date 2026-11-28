@@ -2,11 +2,12 @@
 
 import ctypes
 import json
+import logging
 import os
 import re
 import secrets
 from collections.abc import Iterable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from ctypes import wintypes
 from pathlib import Path
 from threading import Event
@@ -18,6 +19,7 @@ from .runner import APIError, Runner, invalid, not_found
 _BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
 _PAGE_LIMIT = 512 * 1024
 _CHUNK_SIZE = 64 * 1024
+LOG = logging.getLogger(__name__)
 
 
 def range_bounds(header: str | None, size: int) -> tuple[int, int]:
@@ -332,12 +334,62 @@ def _check_leaf(parent: int, destination: Path) -> None:
         ) from exc
 
 
-def _discard_temp(handle: int) -> None:
+def _discard_temp(handle: int, destination: Path) -> None:
     # Discard through the handle: never unlink a rediscovered path.
     delete = wintypes.BOOL(True)
-    _set_file_info(
+    if not _set_file_info(
         handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)
-    )
+    ):
+        raise winfiles._winerror(destination, ctypes.get_last_error())
+
+
+def _log_cleanup_failure(message: str, destination: Path) -> None:
+    # Neither cleanup nor a faulty logging handler may replace the error.
+    with suppress(BaseException):
+        LOG.exception(message, destination)
+
+
+def _close_temp(
+    file: BinaryIO | None,
+    fd: int | None,
+    handle: int,
+    destination: Path,
+    *,
+    discard: bool,
+) -> None:
+    """Discard an unfinished export, then always release its handles.
+
+    Only the private temporary name is ever removed, so an existing final
+    destination is never modified here. Every step is reported rather than
+    raised: an export error stays authoritative, and a completed export stays
+    successful even if a handle cannot be closed cleanly.
+    """
+    if discard:
+        try:
+            _discard_temp(handle, destination)
+        except Exception:
+            _log_cleanup_failure(
+                "Could not delete the incomplete temporary export for %s; "
+                "the final destination was not modified",
+                destination,
+            )
+    try:
+        if file is not None:
+            file.close()
+    except Exception:
+        _log_cleanup_failure(
+            "Could not close the temporary export file for %s", destination
+        )
+    finally:
+        try:
+            if fd is None:
+                winfiles._close_handle(handle)
+            else:
+                os.close(fd)
+        except Exception:
+            _log_cleanup_failure(
+                "Could not close the temporary export handle for %s", destination
+            )
 
 
 @contextmanager
@@ -354,18 +406,11 @@ def _temp_file(parent: int, destination: Path) -> Iterator[BinaryIO]:
             )
             file = os.fdopen(fd, "wb", buffering=0, closefd=False)
         yield file
+        # Only the rename inside this block commits the bytes to the final
+        # destination; leaving early discards the private temporary name.
         committed = True
     finally:
-        if not committed:
-            _discard_temp(handle)
-        try:
-            if file is not None:
-                file.close()
-        finally:
-            if fd is None:
-                winfiles._close_handle(handle)
-            else:
-                os.close(fd)
+        _close_temp(file, fd, handle, destination, discard=not committed)
 
 
 @contextmanager
