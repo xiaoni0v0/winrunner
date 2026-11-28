@@ -10,9 +10,14 @@ const hex = /^[a-f\d]{1,64}$/i
 const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
 const choice = (description, choices) => ({ type: 'string', description, enum: choices })
 const taskFlow = '长任务前用 winrunner_project 的 health 查一次。看 outcome 判定结果；有 next_wait 或 next_get 就原样传回同一工具。pending 或 unknown 时先查询，别重复 start。'
-const taskOptions = `start/wait 可传 wait_seconds（start 默认 0，短任务可设 5；wait 默认 15，至少 1；都至多 60）。到点不停止任务，wait 不会重提；next_wait 用默认等待时长。UTF-8 日志每页至少 4 字节。start/get/wait 可传 status_only:true 不读日志；否则 get/wait 默认预览双路，也可传 stdout_offset、stderr_offset（只传一路就只读该路）、limit（每路字节上限 ${limits.log}）和 encoding（utf8/base64）。`
+const taskOptions = `start/wait 可传 wait_seconds（start 默认 0，wait 默认 15 且至少 1；都至多 60）。到点不停止任务，wait 不重提。start/get/wait 可传 status_only:true 不读日志。get/wait 默认从头预览双路；可按流传 stdout_offset / stderr_offset（从偏移读，limit 限制页长）或 stdout_tail / stderr_tail（最后 N 字节），同一路不能混用，只传一路就只读该路。日志页长最大 ${limits.log} 字节；encoding 用 utf8（默认，至少 4 字节）或 base64（无损）。`
 const startKeyHelp = 'start 可传 idempotency_key（1–128 个字母、数字或 ._~-）；新提交用新键，只有确认同一 Runner 进程后，才可用原键和原参数（包括 wait_seconds）恢复断线提交。重放仅返回原提交快照，当前状态用 get 查询。'
-const taskLogKeys = ['status_only', 'stdout_offset', 'stderr_offset', 'limit', 'encoding']
+const logKeys = ['stdout_offset', 'stderr_offset', 'stdout_tail', 'stderr_tail', 'limit', 'encoding']
+const taskLogKeys = ['status_only', 'include_input', ...logKeys]
+const terminal = new Set(['succeeded', 'failed', 'cancelled'])
+const active = new Set(['preparing', 'running', 'cancelling'])
+const commandStatuses = ['active', ...active, ...terminal]
+const streams = ['stdout', 'stderr']
 const exampleCall = (op, params = {}) => JSON.stringify({ op, params_json: JSON.stringify(params) })
 const cpuMetric = description => ({ description: `${description} 数字百分比，或 null。` })
 const cpuOutput = {
@@ -34,12 +39,12 @@ const groups = {
   action: {
     description: `提交、查询或取消项目的 Git Action。start 覆盖上轮工作区和日志；忙时返回 409。先取完旧日志和产物再提交下一轮。${taskFlow}`,
     ops: ['start', 'get', 'wait', 'cancel'],
-    params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。${taskOptions}${startKeyHelp}`,
+    params: `start：{"name":"demo","commit":"abc1234","interpreter":"python","script":"task.py","args":["--help"],"wait_seconds":5}。commit 用远端可达的完整十六进制哈希或唯一前缀，不用分支或标签；script 是仓库内相对路径；args 可省略，逐项传递，无需 shell 引号。get/wait/cancel：{"name":"demo"}。get/wait 可用 include_input:true 查询本轮 action_id。${taskOptions}${startKeyHelp}`,
   },
   command: {
-    description: `运行和管理项目内或全局的 Windows 命令。项目命令从当前工作树启动，不重置目录或覆盖旧日志，可与 Action 并行；调用端负责协调共享文件。delete 终止命令并删除记录和日志。${taskFlow}`,
-    ops: ['start', 'get', 'wait', 'list', 'delete'],
-    params: `所有操作都可传 name 选择项目，省略则用全局集合，从 Runner 用户目录启动。list：{"name":"demo"} 或 {}（全局）。start：{"name":"demo","mode":"ps","command":"Write-Output 'hello'","wait_seconds":5}。mode 用 ps 或 cmd，直接传命令原文，多行 PowerShell 用 JSON 转义换行。get/wait/delete：{"name":"demo","id":"0"}，用 start 返回的 ID 和同一作用域；各集合的 ID 可重复。${taskOptions}${startKeyHelp}项目删后重建时，不用旧键恢复提交。`,
+    description: `运行和管理项目内或全局的 Windows 命令。项目命令不重置工作树，可与 Action 并行。cancel 强制终止进程树并保留记录和日志；delete 强制终止并删除。${taskFlow}`,
+    ops: ['start', 'get', 'wait', 'list', 'cancel', 'delete'],
+    params: `所有操作可传 name 指定项目，省略则用全局。list 可传 status：active 表示未结束（preparing/running/cancelling），也可精确匹配这三个状态或 succeeded/failed/cancelled；省略列全部。start：{"name":"demo","mode":"ps","command":"Write-Output 'hello'"}，mode 用 ps 或 cmd。get/wait/cancel/delete 用同一作用域的 id，如 {"name":"demo","id":"0"}。get/wait 可用 include_input:true 读取原命令，注意其中可能含敏感信息。${taskOptions}${startKeyHelp}项目删后重建时，不用旧键恢复提交。`,
   },
 }
 
@@ -103,24 +108,28 @@ function startOptions(args, timeout) {
 function getTask(path, args, identifyAction = false) {
   validateStatusOnly(args)
   const params = new URLSearchParams()
-  if (identifyAction) params.set('include_input', 1)
+  if (args.include_input !== undefined && typeof args.include_input !== 'boolean') invalid('include_input 必须是布尔值。')
+  if (identifyAction || args.include_input) params.set('include_input', 1)
   if (args.status_only) {
-    if (['stdout_offset', 'stderr_offset', 'limit', 'encoding'].some(key => args[key] !== undefined)) {
-      invalid('status_only 为 true 时不要传日志参数。')
-    }
+    if (logKeys.some(key => args[key] !== undefined)) invalid('status_only 为 true 时不要传日志参数。')
     return request('GET', queryPath(path, params))
   }
-  const hasOffsets = args.stdout_offset !== undefined || args.stderr_offset !== undefined
-  for (const key of ['stdout_offset', 'stderr_offset']) {
-    if (args[key] !== undefined) params.set(key, nonnegative(args[key], key, 0, Number.MAX_SAFE_INTEGER))
-  }
-  const defaultLimit = hasOffsets ? 4096 : 2048
-  if (!hasOffsets) {
-    params.set('stdout_offset', 0)
-    params.set('stderr_offset', 0)
-  }
   const logEncoding = enumValue(args.encoding === undefined ? 'utf8' : args.encoding, 'encoding', encodings)
-  params.set('limit', pageBytes(args.limit, 'limit', defaultLimit, limits.log, logEncoding))
+  const hasOffsets = streams.some(stream => args[`${stream}_offset`] !== undefined)
+  const hasTails = streams.some(stream => args[`${stream}_tail`] !== undefined)
+  for (const stream of streams) {
+    const offset = `${stream}_offset`
+    const tail = `${stream}_tail`
+    if (args[offset] !== undefined && args[tail] !== undefined) invalid(`${offset} 和 ${tail} 不能混用。`)
+    if (args[offset] !== undefined) params.set(offset, nonnegative(args[offset], offset, 0, Number.MAX_SAFE_INTEGER))
+    if (args[tail] !== undefined) params.set(tail, pageBytes(args[tail], tail, undefined, limits.log, logEncoding))
+    if (!hasOffsets && !hasTails) params.set(offset, 0)
+  }
+  if (!hasTails || hasOffsets) {
+    params.set('limit', pageBytes(args.limit, 'limit', hasOffsets ? 4096 : 2048, limits.log, logEncoding))
+  } else if (args.limit !== undefined) {
+    invalid('limit 只适用于按偏移读取的日志。')
+  }
   return request('GET', queryPath(path, params), { logEncoding })
 }
 
@@ -194,8 +203,10 @@ function forAction(args) {
 function forCommand(args) {
   const collection = args.name === undefined ? '/commands' : `${projectPath(args.name)}/commands`
   if (args.op === 'list') {
-    select(args, ['name'])
-    return request('GET', collection)
+    select(args, ['name', 'status'])
+    const query = new URLSearchParams()
+    if (args.status !== undefined) query.set('status', enumValue(args.status, 'status', commandStatuses))
+    return request('GET', queryPath(collection, query))
   }
   if (args.op === 'start') {
     select(args, ['name', 'mode', 'command', 'wait_seconds', 'status_only', 'idempotency_key'])
@@ -211,14 +222,13 @@ function forCommand(args) {
     return getTask(path, args)
   }
   select(args, ['name', 'id'])
-  return request('DELETE', path, { deadline: 30000 })
+  return args.op === 'cancel'
+    ? request('POST', `${path}/cancel`, { deadline: 30000 })
+    : request('DELETE', path, { deadline: 30000 })
 }
 
 const builders = { project: forProject, action: forAction, command: forCommand }
 const readOnly = new Set(['health', 'list', 'get', 'wait', 'files'])
-const terminal = new Set(['succeeded', 'failed', 'cancelled'])
-const active = new Set(['preparing', 'running', 'cancelling'])
-const streams = ['stdout', 'stderr']
 const pollInterval = 1000
 const transientWaitErrors = new Set(['request_timeout', 'transport_error', 'wait_expired'])
 
@@ -280,7 +290,7 @@ async function withStartLogs(group, args, response, signal, call) {
   }
 }
 
-async function waitForTask(spec, seconds, signal, call) {
+async function waitForTask(spec, seconds, signal, call, allowIdentityFallback) {
   const budget = AbortSignal.timeout(Math.ceil(seconds * 1000))
   const polling = signal ? AbortSignal.any([signal, budget]) : budget
   const interval = Math.min(pollInterval, seconds * 500)
@@ -288,7 +298,7 @@ async function waitForTask(spec, seconds, signal, call) {
   try {
     while (!polling.aborted) {
       let response = await requestRunner(spec, polling, call)
-      if (!last && response.http_status === 400 && response.error?.code === 'invalid_request' &&
+      if (allowIdentityFallback && !last && response.http_status === 400 && response.error?.code === 'invalid_request' &&
           response.error.message === 'Unexpected query parameter' && spec.path.includes('?include_input=1')) {
         // Older Runner versions do not expose the Action identity query.
         const path = spec.path.replace(/\?include_input=1(?:&|$)/, match => match.endsWith('&') ? '?' : '')
@@ -347,6 +357,18 @@ function toolResult(group, args, response) {
     if (body.error?.code === 'idempotency_pending') body.note = '同键的首次提交尚未返回；仅在同一 Runner 进程中稍后用原参数重试。'
   }
   if (!ok) {
+    if (group === 'command' && args.op === 'cancel' && body.http_status === 404 &&
+        body.error?.code === 'not_found' && body.error.message === 'Route not found') {
+      body.note = '此 Runner 不支持仅取消；请升级服务端。没有尝试 delete。'
+    }
+    if (body.http_status === 400 && body.error?.code === 'invalid_request' &&
+        /^Unexpected query parameters?$/.test(body.error.message)) {
+      if (group === 'command' && args.op === 'list' && args.status !== undefined) {
+        body.note = '此 Runner 可能尚不支持按状态筛选；请升级服务端，或显式去掉 status 查全部。'
+      } else if (streams.some(stream => args[`${stream}_tail`] !== undefined)) {
+        body.note = '此 Runner 可能尚不支持日志尾读；请升级服务端，或先查字节数再按偏移读取。'
+      }
+    }
     if (group === 'action' && args.op === 'start' && (body.action ||
         ['invalid_request', 'worker_unavailable', 'worker_unavailable_reset_incomplete'].includes(body.error?.code))) {
       body.next_get = { op: 'get', name: args.name }
@@ -369,6 +391,10 @@ function toolResult(group, args, response) {
       }
     }
     return { outcome: 'succeeded', ...body }
+  }
+  if (group === 'command' && args.op === 'cancel') {
+    const target = taskTarget(group, args, body)
+    return { outcome: 'succeeded', ...body, next_get: { op: 'get', ...target, status_only: true } }
   }
   if (!['start', 'get', 'wait'].includes(args.op)) return { outcome: 'succeeded', ...body }
 
@@ -420,7 +446,10 @@ function definition(group, { description, ops, params }) {
         type: 'object', additionalProperties: true, required: ['outcome'],
         properties: {
           outcome: choice('操作或任务结果；HTTP 状态只用于诊断。', ['succeeded', 'failed', 'cancelled', 'pending', 'request_error', 'unknown']),
-          ...(group === 'project' ? { cpu: cpuOutput } : {}),
+          ...(group === 'project' ? { cpu: cpuOutput } : {
+            started_at: { type: 'integer', description: '任务记录创建时的 Unix 毫秒时间戳。' },
+            finished_at: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: '任务结束时的 Unix 毫秒时间戳；未结束为 null。' },
+          }),
         },
       },
       render(_args, value) { return [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
@@ -443,7 +472,8 @@ function definition(group, { description, ops, params }) {
         const signal = exec?.signal
         const call = {}
         let response = args.op === 'wait'
-          ? await waitForTask(spec, waitSeconds(args), signal, call)
+          ? await waitForTask(spec, waitSeconds(args), signal, call,
+            group === 'action' && !args.include_input && !streams.some(stream => args[`${stream}_tail`] !== undefined))
           : await requestRunner(spec, signal, call)
         if (spec.fileFallback && response.http_status === 400 && response.error?.code === 'invalid_request' &&
             response.error.message === 'entry_offset and entry_limit are only for directories') {

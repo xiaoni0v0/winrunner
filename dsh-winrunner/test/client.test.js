@@ -479,6 +479,129 @@ test('wait stops before querying another endpoint if configuration changes mid-c
   assert.equal(otherHits, 0)
 })
 
+test('filters both command collections on the server and preserves task timestamps', async t => {
+  const client = await fixture(t)
+  const seen = []
+  const record = { id: '0', status: 'running', started_at: 1700000000000, finished_at: null }
+  await client.configure(await server(t, (req, res) => {
+    seen.push(req.url)
+    json(res, { commands: [record] })
+  }))
+  for (const status of ['active', 'preparing', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']) {
+    const result = await client.run('command', { op: 'list', params_json: JSON.stringify({ name: 'Demo', status }) })
+    assert.deepEqual(result.commands, [record])
+    assert.equal(seen.at(-1), `/projects/Demo/commands?status=${status}`)
+  }
+  await client.run('command', { op: 'list', status: 'active' })
+  assert.equal(seen.at(-1), '/commands?status=active')
+  const count = seen.length
+  assert.equal((await client.run('command', { op: 'list', status: 'pending' })).error.code, 'invalid_input')
+  assert.equal(seen.length, count)
+})
+
+test('reads tails and offsets by stream with reusable continuation and opt-in input', async t => {
+  const client = await fixture(t)
+  const seen = []
+  const stdout = Buffer.from('x中!')
+  await client.configure(await server(t, (req, res) => {
+    seen.push(req.url)
+    const { pathname, searchParams: query } = new URL(req.url, 'http://localhost')
+    const action = pathname.endsWith('/actions')
+    json(res, {
+      ...(action ? { action_id: 'a'.repeat(32) } : { id: '0' }),
+      status: action ? 'succeeded' : 'running',
+      started_at: 1700000000000, finished_at: action ? 1700000000050 : null,
+      stdout_bytes: stdout.length, stderr_bytes: 5,
+      ...(query.has('include_input') && !action ? { command: 'echo private' } : {}),
+      ...(query.has('stdout_tail') ? { stdout: { data_base64: stdout.subarray(-Number(query.get('stdout_tail'))).toString('base64'), next_offset: stdout.length } } : {}),
+      ...(query.has('stderr_offset') ? { stderr: { data_base64: 'eA==', next_offset: 2 } } : {}),
+    })
+  }))
+  const result = await client.run('command', { op: 'get', name: 'Demo', id: '0', stdout_tail: 4, stderr_offset: 1, include_input: true })
+  assert.equal(seen.at(-1), '/projects/Demo/commands/0?include_input=1&stdout_tail=4&stderr_offset=1&limit=4096')
+  assert.deepEqual(result.stdout, { text: '中!', next_offset: 5, remaining: 'caught_up' })
+  assert.equal(result.started_at, 1700000000000)
+  assert.equal(result.finished_at, null)
+  assert.equal(result.command, 'echo private')
+  assert.deepEqual(result.next_get, { op: 'get', name: 'Demo', id: '0', stdout_offset: 5, stderr_offset: 2 })
+  const action = await client.run('action', { op: 'wait', name: 'Demo', include_input: true, stdout_tail: 1, encoding: 'base64' })
+  assert.equal(seen.at(-1), '/projects/Demo/actions?include_input=1&stdout_tail=1')
+  assert.equal(action.action_id, 'a'.repeat(32))
+  assert.equal(action.finished_at, 1700000000050)
+  assert.deepEqual(action.stdout, { data_base64: 'IQ==', next_offset: 5, remaining: 'complete' })
+  const input = await client.run('command', { op: 'get', id: '0', status_only: true, include_input: true })
+  assert.equal(seen.at(-1), '/commands/0?include_input=1')
+  assert.equal(input.command, 'echo private')
+  const count = seen.length
+  for (const options of [
+    { stdout_offset: 0, stdout_tail: 4 }, { stdout_tail: 4, limit: 4096 },
+    { status_only: true, stderr_tail: 4 }, { stdout_tail: 8193 },
+    { stdout_tail: 1 }, { include_input: 1 },
+  ]) assert.equal((await client.run('command', { op: 'get', id: '0', ...options })).error.code, 'invalid_input')
+  assert.equal(seen.length, count)
+})
+
+test('command cancel is a bodyless scoped POST with status lookup, not DELETE', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res, body) => {
+    seen.push([req.method, req.url, body.length])
+    if (req.method === 'GET') return json(res, { status: 'succeeded' })
+    res.writeHead(204)
+    res.end()
+  }))
+  const tool = client.tools.get('winrunner_command')
+  assert(tool.parameters.properties.op.enum.includes('cancel'))
+  assert.equal(tool.isConcurrencySafe({ op: 'cancel' }), false)
+  const call = { op: 'cancel', params_json: '{"name":"Demo","id":"0"}' }
+  for (let i = 0; i < 2; i++) {
+    const result = await client.run('command', call)
+    assert.equal(result.http_status, 204)
+    assert.equal(result.status, undefined)
+    assert.deepEqual(result.next_get, { op: 'get', params_json: '{"name":"Demo","id":"0","status_only":true}' })
+    assert.equal((await client.run('command', result.next_get)).status, 'succeeded')
+  }
+  await client.run('command', { op: 'cancel', id: '0' })
+  await client.run('command', { op: 'delete', id: '0' })
+  assert.deepEqual(seen, [
+    ['POST', '/projects/Demo/commands/0/cancel', 0], ['GET', '/projects/Demo/commands/0', 0],
+    ['POST', '/projects/Demo/commands/0/cancel', 0], ['GET', '/projects/Demo/commands/0', 0],
+    ['POST', '/commands/0/cancel', 0], ['DELETE', '/commands/0', 0],
+  ])
+})
+
+test('unsupported new APIs on old runners do not trigger fallback requests', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res) => {
+    seen.push([req.method, req.url])
+    if (req.url.endsWith('/cancel')) return json(res, { error: { code: 'not_found', message: 'Route not found' } }, 404)
+    json(res, { error: { code: 'invalid_request', message: req.url.includes('status=') ? 'Unexpected query parameters' : 'Unexpected query parameter' } }, 400)
+  }))
+  assert.match((await client.run('command', { op: 'cancel', id: '0' })).note, /没有尝试 delete/)
+  assert.match((await client.run('command', { op: 'list', status: 'active' })).note, /按状态筛选/)
+  assert.match((await client.run('action', { op: 'wait', name: 'Demo', stdout_tail: 4 })).note, /日志尾读/)
+  assert.equal((await client.run('command', { op: 'wait', id: '0', status_only: true, include_input: true })).http_status, 400)
+  assert.deepEqual(seen, [
+    ['POST', '/commands/0/cancel'], ['GET', '/commands?status=active'],
+    ['GET', '/projects/Demo/actions?include_input=1&stdout_tail=4'], ['GET', '/commands/0?include_input=1'],
+  ])
+})
+
+test('surfaces the Runner authentication ban and Retry-After without retrying', async t => {
+  const client = await fixture(t)
+  const seen = []
+  await client.configure(await server(t, (req, res) => {
+    seen.push([req.method, req.url])
+    json(res, { error: { code: 'auth_ip_banned', message: 'Authentication temporarily blocked' } }, 429, { 'retry-after': '7' })
+  }))
+  for (const [op, args] of [['list', { status: 'active' }], ['cancel', { id: '0' }]]) {
+    const result = await client.run('command', { op, ...args })
+    assert.deepEqual([result.outcome, result.error.code, result.http_status, result.retry_after_seconds], ['request_error', 'auth_ip_banned', 429, 7])
+  }
+  assert.deepEqual(seen, [['GET', '/commands?status=active'], ['POST', '/commands/0/cancel']])
+})
+
 test('uses a UTF-8 character boundary as the next log offset', async t => {
   const client = await fixture(t)
   const bytes = Buffer.from(`${'x'.repeat(2047)}中!`)
