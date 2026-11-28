@@ -11,12 +11,12 @@ from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING
 
-import config
-from runner import APIError, Runner, action_body, command_body, invalid
-from winfiles import BadPath, normalized_relative
+from . import config
+from .runner import APIError, Runner, action_body, command_body, invalid
+from .winfiles import BadPath, normalized_relative
 
 if TYPE_CHECKING:
-    from winrunner import StartReplay
+    from winrunner.server import StartReplay
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ class DesktopRunner:
     def browse(
         self, project: ProjectSelection, relative: str, offset: int, cancelled: Event
     ) -> dict:
-        from winrunner_files import browse
+        from .winrunner_files import browse
 
         return browse(
             self.runner,
@@ -147,7 +147,7 @@ class DesktopRunner:
         range_header: str | None,
         cancelled: Event,
     ) -> int:
-        from winrunner_files import save_file
+        from .winrunner_files import save_file
 
         return save_file(
             self.runner,
@@ -168,7 +168,7 @@ class DesktopRunner:
         destination: Path,
         cancelled: Event,
     ) -> int:
-        from winrunner_files import save_bytes
+        from .winrunner_files import save_bytes
 
         def get(offsets: dict[str, int] | None = None) -> dict:
             if command is not None:

@@ -91,18 +91,13 @@ class RunnerCase(unittest.TestCase):
         self.port = free_port()
         self.install = self.scratch / "app"
         self.install.mkdir()
-        for name in (
-            "config.py",
-            "gitrepo.py",
-            "runner.py",
-            "winfiles.py",
-            "winprocess.py",
-            "winrunner.py",
-            "winrunner_files.py",
-            "winrunner-progress.psm1",
-        ):
-            shutil.copyfile(ROOT / name, self.install / name)
-        self.settings = self.install / "config.py"
+        shutil.copyfile(ROOT / "main.py", self.install / "main.py")
+        shutil.copytree(
+            ROOT / "winrunner",
+            self.install / "winrunner",
+            ignore=shutil.ignore_patterns("__pycache__", "winrunner.log"),
+        )
+        self.settings = self.install / "winrunner" / "config.py"
         with self.settings.open("a", encoding="utf-8") as settings:
             settings.write(
                 f"\nTOKEN = {self.token!r}\nHOST = '127.0.0.1'\nPORT = {self.port}\n"
@@ -123,7 +118,7 @@ class RunnerCase(unittest.TestCase):
         self.diagnostics = self.scratch / "runner.log"
         with self.diagnostics.open("ab") as out:
             self.server = subprocess.Popen(
-                [sys.executable, "winrunner.py", "--nogui"],
+                [sys.executable, str(self.install / "main.py"), "--nogui"],
                 cwd=self.install,
                 env=self.environment(),
                 stdin=subprocess.DEVNULL,
@@ -285,7 +280,7 @@ class CommandIntegrationTests(RunnerCase):
         with self.settings.open("a", encoding="utf-8") as settings:
             settings.write('\nTOKEN = "123456"\n')
         result = subprocess.run(
-            [sys.executable, "winrunner.py", "--nogui"],
+            [sys.executable, str(self.install / "main.py"), "--nogui"],
             cwd=self.install,
             env=dict(self.environment(), RUNNER_TOKEN="legacy-setting"),
             stdin=subprocess.DEVNULL,
@@ -294,7 +289,7 @@ class CommandIntegrationTests(RunnerCase):
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn(b"Set TOKEN in config.py", result.stderr)
+        self.assertIn(b"Set TOKEN in winrunner/config.py", result.stderr)
 
     def test_health_and_authentication_precede_request_processing(self):
         health = self.call(200, "GET", "/health")

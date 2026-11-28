@@ -10,8 +10,8 @@ import unittest
 from unittest.mock import patch
 
 if sys.platform == "win32":
-    from gitrepo import CommitError, GitFailure, Repository
-    from winprocess import Job
+    from winrunner.gitrepo import CommitError, GitFailure, Repository
+    from winrunner.winprocess import Job
 
     class LocalRepository(Repository):
         def git(self, *args, **kwargs):

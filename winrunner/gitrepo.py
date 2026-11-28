@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 
-import config
+from . import config
 
 _REF_PATH_CONFLICT = re.compile(
     rb"cannot lock ref 'refs/(?:heads|tags)/[^\r\n]+': "

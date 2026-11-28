@@ -16,8 +16,8 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-import config
-from winrunner import (
+from winrunner import config
+from winrunner.server import (
     HTTPHandler,
     HTTPServer,
     ThreadingHTTPServer,
@@ -96,14 +96,14 @@ class HTTPRegressionTests(unittest.TestCase):
     def test_failed_auth_bans_peer_for_ten_seconds_without_extending(self):
         self.start_server(reported_peer="203.0.113.42")
         clock = Mock(return_value=100.0)
-        with patch("winrunner.time", Mock(monotonic=clock)):
+        with patch("winrunner.server.time", Mock(monotonic=clock)):
             status, body, headers = self.request(
                 "GET", "/projects", auth="Bearer wrong"
             )
             self.assertEqual((status, body["error"]["code"]), (401, "unauthorized"))
             self.assertEqual(headers["WWW-Authenticate"], "Bearer")
 
-            with patch("winrunner.hmac.compare_digest") as compare:
+            with patch("winrunner.server.hmac.compare_digest") as compare:
                 for now, retry, auth in (
                     (100.0, "10", True),
                     (105.25, "5", "Bearer wrong"),
@@ -142,7 +142,7 @@ class HTTPRegressionTests(unittest.TestCase):
     def test_correct_token_is_not_rate_limited(self):
         self.start_server()
         # All requests fall within the same instant on the server clock.
-        with patch("winrunner.time", Mock(monotonic=Mock(return_value=100.0))):
+        with patch("winrunner.server.time", Mock(monotonic=Mock(return_value=100.0))):
             for _ in range(20):
                 self.assertEqual(self.request("GET", "/projects")[0], 200)
         self.assertEqual(self.runner.list_projects.call_count, 20)
@@ -185,7 +185,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertEqual(self.runner.start_action.call_count, 2)
 
     def test_desktop_and_http_share_project_command_replay(self):
-        from winrunner_desktop import DesktopRunner, ProjectSelection
+        from winrunner.winrunner_desktop import DesktopRunner, ProjectSelection
 
         self.start_server()
         desktop = DesktopRunner(self.runner, self.server.start_replay)
@@ -253,7 +253,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.runner.start_command.assert_called_once()
 
     def test_integrated_window_reads_state_while_http_serves_and_stops_on_return(self):
-        from winrunner_gui import Target, View
+        from winrunner.winrunner_gui import Target, View
 
         with HTTPServer(("127.0.0.1", 0), HTTPHandler) as server:
             server.token = TOKEN.encode("ascii")
@@ -294,8 +294,13 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.backend_is_running = is_running
 
             with (
-                patch("winrunner.health_snapshot", return_value={"run_id": "demo-run"}),
-                patch("winrunner_gui.run_integrated", side_effect=window) as gui,
+                patch(
+                    "winrunner.server.health_snapshot",
+                    return_value={"run_id": "demo-run"},
+                ),
+                patch(
+                    "winrunner.winrunner_gui.run_integrated", side_effect=window
+                ) as gui,
             ):
                 serve_with_gui(server)
             gui.assert_called_once()
@@ -314,7 +319,7 @@ class HTTPRegressionTests(unittest.TestCase):
 
             with (
                 patch.object(threading.Thread, "start", start_then_interrupt),
-                patch("winrunner_gui.run_integrated") as gui,
+                patch("winrunner.winrunner_gui.run_integrated") as gui,
             ):
                 serve_with_gui(server)
             gui.assert_not_called()
@@ -336,7 +341,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.assertNotIn("private-path", text)
 
     def test_process_cleanup_diagnostics_use_service_logging(self):
-        logger = logging.getLogger("winprocess")
+        logger = logging.getLogger("winrunner.winprocess")
         original = (logger.level, logger.propagate, logger.handlers[:])
         console = io.StringIO()
         with tempfile.TemporaryDirectory() as folder:
@@ -711,7 +716,7 @@ class HTTPRegressionTests(unittest.TestCase):
                 self.assertEqual(body["error"]["code"], "file_busy")
 
                 self.runner.list_projects.side_effect = error
-                with patch("winrunner.LOG.exception") as log:
+                with patch("winrunner.server.LOG.exception") as log:
                     status, body, _ = self.request("GET", "/projects")
                     log.assert_called_once()
                 self.assertEqual(status, 500)
@@ -728,7 +733,7 @@ class HTTPRegressionTests(unittest.TestCase):
         entry = Mock(is_dir=True)
         entry.list_entries.side_effect = error
         self.runner.file_entry.return_value = nullcontext(entry)
-        with patch("winrunner.LOG.exception") as log:
+        with patch("winrunner.server.LOG.exception") as log:
             status, body, _ = self.request("GET", path)
             log.assert_called_once()
         self.assertEqual(status, 500)
@@ -775,7 +780,7 @@ class HTTPRegressionTests(unittest.TestCase):
         self.start_server(reported_peer="203.0.113.42")
         with (
             tempfile.TemporaryFile() as file,
-            patch("winrunner.LOG.exception") as log,
+            patch("winrunner.server.LOG.exception") as log,
         ):
             file.write(b"test data")
             file.flush()

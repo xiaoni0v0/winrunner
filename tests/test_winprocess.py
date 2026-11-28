@@ -10,8 +10,8 @@ import unittest
 from unittest.mock import patch
 
 if os.name == "nt":
-    import winprocess
-    from winprocess import (
+    from winrunner import winprocess
+    from winrunner.winprocess import (
         CpuSampler,
         Job,
         JobCancelled,
@@ -264,7 +264,9 @@ class WinProcessTests(unittest.TestCase):
 
         with (
             patch.object(threading.Thread, "start", start),
-            patch("winprocess._ResumeThread", wraps=winprocess._ResumeThread) as resume,
+            patch(
+                "winrunner.winprocess._ResumeThread", wraps=winprocess._ResumeThread
+            ) as resume,
         ):
             worker = self.start_worker(
                 lambda: self.run_python(
@@ -287,7 +289,7 @@ class WinProcessTests(unittest.TestCase):
             return 0xFFFFFFFF
 
         started = threading.Event()
-        with patch("winprocess._ResumeThread", side_effect=fail_resume):
+        with patch("winrunner.winprocess._ResumeThread", side_effect=fail_resume):
             worker = self.start_worker(
                 lambda: self.run_python("print('must not run')", on_started=started.set)
             )
@@ -311,7 +313,9 @@ class WinProcessTests(unittest.TestCase):
 
         with (
             patch.object(threading.Thread, "start", start),
-            patch("winprocess._ResumeThread", wraps=winprocess._ResumeThread) as resume,
+            patch(
+                "winrunner.winprocess._ResumeThread", wraps=winprocess._ResumeThread
+            ) as resume,
         ):
             worker = self.start_worker(
                 lambda: self.run_python("print('must not run')", on_started=started.set)
@@ -375,8 +379,11 @@ class WinProcessTests(unittest.TestCase):
                     return 0
 
                 with (
-                    patch(f"winprocess.{failed_operation}", side_effect=cleanup_failed),
-                    self.assertLogs("winprocess", level="ERROR") as diagnostics,
+                    patch(
+                        f"winrunner.winprocess.{failed_operation}",
+                        side_effect=cleanup_failed,
+                    ),
+                    self.assertLogs(winprocess.LOG, level="ERROR") as diagnostics,
                 ):
                     worker = self.start_worker(
                         lambda: self.run_python(
@@ -418,10 +425,10 @@ class WinProcessTests(unittest.TestCase):
             return close_handle(handle)
 
         with (
-            patch("winprocess._ResumeThread", side_effect=failure),
-            patch("winprocess._TerminateJobObject", return_value=0),
-            patch("winprocess._CloseHandle", side_effect=fail_to_close_job),
-            self.assertLogs("winprocess", level="ERROR") as diagnostics,
+            patch("winrunner.winprocess._ResumeThread", side_effect=failure),
+            patch("winrunner.winprocess._TerminateJobObject", return_value=0),
+            patch("winrunner.winprocess._CloseHandle", side_effect=fail_to_close_job),
+            self.assertLogs(winprocess.LOG, level="ERROR") as diagnostics,
         ):
             worker = self.start_worker(lambda: self.run_python("pass"))
             self.assertIs(self.finish(worker, timeout=3), failure)
@@ -493,7 +500,9 @@ class CpuSamplerTests(unittest.TestCase):
             self.assertGreaterEqual(
                 first[key]["total_bytes"], first[key]["available_bytes"]
             )
-        with patch("winprocess._GetActiveProcessorGroupCount", return_value=1):
+        with patch(
+            "winrunner.winprocess._GetActiveProcessorGroupCount", return_value=1
+        ):
             try:
                 self.sampler.start()
                 # Wait without calling health: no request establishes the baseline.
@@ -517,7 +526,7 @@ class CpuSamplerTests(unittest.TestCase):
             release.wait(5)
             return None
 
-        with patch("winprocess._CpuReader") as build:
+        with patch("winrunner.winprocess._CpuReader") as build:
             reader = build.return_value
             reader.sample.side_effect = sample
             try:
@@ -567,9 +576,9 @@ class CpuSamplerTests(unittest.TestCase):
         reader = _CpuReader()
         self.addCleanup(reader.close)
         with (
-            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
-            patch("winprocess._GetSystemTimes") as single_group,
-            patch("winprocess._PdhCpu") as build,
+            patch("winrunner.winprocess._GetActiveProcessorGroupCount", return_value=2),
+            patch("winrunner.winprocess._GetSystemTimes") as single_group,
+            patch("winrunner.winprocess._PdhCpu") as build,
         ):
             pdh = build.return_value
             pdh.sample.side_effect = [None, 34.5]
@@ -584,9 +593,11 @@ class CpuSamplerTests(unittest.TestCase):
         reader = _CpuReader()
         self.addCleanup(reader.close)
         with (
-            patch("winprocess._GetActiveProcessorGroupCount", return_value=2),
-            patch("winprocess._GetSystemTimes") as single_group,
-            patch("winprocess._PdhCpu", side_effect=OSError("unavailable")) as build,
+            patch("winrunner.winprocess._GetActiveProcessorGroupCount", return_value=2),
+            patch("winrunner.winprocess._GetSystemTimes") as single_group,
+            patch(
+                "winrunner.winprocess._PdhCpu", side_effect=OSError("unavailable")
+            ) as build,
         ):
             self.assertIsNone(reader.sample(0))
             self.assertIsNone(reader.sample(59))

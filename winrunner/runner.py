@@ -16,10 +16,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import config
-from gitrepo import CommitError, GitFailure, Repository
-from winfiles import BadPath, pinned_entry, pinned_path
-from winprocess import Job, JobCancelled
+from . import config
+from .gitrepo import CommitError, GitFailure, Repository
+from .winfiles import BadPath, pinned_entry, pinned_path
+from .winprocess import Job, JobCancelled
 
 PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])\Z", re.I)

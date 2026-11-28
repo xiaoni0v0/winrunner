@@ -1,4 +1,4 @@
-"""Local WinRunner desktop console. Run beside config.py with Python 3.10+."""
+"""Local WinRunner desktop console, launched through main.py."""
 
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ from queue import Empty, SimpleQueue
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import TYPE_CHECKING, Literal
 
-from runner import APIError
-from winrunner_desktop import DesktopRunner, ProjectSelection, Submission
+from .runner import APIError
+from .winrunner_desktop import DesktopRunner, ProjectSelection, Submission
 
 if TYPE_CHECKING:
-    from winrunner_gui_files import FileBrowser
-    from winrunner_gui_forms import FormKind, SubmitForm
+    from .winrunner_gui_files import FileBrowser
+    from .winrunner_gui_forms import FormKind, SubmitForm
 
 INTEGRATED_REFRESH_MS = 850
 REOPEN_MS = 450
@@ -1303,7 +1303,7 @@ class Dashboard:
         success: Callable[[object], None],
         confirm: str = "",
     ) -> None:
-        from winrunner_gui_forms import SubmitForm
+        from .winrunner_gui_forms import SubmitForm
 
         previous = self._forms.get(key)
         if previous is not None and previous.winfo_exists():
@@ -1508,7 +1508,7 @@ class Dashboard:
                 self._report("已复制仓库地址")
 
     def _browse_files(self) -> None:
-        from winrunner_gui_files import FileBrowser
+        from .winrunner_gui_files import FileBrowser
 
         desktop, project = self.desktop, self._project_selection()
         if desktop is None or project is None:
@@ -1956,6 +1956,4 @@ def run_integrated(
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        "Start the desktop console with: python winrunner.py (without --nogui)"
-    )
+    raise SystemExit("Start the desktop console with: python main.py (without --nogui)")

@@ -3,3 +3,4 @@ __pycache__/
 .winrunner-data/
 .venv/
 /winrunner.log
+/winrunner/winrunner.log

@@ -9,11 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import winrunner_gui as gui
-from runner import APIError, Project, Runner, Task
-from winrunner import StartReplay
-from winrunner_desktop import DesktopRunner, ProjectSelection, Submission
-from winrunner_gui_forms import SubmitForm
+from winrunner import winrunner_gui as gui
+from winrunner.runner import APIError, Project, Runner, Task
+from winrunner.server import StartReplay
+from winrunner.winrunner_desktop import DesktopRunner, ProjectSelection, Submission
+from winrunner.winrunner_gui_forms import SubmitForm
 
 
 class DesktopAdapterTests(unittest.TestCase):

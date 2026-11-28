@@ -4,9 +4,12 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 
 ## 配置和安装
 
-1. 在**运行 DSH Host 的账号**下新建 `~/.winrunner/client.json`（Windows 为 `%USERPROFILE%\.winrunner\client.json`）。可复制 `client.example.json` 的结构，填入 `baseUrl`（例如 `http://192.0.2.10`，不要加路径）、`port`（例如 `8080`）和 `token`。也可写成 `"baseUrl": "http://192.0.2.10:8080"`，此时将 `port` 设为 `null` 或省略；两处都填时必须一致。实际凭据文件应放在仓库之外，不要上传或粘贴到对话。
+1. 在**运行 DSH Host 的账号**下新建 `~/.winrunner/client.json`（Windows 为 `%USERPROFILE%\.winrunner\client.json`）。可参考 [`dsh-winrunner/client.example.json`](<client.example.json>)，填入 `baseUrl`（例如 `http://192.0.2.10`，不要加路径）、`port`（例如 `8080`）和 `token`。也可写成 `"baseUrl": "http://192.0.2.10:8080"`，此时将 `port` 设为 `null` 或省略；两处都填时必须一致。实际凭据文件应放在仓库之外，不要上传或粘贴到对话。
 2. 若必须使用非回环明文 HTTP，在配置中显式设置 `"allowInsecureHttp": true`。HTTP 不加密令牌或请求内容；优先用 HTTPS，明文时应依赖受控的专用网络。插件不跟随重定向，不自动重试写操作。
-3. 在 DSH 的 **插件** → **添加插件** → **本地目录** 选择本目录。首次安装如果显示已应用，不用重启，开一个新会话确认工具可见；如果提示需要重启，或者要加载已安装插件的新代码，则重启 DSH。安装会影响当前 profile；只给可信的 profile 启用。插件的命令工具会以远端 Runner 账号运行命令，Action 提交会替换上一轮结果。
+3. 在 DSH 的**插件**页点击**添加插件**（或从旁边的下拉菜单选择**安装第三方插件**），将 `github:xiaoni0v0/winrunner` 填入**包名或地址**，点击**安装**并确认。已克隆仓库时也可以填入**仓库根目录的绝对路径**（含 [`package.json`](<../package.json>)），不要选择 `dsh-winrunner/` 子目录。不需要执行 `npm install` 或单独部署客户端。
+4. 打开新会话，确认 `winrunner_project`、`winrunner_action`、`winrunner_command` 可用。如果 DSH 提示需要重启，先重启再验证。插件会影响当前 profile；只在可信的 profile 启用。命令工具以远端 Runner 账号运行命令，提交 Action 会替换上一轮结果。
+
+从旧版升级时，在 DSH 中卸载同名插件（包括此前从 `dsh-winrunner/` 安装的版本），再从上述 GitHub 地址或新仓库根目录安装，重启 DSH 后验证。无需改动仓库外的 `~/.winrunner/client.json`。GitHub 地址未指定提交，不代表插件会自动更新。
 
 三个工具及基础任务流程已在旧版 WinRunner 上做过本机验证。新版接口的回归测试使用回环模拟服务，不需要部署 WinRunner 或更改当前 DSH profile。
 
@@ -26,7 +29,7 @@ WinRunner 的 Host-only 客户端。无需安装额外的 Node 依赖。WinRunne
 
 `winrunner_command` 的所有操作都接受可选的 `name`；省略则使用全局集合。`list` 可传 `status: "active"`（准备中、运行中、取消中），或 `preparing`、`running`、`cancelling`、`succeeded`、`failed`、`cancelled` 之一精确筛选；省略列全部。各集合可以有相同的 `id`，查询、等待、取消或删除时要带上启动时的项目名。`next_get` 和 `next_wait` 会保留这个参数。
 
-项目命令从当前工作树启动，不重置目录、不覆盖已有日志。命令之间以及命令与 Action 可以并行，调用端需协调共享文件；Action 仍可能重置工作树。详见 [项目命令 API](<../API.md#项目命令>)。
+项目命令从当前工作树启动，不重置目录、不覆盖已有日志。命令之间以及命令与 Action 可以并行，调用端需协调共享文件；Action 仍可能重置工作树。详见 [项目命令 API](<../docs/API.md#项目命令>)。
 
 - 短任务可以给 `start` 传 `wait_seconds: 5`。任务已结束且有输出时，客户端顺带读取两路短日志；如果补读失败，仍返回原任务结果，并单列 `logs_error`。`start` 默认不等（0 秒），最多等 60 秒；终态日志是额外的只读请求，最多再等 4 秒。
 - `pending` 时优先用返回的 `next_wait`，不要重复提交。`wait` 默认最多等 15 秒，可指定 1–60 秒。它把约每秒一次的查询合在一次工具调用里；等满还没结束时返回最后一次状态，标记 `wait_expired: true`；续接的 `next_wait` 回到默认 15 秒，不沿用本次的短等待上限。`start` 和 `wait` 的等待上限都不会停止远端任务。Action 和命令都可用 `cancel` 停止并保留记录和日志；命令的 `cancel` 强制终止进程树，可重复调用，不改已结束命令的状态。命令的 `cancel` 返回成功表示操作完成，不等于任务一定变成 `cancelled`；用返回的 `next_get` 核对。只有要丢弃命令记录和日志时才用 `delete`。
@@ -52,4 +55,4 @@ Action 和命令的 `start` 可选 `idempotency_key`（1–128 个字母、数�
 
 ## 本机测试
 
-`node --test`。测试使用本机回环模拟服务和自动清理的临时配置，不需要 WinRunner 实例或真实凭据。
+在仓库根目录运行 `npm test`。测试使用本机回环模拟服务和自动清理的临时配置，不需要 WinRunner 实例或真实凭据。用 `npm pack --dry-run` 可检查插件包会包含哪些文件。

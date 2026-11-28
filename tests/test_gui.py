@@ -8,7 +8,7 @@ from datetime import datetime
 from queue import SimpleQueue
 from unittest.mock import MagicMock, call, patch
 
-import winrunner_gui as gui
+from winrunner import winrunner_gui as gui
 
 
 class ViewTests(unittest.TestCase):

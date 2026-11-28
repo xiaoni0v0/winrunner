@@ -8,9 +8,9 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
-import winrunner_gui as gui
-from runner import APIError
-from winrunner_gui_files import Browse, FileBrowser, Save
+from winrunner import winrunner_gui as gui
+from winrunner.runner import APIError
+from winrunner.winrunner_gui_files import Browse, FileBrowser, Save
 
 
 def listing(path: str, *entries: tuple[str, str, int | None], nxt=None) -> dict:
@@ -208,7 +208,8 @@ class FileBrowserTests(unittest.TestCase):
 
         dest = Path("chosen log.txt")
         with patch(
-            "winrunner_gui_files.filedialog.asksaveasfilename", return_value=str(dest)
+            "winrunner.winrunner_gui_files.filedialog.asksaveasfilename",
+            return_value=str(dest),
         ) as picker:
             set_entry(browser._range_entry, "not a range")
             browser._range_button.invoke()
@@ -358,7 +359,8 @@ class FileBrowserTests(unittest.TestCase):
         self.ready(browser)
         self.select(browser, "file")
         with patch(
-            "winrunner_gui_files.filedialog.asksaveasfilename", return_value="dest"
+            "winrunner.winrunner_gui_files.filedialog.asksaveasfilename",
+            return_value="dest",
         ):
             browser._download_button.invoke()
         self.assertTrue(started.wait(timeout=2))
@@ -387,7 +389,7 @@ class FileBrowserTests(unittest.TestCase):
             return "dest"
 
         with patch(
-            "winrunner_gui_files.filedialog.asksaveasfilename",
+            "winrunner.winrunner_gui_files.filedialog.asksaveasfilename",
             side_effect=close_during_picker,
         ):
             browser._download_button.invoke()

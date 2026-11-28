@@ -10,8 +10,8 @@ from collections.abc import Callable
 from tkinter import ttk
 from typing import Literal
 
-import config
-from winrunner_gui import (
+from . import config
+from .winrunner_gui import (
     BG,
     BORDER,
     FONT,

@@ -9,7 +9,8 @@ from pathlib import Path
 TOKEN = "123456"
 HOST = "0.0.0.0"
 PORT = 18080
-DATA_DIR = Path(__file__).resolve().parent / ".winrunner-data"
+# Keep runtime data alongside main.py, independent of the working directory.
+DATA_DIR = Path(__file__).resolve().parents[1] / ".winrunner-data"
 DEFAULT_TIMEOUT = 10.0
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_HTTP_CONNECTIONS = 64

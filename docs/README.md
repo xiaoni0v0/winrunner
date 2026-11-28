@@ -2,22 +2,26 @@
 
 把一台 Windows 竞价实例作为 HTTP 算力节点。调用方提交 Git 仓库里的脚本或临时 Windows 命令，轮询状态，取回日志和文件。接口见 [API.md](<API.md>)。
 
-## 运行方式
+## 安装 DSH 插件
+
+在 DSH 的 **插件** 页面点击 **添加插件**，在「包名或地址」填入 `github:xiaoni0v0/winrunner`。本地开发时选择仓库根目录，而不是 `dsh-winrunner/`。插件只连接已单独部署的 WinRunner 服务，不安装或启动 Python 服务。地址和令牌配置见 [插件说明](<../dsh-winrunner/README.md>)。
+
+## 运行 Python 服务
 
 - 支持 Windows 10 / Windows Server 2016 或更新版本。镜像预装 Python 3.10+、Git for Windows，以及任务需要的 Node.js 等解释器；Runner 不依赖第三方 Python 包。
-- 先在 [config.py](<config.py>) 中把 `TOKEN = "123456"` 改为自己的随机令牌；占位值不能启动。监听地址和端口设为 `0.0.0.0:18080`，不需要设置环境变量。不要提交真实令牌，制作通用镜像前应还原占位值。
+- 先在 [config.py](<../winrunner/config.py>) 中把 `TOKEN = "123456"` 改为自己的随机令牌；占位值不能启动。监听地址和端口设为 `0.0.0.0:18080`，不需要设置环境变量。不要提交真实令牌，制作通用镜像前应还原占位值。
 - **启动前在云安全组中只允许调用端的出口 IP 访问 TCP 18080。** 所有 API 均要求 `Authorization: Bearer <token>`。HTTP 不防窃听或篡改；任务以 Runner 账号权限运行，不做沙箱，只接收可信调用方和脚本。
-- 数据目录默认是项目目录下的 `.winrunner-data`；Runner 每次启动会清掉其中的旧项目和缓存。Action 解释器白名单也在 [config.py](<config.py>) 中，默认提供 `python`、`python3` 和 `node`。
+- 数据目录默认是项目目录下的 `.winrunner-data`；Runner 每次启动会清掉其中的旧项目和缓存。Action 解释器白名单也在 [config.py](<../winrunner/config.py>) 中，默认提供 `python`、`python3` 和 `node`。
 
-从项目目录在 PowerShell 启动：
+从项目目录在 PowerShell 启动（升级旧部署时，把本机配置值迁入新的 `winrunner/config.py`，并将启动命令改为 `python main.py`；不要提交令牌）：
 
 ```powershell
-python winrunner.py
+python main.py
 ```
 
-默认同时打开 WinRunner 本机控制台。点关闭会短暂隐藏窗口，随后自动打开，不影响服务和任务；要停止服务并取消正在运行的任务，请在启动服务的终端按 **Ctrl+C**。纯命令行或无桌面环境使用 `python winrunner.py --nogui`（不加载 Tkinter）。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
+默认同时打开 WinRunner 本机控制台。点关闭会短暂隐藏窗口，随后自动打开，不影响服务和任务；要停止服务并取消正在运行的任务，请在启动服务的终端按 **Ctrl+C**。纯命令行或无桌面环境使用 `python main.py --nogui`（不加载 Tkinter）。Windows 上可用 `python -m unittest discover -s tests -v` 运行测试。
 
-服务日志输出到控制台，并追加到程序同目录的 `winrunner.log`，不自动轮转。每行最多 80 列；来自 `127.0.0.1` 的 HTTP 请求不记请求日志；其他来源的请求日志包含操作、HTTP 状态、耗时和部分参数，不记录鉴权头、命令正文或任务 stdout/stderr。任务输出仍只在内存中，通过 API 读取。
+服务日志输出到控制台，并追加到 `winrunner/winrunner.log`，不自动轮转。每行最多 80 列；来自 `127.0.0.1` 的 HTTP 请求不记请求日志；其他来源的请求日志包含操作、HTTP 状态、耗时和部分参数，不记录鉴权头、命令正文或任务 stdout/stderr。任务输出仍只在内存中，通过 API 读取。
 
 ## 本机控制台
 
@@ -52,6 +56,7 @@ python winrunner.py
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install black==26.3.1 mypy==1.19.1
 $sources = @(git ls-files '*.py')
-.\.venv\Scripts\python.exe -m black --check @sources
-.\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe -m black --config dev/pyproject.toml --check @sources
+.\.venv\Scripts\python.exe -m mypy --config-file dev/pyproject.toml
+npm test  # DSH 插件回归测试，无需启动 Runner。
 ```

@@ -13,8 +13,8 @@ from queue import Empty, SimpleQueue
 from tkinter import filedialog, ttk
 from typing import Literal
 
-import winrunner_gui as gui
-from runner import APIError
+from . import winrunner_gui as gui
+from .runner import APIError
 
 Browse = Callable[[str, str, int, threading.Event], dict]
 Save = Callable[[str, str, Path, str | None, threading.Event], int]

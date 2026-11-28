@@ -11,10 +11,10 @@ from threading import Event
 import unittest
 from unittest.mock import patch
 
-import runner
-import winfiles
-import winrunner_files
-from winrunner_files import browse, save_bytes, save_file
+from winrunner import runner
+from winrunner import winfiles
+from winrunner import winrunner_files
+from winrunner.winrunner_files import browse, save_bytes, save_file
 
 _PROJECT_BODY = b'{"repo_url":"https://example.invalid/repo.git"}'
 _PAYLOAD = bytes(range(256)) * 1024
@@ -308,7 +308,9 @@ class GUIFileBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.APIError, "Could not save to") as caught:
             self.save(destination=self.exports / "missing" / "output")
         self.assertEqual(caught.exception.code, "save_failed")
-        with patch("winrunner_files.os.fsync", side_effect=OSError("disk is full")):
+        with patch(
+            "winrunner.winrunner_files.os.fsync", side_effect=OSError("disk is full")
+        ):
             with self.assertRaisesRegex(runner.APIError, "disk is full") as caught:
                 self.save()
         self.assertEqual(caught.exception.code, "save_failed")

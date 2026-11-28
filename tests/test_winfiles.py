@@ -11,8 +11,8 @@ from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import patch
 
-import winfiles
-from winfiles import BadPath, pinned_entry, pinned_path
+from winrunner import winfiles
+from winrunner.winfiles import BadPath, pinned_entry, pinned_path
 
 
 @unittest.skipUnless(os.name == "nt", "Windows handles required")

@@ -12,8 +12,8 @@ from pathlib import Path
 from threading import Event
 from typing import BinaryIO
 
-import winfiles
-from runner import APIError, Runner, invalid, not_found
+from . import winfiles
+from .runner import APIError, Runner, invalid, not_found
 
 _BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", re.I)
 _PAGE_LIMIT = 512 * 1024

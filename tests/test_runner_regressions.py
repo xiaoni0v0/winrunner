@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import TypeVar
 from unittest.mock import patch
 
-import runner
+from winrunner import runner
 
 PROJECT_BODY = json.dumps({"repo_url": "https://example.invalid/repo.git"}).encode(
     "utf-8"
@@ -140,7 +140,7 @@ class RunnerRegressions(unittest.TestCase):
         project = self.create()
         with (
             patch.object(runner.config, "INTERPRETERS", None),
-            self.assertLogs("runner", level="ERROR"),
+            self.assertLogs(runner.LOG, level="ERROR"),
         ):
             self.assert_api_error(500, "validation_failed", self.start_action, project)
         self.assertFalse(project.worktree.exists())
@@ -149,7 +149,7 @@ class RunnerRegressions(unittest.TestCase):
         self.assertEqual(action["error"]["code"], "validation_failed")
         with (
             patch.object(runner, "command_body", side_effect=RuntimeError("validator")),
-            self.assertLogs("runner", level="ERROR"),
+            self.assertLogs(runner.LOG, level="ERROR"),
         ):
             self.assert_api_error(
                 500,
@@ -204,7 +204,7 @@ class RunnerRegressions(unittest.TestCase):
         with (
             patch.object(first.job, "cancel", side_effect=OSError("cancel failed")),
             patch.object(second.job, "cancel", side_effect=cancelled.set),
-            self.assertLogs("runner", "ERROR"),
+            self.assertLogs(runner.LOG, "ERROR"),
         ):
             shutdown = self.background(self.model.close)
             try:
@@ -297,7 +297,7 @@ class RunnerRegressions(unittest.TestCase):
 
         with (
             patch.object(path_type, "is_dir", broken_is_dir),
-            self.assertLogs("runner", "ERROR"),
+            self.assertLogs(runner.LOG, "ERROR"),
         ):
             task = self.start_action(project)
             result = self.wait_action(project, task)
@@ -411,7 +411,7 @@ class RunnerRegressions(unittest.TestCase):
         with (
             patch.object(LocalRepository, "create", fail_clone),
             patch.object(runner, "_remove_tree", side_effect=block_rollback),
-            self.assertLogs("runner", "WARNING") as logs,
+            self.assertLogs(runner.LOG, "WARNING") as logs,
         ):
             error = self.assert_api_error(
                 502, "git_clone_failed", self.model.create, "Sample", PROJECT_BODY
@@ -428,7 +428,7 @@ class RunnerRegressions(unittest.TestCase):
         with (
             patch.object(runner, "_remove_tree", side_effect=block_rollback),
             patch.object(LocalRepository, "create", autospec=True) as clone,
-            self.assertLogs("runner", "WARNING"),
+            self.assertLogs(runner.LOG, "WARNING"),
         ):
             self.assert_api_error(
                 409,

@@ -4,7 +4,7 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { apply, inject } from '../index.js'
+import { apply, inject } from '@local/dsh-winrunner-client'
 
 async function server(t, handler) {
   const instance = http.createServer(async (req, res) => {

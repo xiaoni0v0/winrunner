@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from winrunner import HTTPHandler, HTTPServer
+from winrunner.server import HTTPHandler, HTTPServer
 
 TOKEN = "test-bearer-token"
 FILES = "/projects/demo/files"

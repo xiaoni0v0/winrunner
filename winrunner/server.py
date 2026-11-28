@@ -1,4 +1,4 @@
-"""Start WinRunner with: python winrunner.py."""
+"""WinRunner HTTP service and startup logic."""
 
 import argparse
 import hashlib
@@ -27,8 +27,8 @@ from threading import BoundedSemaphore, Lock
 from typing import Any, cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-import config
-from runner import (
+from . import config
+from .runner import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_TASK_STATUSES,
     APIError,
@@ -37,8 +37,8 @@ from runner import (
     json_value,
     not_found,
 )
-from winprocess import CpuSampler, health
-from winrunner_files import directory_listing, range_bounds
+from .winprocess import CpuSampler, health
+from .winrunner_files import directory_listing, range_bounds
 
 
 def health_snapshot(runner: Runner, sampler: CpuSampler) -> dict:
@@ -117,7 +117,11 @@ class ServiceFileHandler(logging.FileHandler):
 
 @contextmanager
 def service_logging(path: Path, token: str):
-    channels = (LOG, logging.getLogger("runner"), logging.getLogger("winprocess"))
+    channels = (
+        LOG,
+        logging.getLogger("winrunner.runner"),
+        logging.getLogger("winrunner.winprocess"),
+    )
     previous = [(channel, channel.level, channel.propagate) for channel in channels]
     formatter = ServiceFormatter(token)
     console = logging.StreamHandler(sys.stdout)
@@ -885,7 +889,7 @@ def main() -> None:
         or any(not 33 <= ord(c) <= 126 for c in token)
     ):
         sys.exit(
-            "Set TOKEN in config.py to a non-placeholder ASCII token without spaces"
+            "Set TOKEN in winrunner/config.py to a non-placeholder ASCII token without spaces"
         )
     with service_logging(LOG_FILE, token):
         try:
@@ -921,8 +925,8 @@ def serve(token: str, *, nogui: bool) -> None:
 def serve_with_gui(server: HTTPServer) -> None:
     import tkinter
 
-    from winrunner_desktop import DesktopRunner
-    from winrunner_gui import (
+    from .winrunner_desktop import DesktopRunner
+    from .winrunner_gui import (
         LOG_READ,
         Response,
         Snapshot,
@@ -1005,7 +1009,3 @@ def serve_with_gui(server: HTTPServer) -> None:
             signal.signal(signal.SIGINT, previous)
     if errors:
         raise errors[0]
-
-
-if __name__ == "__main__":
-    main()
